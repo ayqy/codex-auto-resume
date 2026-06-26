@@ -109,8 +109,14 @@ class UsageLimitWatcher:
                 changed = True
                 continue
 
-            thread_info = self.thread_exists(session_id)
-            candidate = self.inspect_rollout_for_usage_limit(thread_info) if thread_info else None
+            try:
+                thread_info = self.thread_exists(session_id)
+                candidate = self.inspect_rollout_for_usage_limit(thread_info) if thread_info else None
+            except sqlite3.OperationalError as e:
+                self.log(f"在启动清理阶段无法访问数据库来检查会话 {session_id}: {e}。将跳过此条目。")
+                cleaned_jobs.append(job)
+                continue
+
             if not thread_info or not candidate:
                 key = self.build_job_error_key(job)
                 if key:
@@ -151,19 +157,9 @@ class UsageLimitWatcher:
 
     def connect(self, path: Path):
         uri = f"file:{path}?mode=ro"
-        for attempt in range(2): # Attempt twice: initial + one retry
-            try:
-                conn = sqlite3.connect(uri, uri=True, timeout=10)
-                conn.row_factory = sqlite3.Row
-                self.log(f"成功连接到数据库: {path}")
-                return conn
-            except sqlite3.OperationalError as e:
-                if attempt == 0:
-                    self.log(f"首次连接数据库失败: {path} - {e}. 将在60秒后重试一次...")
-                    time.sleep(60) # Wait for 60 seconds as requested
-                else:
-                    self.log(f"重试连接数据库失败: {path} - {e}. 放弃本次连接尝试。")
-                    raise # Re-raise the exception if retry also fails
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        return conn
 
 
     def fetch_recent_logs(self):
@@ -429,7 +425,13 @@ class UsageLimitWatcher:
 
     def inspect_latest_rollout_error(self):
         candidates = []
-        for thread_info in self.fetch_recent_threads(limit=20):
+        try:
+            threads = self.fetch_recent_threads(limit=20)
+        except sqlite3.OperationalError as e:
+            self.log(f"检查rollout时无法访问数据库: {e}")
+            return None
+
+        for thread_info in threads:
             candidate = self.inspect_rollout_for_usage_limit(thread_info)
             if candidate:
                 candidates.append(candidate)
@@ -496,7 +498,12 @@ class UsageLimitWatcher:
         return True
 
     def inspect_latest_log_error(self):
-        rows = self.fetch_recent_logs()
+        try:
+            rows = self.fetch_recent_logs()
+        except sqlite3.OperationalError as e:
+            self.log(f"检查日志时无法访问数据库: {e}")
+            return None
+
         if not rows:
             return None
 
@@ -515,7 +522,12 @@ class UsageLimitWatcher:
             self.log(f"failed to resolve session id for log {target_row.id}")
             return None
 
-        thread_info = self.thread_exists(session_id)
+        try:
+            thread_info = self.thread_exists(session_id)
+        except sqlite3.OperationalError as e:
+            self.log(f"检查日志时无法访问数据库 (thread_exists): {e}")
+            return None
+
         if not thread_info:
             self.log(f"resolved session id {session_id} but thread record not found")
             return None
