@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -39,7 +40,7 @@ class UsageLimitWatcher:
         self.state_path = self.tmp_dir / "state.json"
         self.log_path = self.logs_dir / "watcher.log"
         self.local_tz = datetime.now().astimezone().tzinfo or ZoneInfo("UTC")
-        self.poll_interval = 300
+        self.poll_interval = 1800
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.state = self.load_state()
@@ -150,9 +151,20 @@ class UsageLimitWatcher:
 
     def connect(self, path: Path):
         uri = f"file:{path}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True)
-        conn.row_factory = sqlite3.Row
-        return conn
+        for attempt in range(2): # Attempt twice: initial + one retry
+            try:
+                conn = sqlite3.connect(uri, uri=True, timeout=10)
+                conn.row_factory = sqlite3.Row
+                self.log(f"成功连接到数据库: {path}")
+                return conn
+            except sqlite3.OperationalError as e:
+                if attempt == 0:
+                    self.log(f"首次连接数据库失败: {path} - {e}. 将在60秒后重试一次...")
+                    time.sleep(60) # Wait for 60 seconds as requested
+                else:
+                    self.log(f"重试连接数据库失败: {path} - {e}. 放弃本次连接尝试。")
+                    raise # Re-raise the exception if retry also fails
+
 
     def fetch_recent_logs(self):
         query = """
@@ -652,8 +664,9 @@ class UsageLimitWatcher:
             try:
                 self.trigger_due_jobs()
                 self.run_once()
-            except Exception as exc:
-                self.log(f"watcher error: {exc}")
+            except Exception:
+                error_message = f"watcher error:\n{traceback.format_exc()}"
+                self.log(error_message)
                 try:
                     self.trigger_due_jobs()
                 except Exception as trigger_exc:
