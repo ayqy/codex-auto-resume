@@ -7,7 +7,7 @@ LOG_DIR := $(TMP_DIR)/logs
 
 TOKEN_DETAIL_FILE ?= $(shell mktemp /tmp/codex-token-usage.XXXXXX.txt 2>/dev/null || mktemp -t codex-token-usage)
 
-.PHONY: today run once status clean test-sample chmod force
+.PHONY: today run once status debug clean test-sample chmod force
 
 today:
 	@mkdir -p "$(LOG_DIR)"
@@ -25,6 +25,10 @@ once:
 status:
 	@mkdir -p "$(LOG_DIR)"
 	@$(PYTHON) "$(APP_DIR)/scripts/watch_usage_limit.py" --status
+
+debug:
+	@mkdir -p "$(LOG_DIR)"
+	@$(PYTHON) "$(APP_DIR)/scripts/watch_usage_limit.py" --debug-limit-history --days 7
 
 test-sample:
 	@mkdir -p "$(LOG_DIR)"
