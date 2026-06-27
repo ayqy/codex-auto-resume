@@ -6,8 +6,9 @@ TMP_DIR := $(APP_DIR)/tmp
 LOG_DIR := $(TMP_DIR)/logs
 
 TOKEN_DETAIL_FILE ?= $(shell mktemp /tmp/codex-token-usage.XXXXXX.txt 2>/dev/null || mktemp -t codex-token-usage)
+DEBUG_ARGS ?= --debug-limit-history --days 7
 
-.PHONY: today run once status debug clean test-sample chmod force
+.PHONY: today run status debug clean chmod test
 
 today:
 	@mkdir -p "$(LOG_DIR)"
@@ -18,25 +19,16 @@ run:
 	@mkdir -p "$(LOG_DIR)"
 	@$(PYTHON) "$(APP_DIR)/scripts/watch_usage_limit.py"
 
-once:
-	@mkdir -p "$(LOG_DIR)"
-	@$(PYTHON) "$(APP_DIR)/scripts/watch_usage_limit.py" --once
-
 status:
 	@mkdir -p "$(LOG_DIR)"
 	@$(PYTHON) "$(APP_DIR)/scripts/watch_usage_limit.py" --status
 
 debug:
 	@mkdir -p "$(LOG_DIR)"
-	@$(PYTHON) "$(APP_DIR)/scripts/watch_usage_limit.py" --debug-limit-history --days 7
+	@$(PYTHON) "$(APP_DIR)/scripts/watch_usage_limit.py" $(DEBUG_ARGS)
 
-test-sample:
-	@mkdir -p "$(LOG_DIR)"
-	@$(PYTHON) "$(APP_DIR)/scripts/watch_usage_limit.py" --test-sample
-
-force:
-	@mkdir -p "$(LOG_DIR)"
-	@$(PYTHON) "$(APP_DIR)/scripts/watch_usage_limit.py" --force-latest
+test:
+	@$(PYTHON) -m pytest -q
 
 clean:
 	@rm -rf "$(TMP_DIR)"

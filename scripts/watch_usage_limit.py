@@ -410,7 +410,7 @@ class UsageLimitWatcher:
         try:
             with self.connect(self.state_db) as conn:
                 rows = conn.execute(query, (limit,)).fetchall()
-        except sqlite3.OperationalError as exc:
+        except sqlite3.Error as exc:
             self.log_state_db_fallback("检查rollout时无法访问数据库", exc)
             return []
         return [self.thread_info_from_state_row(row) for row in rows]
@@ -424,7 +424,7 @@ class UsageLimitWatcher:
         try:
             with self.connect(self.state_db) as conn:
                 row = conn.execute(query, (thread_id,)).fetchone()
-        except sqlite3.OperationalError as exc:
+        except sqlite3.Error as exc:
             self.log_state_db_fallback("检查日志时无法访问数据库 (thread_exists)", exc)
             return None
         if not row:
@@ -572,7 +572,7 @@ class UsageLimitWatcher:
             return None, None
         try:
             rows = self.fetch_rows_for_process_uuid(process_uuid, target_row.ts)
-        except sqlite3.OperationalError:
+        except sqlite3.Error:
             return None, None
         thread_rows = [row for row in rows if row.thread_id]
         if not thread_rows:
@@ -1088,7 +1088,7 @@ class UsageLimitWatcher:
         logs_available = True
         try:
             log_candidates = self.collect_log_candidates(days=days, limit=log_limit)
-        except sqlite3.OperationalError as exc:
+        except sqlite3.Error as exc:
             self.log(f"检查日志时无法访问数据库: {exc}")
             log_candidates = []
             logs_available = False
@@ -1259,6 +1259,13 @@ class UsageLimitWatcher:
                 for job in existing_jobs:
                     if job.get("status") != "pending":
                         continue
+                    scheduled_run_at_text = job.get("scheduled_run_at")
+                    try:
+                        scheduled_run_at = datetime.fromisoformat(scheduled_run_at_text) if scheduled_run_at_text else None
+                    except ValueError:
+                        scheduled_run_at = None
+                    if scheduled_run_at and scheduled_run_at <= now:
+                        continue
                     job["status"] = "expired"
                     job["status_reason"] = "candidate_no_longer_active"
                     job["expired_at"] = now.isoformat()
@@ -1275,7 +1282,7 @@ class UsageLimitWatcher:
     def inspect_latest_log_error(self):
         try:
             rows = self.fetch_recent_logs()
-        except sqlite3.OperationalError as exc:
+        except sqlite3.Error as exc:
             self.log(f"检查日志时无法访问数据库: {exc}")
             return None
 
@@ -1302,7 +1309,7 @@ class UsageLimitWatcher:
     def inspect_log_error_for_session(self, session_id: str):
         try:
             rows = self.fetch_session_logs(session_id)
-        except sqlite3.OperationalError as exc:
+        except sqlite3.Error as exc:
             self.log(f"debug session 读取日志失败: {exc}")
             return None
         candidates = self.collect_log_candidates_from_rows(rows, preferred_session_id=session_id)
@@ -1772,77 +1779,42 @@ class UsageLimitWatcher:
         self.log("starting usage limit watcher")
         while True:
             try:
-                self.trigger_due_jobs()
                 self.run_once()
             except Exception:
                 error_message = f"watcher error:\n{traceback.format_exc()}"
                 self.log(error_message)
-                try:
-                    self.trigger_due_jobs()
-                except Exception as trigger_exc:
-                    self.log(f"trigger check failed after watcher error: {trigger_exc}")
             time.sleep(self.compute_sleep_seconds())
-
-    def run_sample_test(self):
-        fake_row = LogRow(
-            id=1,
-            ts=int(datetime(2026, 6, 25, 14, 0, tzinfo=ZoneInfo("UTC")).timestamp()),
-            level="INFO",
-            thread_id="019efc0b-a83a-7890-8c03-5867370ccde6",
-            process_uuid="pid:test:sample",
-            feedback_log_body=(
-                "Turn error: You've hit your usage limit. Upgrade to Pro "
-                "(https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage "
-                "to purchase more credits or try again at 3:13 PM."
-            ),
-        )
-        retry_at, source = self.parse_retry_time([fake_row], fake_row)
-        scheduled_run_at = retry_at + timedelta(minutes=10)
-        result = {
-            "session_id": fake_row.thread_id,
-            "retry_source": source,
-            "retry_at": retry_at.isoformat(),
-            "scheduled_run_at": scheduled_run_at.isoformat(),
-            "resume_command": (
-                f'codex resume -m gpt-5.4 -c model_reasoning_effort=\'medium\' '
-                f'--yolo {fake_row.thread_id} "continue"'
-            ),
-        }
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0
 
 
 def main():
     parser = argparse.ArgumentParser(description="Watch Codex usage-limit errors and schedule resumes.")
-    parser.add_argument("--once", action="store_true", help="Scan once and update local queue")
     parser.add_argument("--status", action="store_true", help="Print watcher status")
-    parser.add_argument("--test-sample", action="store_true", help="Run sample parser test")
-    parser.add_argument("--force-latest", action="store_true", help="Force trigger the latest detected session")
     parser.add_argument("--debug-session", help="Print merged metadata and usage-limit candidates for a session")
     parser.add_argument("--debug-limit-history", action="store_true", help="Print recent limit candidates sorted by retry_at desc")
+    parser.add_argument("--debug-schedule-once", action="store_true", help="Run a single debug scheduling cycle")
+    parser.add_argument("--debug-force-latest", action="store_true", help="Force trigger the latest detected session for debugging")
     parser.add_argument("--days", type=int, default=7, help="Day window for debug history/session candidate collection")
     args = parser.parse_args()
 
     cleanup_on_init = not (
         args.status
-        or args.test_sample
         or args.debug_session
         or args.debug_limit_history
+        or args.debug_schedule_once
+        or args.debug_force_latest
     )
     watcher = UsageLimitWatcher(Path(__file__).resolve().parent.parent, cleanup_on_init=cleanup_on_init)
 
     if args.status:
         return watcher.print_status()
-    if args.test_sample:
-        return watcher.run_sample_test()
-    if args.force_latest:
-        return watcher.force_latest()
     if args.debug_session:
         return watcher.debug_session(args.debug_session)
     if args.debug_limit_history:
         return watcher.debug_limit_history(days=args.days)
-    if args.once:
+    if args.debug_schedule_once:
         return watcher.run_once()
+    if args.debug_force_latest:
+        return watcher.force_latest()
     watcher.run_forever()
     return 0
 

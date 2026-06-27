@@ -107,6 +107,8 @@ def collect_usage(start_local: datetime, end_local: datetime):
 
             obj_type = obj.get("type")
             payload = obj.get("payload", {})
+            if not isinstance(payload, dict):
+                continue
 
             if obj_type == "turn_context":
                 model = payload.get("model")
@@ -117,13 +119,20 @@ def collect_usage(start_local: datetime, end_local: datetime):
 
             if payload.get("type") == "function_call_output":
                 output_str = payload.get("output", "")
+                if not isinstance(output_str, str):
+                    continue
                 found_models = MODEL_DETECTION_REGEX.findall(output_str)
                 if found_models:
                     last_model_seen = found_models[-1]
                 continue
 
             if is_usage_item(obj):
-                last_usage = payload.get("info", {}).get("last_token_usage", {})
+                info = payload.get("info", {})
+                if not isinstance(info, dict):
+                    continue
+                last_usage = info.get("last_token_usage", {})
+                if not isinstance(last_usage, dict):
+                    continue
                 if not last_usage:
                     continue
                 model_key = last_model_seen

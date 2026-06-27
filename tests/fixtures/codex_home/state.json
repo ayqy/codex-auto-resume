@@ -1,0 +1,12 @@
+{
+  "last_seen_log_id": 0,
+  "processed_error_keys": [],
+  "pending_jobs": [],
+  "triggered_jobs": [],
+  "last_detected_error": null,
+  "last_detected_session_id": null,
+  "last_detected_retry_at": null,
+  "last_detected_scheduled_run_at": null,
+  "last_detected_cwd": null,
+  "thread_cache": {}
+}

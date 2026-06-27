@@ -48,7 +48,7 @@
 - 🎯 **自动检测用量超限**: 扫描本地 Codex 日志，实时检测用量超限事件及其重试时间戳。
 - 🧠 **智能会话解析**: 准确识别受影响的会话 ID 和项目工作目录。
 - 💻 **跨平台终端集成**: 支持 iTerm2、Terminal.app、gnome-terminal 等多种终端应用。
-- ⏰ **定时与手动恢复**: 自动安排恢复任务，或允许您随时手动强制立即恢复。
+- ⏰ **自动恢复与可调试恢复**: 自动安排恢复任务，并在需要排查时提供调试调度与调试恢复能力。
 - 📊 **Token 用量报告**: 内置脚本，可汇总每日 Token 使用量并估算开销。
 - 🛡️ **稳健的状态管理**: 精准追踪已处理的错误和待处理的任务，防止重复或遗漏。
 
@@ -113,9 +113,9 @@ graph TD
 |--------------|------------------------------------------------------------|
 | `make run`   | **(推荐)** 启动后台守护进程，持续监控错误。                |
 | `make today` | 显示当天 Codex token 的使用情况和预估费用。                 |
-| `make force` | 忽略计划时间，为最近检测到的会话立即触发恢复。             |
-| `make debug` | 用与监听器相同的筛选逻辑，输出最近 7 天所有 limit 事件与目标调度结果。 |
+| `make debug` | 输出近期 limit 事件与目标调度状态；可通过 `DEBUG_ARGS` 切换到具体 debug 子流程。 |
 | `make status`| 显示监控程序的当前状态，包括待处理和已完成的任务。         |
+| `make test`  | 运行基于脱敏真实样本构建的自动化单测。                     |
 
 ### 所有命令
 
@@ -125,13 +125,20 @@ graph TD
 |------------------|----------------------------------------------------------------|
 | `make today`     | 显示当天的 token 使用情况摘要。                                |
 | `make run`       | 启动守护进程，以持续监控用量超限错误。                         |
-| `make once`      | 仅运行一次监控，检测错误并按需安排恢复任务。                   |
 | `make status`    | 打印监控程序的内部 JSON 状态（待处理任务、已处理错误等）。     |
-| `make debug`     | 以可读文本输出最近 7 天的 limit 事件、候选结果和目标 pending jobs。 |
-| `make force`     | 为最近检测到的错误会话，强制立即触发恢复。                     |
-| `make test-sample`| 运行一个独立的错误消息解析逻辑测试。                           |
+| `make debug`     | 默认输出最近 7 天的 limit 事件、候选结果和目标 pending jobs。  |
+| `make test`      | 运行自动化单测与脱敏 fixtures。                                |
 | `make clean`     | 删除监控程序生成的所有临时文件、日志和状态。                   |
 | `make chmod`     | 为 `scripts/` 目录下的所有 shell 脚本赋予 `+x` 执行权限。      |
+
+### Debug 子命令
+
+`make debug` 支持通过 `DEBUG_ARGS` 进入具体 debug 子流程：
+
+- `make debug DEBUG_ARGS="--debug-limit-history --days 14"` 查看近期 limit 历史与调度决策。
+- `make debug DEBUG_ARGS="--debug-session <session_id>"` 查看单个会话的元数据与候选。
+- `make debug DEBUG_ARGS="--debug-schedule-once"` 仅执行一轮调试调度，不启动常驻进程。
+- `make debug DEBUG_ARGS="--debug-force-latest"` 对最近检测到的会话执行调试恢复。
 
 
 ## 贡献代码
