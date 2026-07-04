@@ -112,7 +112,8 @@ graph TD
 | 命令         | 描述                                                       |
 |--------------|------------------------------------------------------------|
 | `make run`   | **(推荐)** 启动后台守护进程，持续监控错误。                |
-| `make today` | 显示当天 Codex token 的使用情况和预估费用。                 |
+| `make today` | 显示当天 token 汇总、总 Token、session 明细和预估费用。    |
+| `make usage` | 与 `make today` 相同；可通过 `D=YYYY-MM-DD` 指定查询日期。 |
 | `make debug` | 输出近期 limit 事件与目标调度状态；可通过 `DEBUG_ARGS` 切换到具体 debug 子流程。 |
 | `make status`| 显示监控程序的当前状态，包括待处理和已完成的任务。         |
 | `make test`  | 运行基于脱敏真实样本构建的自动化单测。                     |
@@ -123,7 +124,8 @@ graph TD
 
 | 命令             | 描述                                                           |
 |------------------|----------------------------------------------------------------|
-| `make today`     | 显示当天的 token 使用情况摘要。                                |
+| `make today`     | 显示当天 token 汇总、总 Token、session 明细和预估费用。        |
+| `make usage`     | 与 `make today` 相同；可通过 `D=YYYY-MM-DD` 指定查询日期。     |
 | `make run`       | 启动守护进程，以持续监控用量超限错误。                         |
 | `make status`    | 打印监控程序的内部 JSON 状态（待处理任务、已处理错误等）。     |
 | `make debug`     | 默认输出最近 7 天的 limit 事件、候选结果和目标 pending jobs。  |
@@ -139,6 +141,11 @@ graph TD
 - `make debug DEBUG_ARGS="--debug-session <session_id>"` 查看单个会话的元数据与候选。
 - `make debug DEBUG_ARGS="--debug-schedule-once"` 仅执行一轮调试调度，不启动常驻进程。
 - `make debug DEBUG_ARGS="--debug-force-latest"` 对最近检测到的会话执行调试恢复。
+
+### Usage 示例
+
+- `make today` 输出当天的 token 汇总、模型汇总和 session 级明细。
+- `make usage D=2026-07-03` 输出 2026-07-03 当天的同类报告。
 
 
 ## 贡献代码

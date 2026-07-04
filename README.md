@@ -112,7 +112,8 @@ These are the commands you'll use most frequently.
 | Command      | Description                                                                          |
 |--------------|--------------------------------------------------------------------------------------|
 | `make run`   | **(Recommended)** Starts the watcher in the background to continuously monitor for errors. |
-| `make today` | Shows a summary of your Codex token usage and estimated costs for the current day.       |
+| `make today` | Shows today's token summary, total tokens, session breakdown, and estimated costs.        |
+| `make usage` | Shows the same report as `make today`; pass `D=YYYY-MM-DD` to inspect a specific day.     |
 | `make debug` | Prints recent limit events and target scheduling state. You can also pass `DEBUG_ARGS` to inspect a specific debug flow. |
 | `make status`| Displays the watcher's current state, including pending and completed jobs.            |
 | `make test`  | Runs the automated test suite against sanitized fixtures derived from real-world samples. |
@@ -123,7 +124,8 @@ Here is a complete list of all available commands.
 
 | Command         | Description                                                                       |
 |-----------------|-----------------------------------------------------------------------------------|
-| `make today`    | Show a summary of token usage for the current day.                                |
+| `make today`    | Show today's token summary, total tokens, session breakdown, and estimated costs. |
+| `make usage`    | Show the same report as `make today`; pass `D=YYYY-MM-DD` for a specific day.     |
 | `make run`      | Start the watcher daemon to continuously monitor for usage limit errors.          |
 | `make status`   | Print the internal JSON state of the watcher (pending jobs, processed errors, etc.). |
 | `make debug`    | Run the default debug view: recent 7-day limit events, confirmed candidates, and desired pending jobs. |
@@ -139,6 +141,11 @@ Here is a complete list of all available commands.
 - `make debug DEBUG_ARGS="--debug-session <session_id>"` prints merged metadata and candidates for one session.
 - `make debug DEBUG_ARGS="--debug-schedule-once"` runs one scheduling cycle without starting the daemon.
 - `make debug DEBUG_ARGS="--debug-force-latest"` force-triggers the latest detected session for debugging.
+
+### Usage Examples
+
+- `make today` prints today's token totals, per-model summary, and session-level breakdown.
+- `make usage D=2026-07-03` prints the same report for July 3, 2026.
 
 
 ## Contributing

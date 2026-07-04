@@ -7,13 +7,20 @@ LOG_DIR := $(TMP_DIR)/logs
 
 TOKEN_DETAIL_FILE ?= $(shell mktemp /tmp/codex-token-usage.XXXXXX.txt 2>/dev/null || mktemp -t codex-token-usage)
 DEBUG_ARGS ?= --debug-limit-history --days 7
+D ?=
 
-.PHONY: today run status debug clean chmod test
+.PHONY: today usage run status debug clean chmod test
 
-today:
+today: usage
+
+usage:
 	@mkdir -p "$(LOG_DIR)"
 	@DETAIL_FILE="$(TOKEN_DETAIL_FILE)"; \
-	$(PYTHON) "$(APP_DIR)/scripts/codex_token_usage.py" --today --summary-only --detail-file "$$DETAIL_FILE"
+	if [ -n "$(D)" ]; then \
+		$(PYTHON) "$(APP_DIR)/scripts/codex_token_usage.py" -d "$(D)" -f "$$DETAIL_FILE"; \
+	else \
+		$(PYTHON) "$(APP_DIR)/scripts/codex_token_usage.py" -t -f "$$DETAIL_FILE"; \
+	fi
 
 run:
 	@mkdir -p "$(LOG_DIR)"
