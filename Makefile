@@ -5,22 +5,35 @@ APP_DIR := $(CURDIR)
 TMP_DIR := $(APP_DIR)/tmp
 LOG_DIR := $(TMP_DIR)/logs
 
-TOKEN_DETAIL_FILE ?= $(shell mktemp /tmp/codex-token-usage.XXXXXX.txt 2>/dev/null || mktemp -t codex-token-usage)
 DEBUG_ARGS ?= --debug-limit-history --days 7
 D ?=
+N ?= 30
+F ?=
 
-.PHONY: today usage run status debug clean chmod test
+.PHONY: today usage recent run status debug clean chmod test
 
 today: usage
 
 usage:
 	@mkdir -p "$(LOG_DIR)"
-	@DETAIL_FILE="$(TOKEN_DETAIL_FILE)"; \
+	@set --; \
 	if [ -n "$(D)" ]; then \
-		$(PYTHON) "$(APP_DIR)/scripts/codex_token_usage.py" -d "$(D)" -f "$$DETAIL_FILE"; \
+		set -- "$$@" -d "$(D)"; \
 	else \
-		$(PYTHON) "$(APP_DIR)/scripts/codex_token_usage.py" -t -f "$$DETAIL_FILE"; \
-	fi
+		set -- "$$@" -t; \
+	fi; \
+	if [ -n "$(F)" ]; then \
+		set -- "$$@" -f "$(F)"; \
+	fi; \
+	$(PYTHON) "$(APP_DIR)/scripts/codex_token_usage.py" "$$@"
+
+recent:
+	@mkdir -p "$(LOG_DIR)"
+	@set -- -r -n "$(N)"; \
+	if [ -n "$(F)" ]; then \
+		set -- "$$@" -f "$(F)"; \
+	fi; \
+	$(PYTHON) "$(APP_DIR)/scripts/codex_token_usage.py" "$$@"
 
 run:
 	@mkdir -p "$(LOG_DIR)"
