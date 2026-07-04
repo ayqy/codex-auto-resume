@@ -4,13 +4,14 @@ import json
 import math
 import os
 import re
+import shlex
 import sys
 import tempfile
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from statistics import median
-from typing import Optional
+from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 PRICES = {
@@ -24,7 +25,10 @@ PRICES = {
 
 MODEL_DETECTION_REGEX = re.compile(r'"model":\s*"([^"]+)"')
 SESSION_ID_REGEX = re.compile(r"rollout-.*-([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$")
-SENTENCE_END_REGEX = re.compile(r"[。！？!?]")
+SESSION_ID_LINE_REGEX = re.compile(r"session id:\s*([0-9a-f]{8}-[0-9a-f-]{27})", re.IGNORECASE)
+ABSOLUTE_PATH_REGEX = re.compile(r"(/(?:[^\s\"'`<>|]|\\ )+)")
+PATH_LINE_SUFFIX_REGEX = re.compile(r":\d+(?::\d+)?$")
+RUN_DIR_TIMESTAMP_REGEX = re.compile(r"^(\d{8})-(\d{6})(\d{0,3})")
 NOISE_MODE_REGEX = re.compile(r"^\[MODE:\s*(EXECUTE|PLAN|RESEARCH|INNOVATE|REVIEW)\]$", re.IGNORECASE)
 NOISE_BARE_MODE_REGEX = re.compile(r"^(EXECUTE|PLAN|RESEARCH|INNOVATE|REVIEW)$", re.IGNORECASE)
 COMMAND_ECHO_REGEX = re.compile(r"^[%$]\s+\S+")
@@ -73,6 +77,37 @@ def create_session_record(session_id: str):
             "first_event_at": None,
             "last_event_at": None,
             "models": defaultdict(create_usage_dict),
+        }
+    )
+    return record
+
+
+def create_session_metadata_record(session_id: str):
+    return {
+        "session_id": session_id,
+        "title": session_id,
+        "title_priority": 0,
+        "cwd": None,
+        "semantic_user_messages": [],
+        "referenced_paths": set(),
+        "launch_events": [],
+        "first_seen_at": None,
+        "last_seen_at": None,
+        "source_file": None,
+    }
+
+
+def create_display_session_record(session_id: str, title: str, cwd: Optional[str], display_kind: str):
+    record = create_session_record(session_id)
+    record.update(
+        {
+            "title": title,
+            "cwd": cwd,
+            "display_kind": display_kind,
+            "child_count": 0,
+            "child_session_ids": [],
+            "project_roots": [],
+            "is_synthetic_parent": False,
         }
     )
     return record
@@ -262,16 +297,30 @@ def extract_semantic_title_text(text: Optional[str]) -> Optional[str]:
     return candidate
 
 
-def build_session_title(text: Optional[str], fallback: str) -> str:
-    if not text:
+def unique_title_parts(value: Any) -> list[str]:
+    if value is None:
+        return []
+    raw_items = value if isinstance(value, (list, tuple)) else [value]
+    parts = []
+    for item in raw_items:
+        if not isinstance(item, str):
+            continue
+        normalized = normalize_title_text(item)
+        if not normalized or normalized in parts:
+            continue
+        parts.append(normalized)
+    return parts
+
+
+def build_session_title(text: Any, fallback: str) -> str:
+    parts = unique_title_parts(text)
+    if not parts:
         return fallback
-    normalized = normalize_title_text(text)
-    if not normalized:
-        return fallback
-    sentence_match = SENTENCE_END_REGEX.search(normalized)
-    if sentence_match and sentence_match.end() <= 200:
-        return normalized[: sentence_match.end()].strip() or fallback
-    return normalized[:200].strip() or fallback
+    first = parts[0]
+    if len(first) >= 200 or len(parts) == 1:
+        return first[:200].strip() or fallback
+    combined = f"{first} | {parts[1]}"
+    return combined[:200].strip() or fallback
 
 
 def extract_response_item_user_text(payload: dict) -> Optional[str]:
@@ -294,6 +343,106 @@ def extract_response_item_user_text(payload: dict) -> Optional[str]:
     return "\n".join(parts)
 
 
+def parse_iso_datetime(value: str) -> datetime:
+    normalized = value.replace("Z", "+00:00")
+    return datetime.fromisoformat(normalized)
+
+
+def clean_path_candidate(candidate: str) -> str:
+    cleaned = candidate.strip().replace("\\ ", " ")
+    cleaned = PATH_LINE_SUFFIX_REGEX.sub("", cleaned)
+    cleaned = cleaned.rstrip(".,;!?)]}")
+    return cleaned
+
+
+def extract_existing_paths(text: Optional[str]) -> set[str]:
+    if not text:
+        return set()
+    results = set()
+    for match in ABSOLUTE_PATH_REGEX.finditer(text):
+        candidate = clean_path_candidate(match.group(1))
+        if len(candidate) < 2:
+            continue
+        try:
+            if Path(candidate).exists():
+                results.add(str(Path(candidate)))
+        except OSError:
+            continue
+    return results
+
+
+def register_referenced_paths(state: dict, text: Optional[str]):
+    if not text:
+        return
+    state["referenced_paths"].update(extract_existing_paths(text))
+
+
+def parse_function_call_arguments(payload: dict) -> Optional[dict]:
+    if payload.get("type") != "function_call":
+        return None
+    raw_args = payload.get("arguments")
+    if not isinstance(raw_args, str) or not raw_args.strip():
+        return None
+    try:
+        parsed = json.loads(raw_args)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
+def extract_launch_project_root(command: str) -> Optional[str]:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    if len(tokens) < 5:
+        return None
+    executable = Path(tokens[0]).name.lower()
+    if not executable.startswith("python"):
+        return None
+    if tokens[1] != "-m" or tokens[2] != "studio" or tokens[3] not in {"growth", "run"}:
+        return None
+    project_root = None
+    for index, token in enumerate(tokens[4:], start=4):
+        if token == "--project" and index + 1 < len(tokens):
+            project_root = tokens[index + 1]
+            break
+        if token.startswith("--project="):
+            project_root = token.split("=", 1)[1]
+            break
+    if not project_root:
+        return None
+    candidate = clean_path_candidate(project_root)
+    try:
+        if Path(candidate).exists():
+            return str(Path(candidate))
+    except OSError:
+        return None
+    return None
+
+
+def register_launch_event(state: dict, event_time: Optional[datetime], arguments: Optional[dict]):
+    if event_time is None or not isinstance(arguments, dict):
+        return
+    command = arguments.get("cmd")
+    if not isinstance(command, str):
+        return
+    project_root = extract_launch_project_root(command)
+    if not project_root:
+        return
+    event = {"project_root": project_root, "time": event_time, "cmd": command}
+    for existing in state["launch_events"]:
+        if (
+            existing["project_root"] == event["project_root"]
+            and existing["time"] == event["time"]
+            and existing["cmd"] == event["cmd"]
+        ):
+            return
+    state["launch_events"].append(event)
+
+
 def create_file_state(file_path: Path):
     session_id = derive_session_id(file_path)
     return {
@@ -302,27 +451,47 @@ def create_file_state(file_path: Path):
         "last_model_seen": "unknown",
         "cwd": None,
         "title": None,
-        "semantic_user_message": None,
+        "semantic_user_messages": [],
+        "referenced_paths": set(),
+        "launch_events": [],
+        "first_seen_at": None,
+        "last_seen_at": None,
+        "source_file": str(file_path),
         "used_in_range": False,
     }
 
 
 def register_semantic_user_message(state: dict, text: Optional[str]):
-    if state["semantic_user_message"]:
-        return
     semantic_text = extract_semantic_title_text(text)
-    if semantic_text:
-        state["semantic_user_message"] = semantic_text
+    if not semantic_text:
+        return
+    if semantic_text in state["semantic_user_messages"]:
+        return
+    if len(state["semantic_user_messages"]) >= 2:
+        return
+    state["semantic_user_messages"].append(semantic_text)
 
 
-def update_file_state_metadata(obj: dict, state: dict):
+def merge_time_window(current: Optional[datetime], candidate: Optional[datetime], prefer_earliest: bool) -> Optional[datetime]:
+    if current is None:
+        return candidate
+    if candidate is None:
+        return current
+    if prefer_earliest:
+        return candidate if candidate < current else current
+    return candidate if candidate > current else current
+
+
+def update_file_state_metadata(obj: dict, state: dict, event_time_local: Optional[datetime]):
     payload = obj.get("payload", {})
     if not isinstance(payload, dict):
         return
 
+    state["first_seen_at"] = merge_time_window(state["first_seen_at"], event_time_local, True)
+    state["last_seen_at"] = merge_time_window(state["last_seen_at"], event_time_local, False)
+
     obj_type = obj.get("type")
     if obj_type == "session_meta":
-        # 6/27 和 6/28 的排查显示问题在标题噪音，不在 session_id 串号。
         state["session_id"] = payload.get("session_id") or payload.get("id") or state["session_id"]
 
     if obj_type in ("session_meta", "turn_context"):
@@ -334,12 +503,27 @@ def update_file_state_metadata(obj: dict, state: dict):
             if semantic_title:
                 state["title"] = semantic_title
         register_semantic_user_message(state, payload.get("first_user_message"))
+        register_referenced_paths(state, payload.get("first_user_message"))
 
     if obj_type == "event_msg" and payload.get("type") == "user_message":
-        register_semantic_user_message(state, payload.get("message"))
+        message = payload.get("message")
+        register_semantic_user_message(state, message)
+        register_referenced_paths(state, message)
 
     if obj_type == "response_item":
-        register_semantic_user_message(state, extract_response_item_user_text(payload))
+        user_text = extract_response_item_user_text(payload)
+        register_semantic_user_message(state, user_text)
+        register_referenced_paths(state, user_text)
+
+        call_args = parse_function_call_arguments(payload)
+        if call_args:
+            register_referenced_paths(state, json.dumps(call_args, ensure_ascii=False))
+            register_launch_event(state, event_time_local, call_args)
+
+        if payload.get("type") == "function_call_output":
+            output_value = payload.get("output")
+            if isinstance(output_value, str):
+                register_referenced_paths(state, output_value)
 
 
 def update_model_tracking(obj: dict, state: dict):
@@ -367,20 +551,49 @@ def update_model_tracking(obj: dict, state: dict):
 
 
 def session_title_candidate(state: dict):
-    if state["semantic_user_message"]:
-        return state["semantic_user_message"], 4
+    if state["semantic_user_messages"]:
+        return state["semantic_user_messages"], 4
     if state["title"]:
         return state["title"], 2
     return state["session_id"], 0
 
 
-def apply_session_metadata(record: dict, state: dict):
+def merge_session_metadata(target: dict, state: dict):
     title_source, priority = session_title_candidate(state)
+    if priority >= target["title_priority"]:
+        target["title"] = build_session_title(title_source, state["session_id"])
+        target["title_priority"] = priority
+    if state["cwd"] and not target["cwd"]:
+        target["cwd"] = state["cwd"]
+    for message in state["semantic_user_messages"]:
+        if message in target["semantic_user_messages"]:
+            continue
+        if len(target["semantic_user_messages"]) >= 2:
+            break
+        target["semantic_user_messages"].append(message)
+    target["referenced_paths"].update(state["referenced_paths"])
+    for event in state["launch_events"]:
+        if any(
+            existing["project_root"] == event["project_root"]
+            and existing["time"] == event["time"]
+            and existing["cmd"] == event["cmd"]
+            for existing in target["launch_events"]
+        ):
+            continue
+        target["launch_events"].append(event)
+    target["first_seen_at"] = merge_time_window(target["first_seen_at"], state["first_seen_at"], True)
+    target["last_seen_at"] = merge_time_window(target["last_seen_at"], state["last_seen_at"], False)
+    if state["source_file"] and not target["source_file"]:
+        target["source_file"] = state["source_file"]
+
+
+def apply_session_metadata(record: dict, metadata: dict):
+    title_source, priority = session_title_candidate(metadata)
     if priority >= record["title_priority"]:
-        record["title"] = build_session_title(title_source, state["session_id"])
+        record["title"] = build_session_title(title_source, metadata["session_id"])
         record["title_priority"] = priority
-    if state["cwd"] and not record["cwd"]:
-        record["cwd"] = state["cwd"]
+    if metadata["cwd"] and not record["cwd"]:
+        record["cwd"] = metadata["cwd"]
 
 
 def format_event_window(start_at: Optional[datetime], end_at: Optional[datetime]) -> str:
@@ -403,9 +616,298 @@ def iter_session_files(root: Path, start_utc: datetime):
     session_files = sorted(root.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
     for file_path in session_files:
         file_mtime_utc = datetime.fromtimestamp(file_path.stat().st_mtime, tz=ZoneInfo("UTC"))
-        if file_mtime_utc < start_utc - timedelta(days=2):
+        if file_mtime_utc < start_utc - timedelta(days=7):
             continue
         yield file_path
+
+
+def parse_session_id_from_stderr(path: Path) -> Optional[str]:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = SESSION_ID_LINE_REGEX.search(text)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def parse_run_dir_started_at(run_dir: Path) -> Optional[datetime]:
+    match = RUN_DIR_TIMESTAMP_REGEX.match(run_dir.name)
+    if not match:
+        return None
+    stamp = f"{match.group(1)}{match.group(2)}"
+    try:
+        return datetime.strptime(stamp, "%Y%m%d%H%M%S").replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+    except ValueError:
+        return None
+
+
+def load_run_metadata(project_root: str, run_dir: Path) -> dict:
+    meta_path = run_dir / "meta.json"
+    meta_payload = {}
+    if meta_path.exists():
+        try:
+            meta_payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            meta_payload = {}
+    started_at = None
+    finished_at = None
+    if isinstance(meta_payload, dict):
+        started_at_raw = meta_payload.get("started_at")
+        finished_at_raw = meta_payload.get("finished_at")
+        if isinstance(started_at_raw, str):
+            try:
+                started_at = parse_iso_datetime(started_at_raw)
+            except ValueError:
+                started_at = None
+        if isinstance(finished_at_raw, str):
+            try:
+                finished_at = parse_iso_datetime(finished_at_raw)
+            except ValueError:
+                finished_at = None
+    if started_at is None:
+        started_at = parse_run_dir_started_at(run_dir)
+    return {
+        "project_root": project_root,
+        "run_dir": str(run_dir),
+        "kind": meta_payload.get("kind") if isinstance(meta_payload, dict) else None,
+        "started_at": started_at,
+        "finished_at": finished_at,
+    }
+
+
+def load_run_index(project_root: str, cache: dict[str, dict[str, dict]]):
+    if project_root in cache:
+        return cache[project_root]
+    run_index = {}
+    runs_dir = Path(project_root) / ".24h-studio" / "runs"
+    if runs_dir.is_dir():
+        for stderr_path in runs_dir.glob("*/stderr.log"):
+            session_id = parse_session_id_from_stderr(stderr_path)
+            if not session_id:
+                continue
+            run_index[session_id] = load_run_metadata(project_root, stderr_path.parent)
+    cache[project_root] = run_index
+    return run_index
+
+
+def identify_child_sessions(sessions: dict, session_catalog: dict):
+    child_sessions = {}
+    run_index_cache: dict[str, dict[str, dict]] = {}
+    for session_id in sessions:
+        metadata = session_catalog.get(session_id)
+        if not metadata:
+            continue
+        cwd = metadata.get("cwd")
+        if not isinstance(cwd, str) or not cwd:
+            continue
+        run_index = load_run_index(cwd, run_index_cache)
+        run_meta = run_index.get(session_id)
+        if not run_meta:
+            continue
+        child_sessions[session_id] = {
+            "session_id": session_id,
+            "project_root": run_meta["project_root"],
+            "run_meta": run_meta,
+            "metadata": metadata,
+        }
+    return child_sessions
+
+
+def child_anchor_time(session: dict, child_info: dict) -> Optional[datetime]:
+    run_meta = child_info.get("run_meta", {})
+    anchor = run_meta.get("started_at")
+    if anchor is not None:
+        return anchor
+    if session.get("first_event_at") is not None:
+        return session["first_event_at"]
+    metadata = child_info.get("metadata") or {}
+    return metadata.get("first_seen_at")
+
+
+def score_parent_candidate(parent_meta: dict, child_session: dict, child_info: dict):
+    child_start = child_anchor_time(child_session, child_info)
+    if child_start is None:
+        return (0, None)
+
+    project_root = child_info["project_root"]
+    best_launch_delta = None
+    for event in parent_meta.get("launch_events", []):
+        if event["project_root"] != project_root:
+            continue
+        if event["time"] is None or event["time"] > child_start:
+            continue
+        delta = int((child_start - event["time"]).total_seconds())
+        if best_launch_delta is None or delta < best_launch_delta:
+            best_launch_delta = delta
+    if best_launch_delta is not None:
+        return (3, best_launch_delta)
+
+    if project_root not in parent_meta.get("referenced_paths", set()):
+        return (0, None)
+
+    parent_start = parent_meta.get("first_seen_at")
+    parent_end = parent_meta.get("last_seen_at")
+    if parent_start is None or parent_end is None:
+        return (0, None)
+    if parent_start <= child_start <= parent_end:
+        return (2, 0)
+    if child_start > parent_end and child_start - parent_end <= timedelta(hours=6):
+        return (2, int((child_start - parent_end).total_seconds()))
+    return (0, None)
+
+
+def assign_parent_sessions(sessions: dict, session_catalog: dict, child_sessions: dict):
+    assignments = {}
+    non_child_catalog = {sid: meta for sid, meta in session_catalog.items() if sid not in child_sessions}
+    for child_id, child_info in child_sessions.items():
+        child_session = sessions[child_id]
+        candidates = []
+        for parent_id, parent_meta in non_child_catalog.items():
+            if parent_id == child_id:
+                continue
+            score, delta = score_parent_candidate(parent_meta, child_session, child_info)
+            if score <= 0 or delta is None:
+                continue
+            candidates.append((score, delta, parent_id))
+        if not candidates:
+            continue
+        candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+        best_score, best_delta, best_parent_id = candidates[0]
+        ambiguous = any(score == best_score and delta == best_delta for score, delta, _ in candidates[1:])
+        if ambiguous:
+            continue
+        assignments[child_id] = best_parent_id
+    return assignments
+
+
+def merge_session_usage(target: dict, source: dict):
+    add_usage(target, source)
+    for model, usage in source["models"].items():
+        add_usage(target["models"][model], usage)
+    target["first_event_at"] = merge_time_window(target["first_event_at"], source.get("first_event_at"), True)
+    target["last_event_at"] = merge_time_window(target["last_event_at"], source.get("last_event_at"), False)
+
+
+def sorted_model_items(models: dict):
+    return sorted(models.items(), key=lambda item: (item[0] not in PRICES, item[0] == "unknown", item[0]))
+
+
+def build_model_parts(models: dict):
+    parts = []
+    for model, usage in sorted_model_items(models):
+        if usage["input_tokens"] == 0 and usage["output_tokens"] == 0:
+            continue
+        parts.append(
+            f"{model}（总Token {format_token_count(usage_total(usage))}，输入 {format_token_count(usage['input_tokens'])}，输出 {format_token_count(usage['output_tokens'])}）"
+        )
+    return parts
+
+
+def build_session_display_records(sessions: dict, session_catalog: dict, child_sessions: dict, assignments: dict):
+    parent_children = defaultdict(list)
+    for child_id, parent_id in assignments.items():
+        parent_children[parent_id].append(child_id)
+
+    unresolved_child_ids = {sid for sid in child_sessions if sid not in assignments}
+    display_records = []
+
+    for parent_id, child_ids in parent_children.items():
+        parent_meta = session_catalog.get(parent_id, create_session_metadata_record(parent_id))
+        parent_raw = sessions.get(parent_id)
+        parent_title = parent_raw["title"] if parent_raw else parent_meta["title"]
+        parent_cwd = parent_raw["cwd"] if parent_raw and parent_raw.get("cwd") else parent_meta.get("cwd")
+        record = create_display_session_record(parent_id, parent_title, parent_cwd, "group")
+        record["child_count"] = len(child_ids)
+        record["child_session_ids"] = list(child_ids)
+        record["project_roots"] = sorted({child_sessions[child_id]["project_root"] for child_id in child_ids})
+        record["is_synthetic_parent"] = parent_raw is None
+        if parent_raw:
+            merge_session_usage(record, parent_raw)
+        for child_id in child_ids:
+            merge_session_usage(record, sessions[child_id])
+        display_records.append(record)
+
+    grouped_parent_ids = set(parent_children)
+    for session_id, session in sessions.items():
+        if session_id in unresolved_child_ids:
+            continue
+        if session_id in assignments:
+            continue
+        if session_id in grouped_parent_ids:
+            continue
+        record = create_display_session_record(session_id, session["title"], session.get("cwd"), "single")
+        merge_session_usage(record, session)
+        display_records.append(record)
+
+    display_records.sort(
+        key=lambda item: (
+            item["first_event_at"] is None,
+            item["first_event_at"] or datetime.max.replace(tzinfo=ZoneInfo("UTC")),
+            item["session_id"],
+        )
+    )
+    return display_records
+
+
+def percentile_90(values: list[int]) -> int:
+    if not values:
+        return 0
+    sorted_values = sorted(values)
+    index = max(math.ceil(len(sorted_values) * 0.9) - 1, 0)
+    return sorted_values[index]
+
+
+def build_unresolved_child_clusters(sessions: dict, child_sessions: dict, assignments: dict):
+    clusters = {}
+    for child_id, child_info in child_sessions.items():
+        if child_id in assignments:
+            continue
+        session = sessions[child_id]
+        cwd = session.get("cwd") or child_info["project_root"]
+        cluster = clusters.setdefault(
+            cwd,
+            {
+                "cwd": cwd,
+                "session_count": 0,
+                "session_ids": [],
+                "usage": create_usage_dict(),
+                "models": defaultdict(create_usage_dict),
+                "first_event_at": None,
+                "last_event_at": None,
+                "totals": [],
+            },
+        )
+        cluster["session_count"] += 1
+        cluster["session_ids"].append(child_id)
+        add_usage(cluster["usage"], session)
+        for model, usage in session["models"].items():
+            add_usage(cluster["models"][model], usage)
+        cluster["first_event_at"] = merge_time_window(cluster["first_event_at"], session.get("first_event_at"), True)
+        cluster["last_event_at"] = merge_time_window(cluster["last_event_at"], session.get("last_event_at"), False)
+        cluster["totals"].append(usage_total(session))
+
+    results = []
+    for cluster in clusters.values():
+        totals = cluster.pop("totals")
+        total_cost, partial_cost = calculate_models_cost(cluster["models"])
+        cluster["average_tokens"] = sum(totals) // len(totals) if totals else 0
+        cluster["median_tokens"] = int(median(totals)) if totals else 0
+        cluster["p90_tokens"] = percentile_90(totals)
+        cluster["max_tokens"] = max(totals) if totals else 0
+        cluster["total_cost"] = total_cost
+        cluster["partial_cost"] = partial_cost
+        results.append(cluster)
+
+    results.sort(
+        key=lambda item: (
+            item["first_event_at"] is None,
+            item["first_event_at"] or datetime.max.replace(tzinfo=ZoneInfo("UTC")),
+            item["cwd"],
+        )
+    )
+    return results
 
 
 def collect_usage_data(start_local: datetime, end_local: datetime, include_sessions: bool, include_days: bool):
@@ -421,26 +923,31 @@ def collect_usage_data(start_local: datetime, end_local: datetime, include_sessi
     model_totals = defaultdict(create_usage_dict)
     sessions = {} if include_sessions else None
     days = {} if include_days else None
+    session_catalog = {} if include_sessions else None
 
     for file_path in iter_session_files(root, start_utc):
         file_state = create_file_state(file_path)
 
         for obj in read_jsonl(file_path):
-            update_file_state_metadata(obj, file_state)
+            timestamp_str = obj.get("timestamp")
+            event_time_utc = None
+            event_time_local = None
+            if isinstance(timestamp_str, str):
+                try:
+                    event_time_utc = parse_iso_datetime(timestamp_str)
+                    event_time_local = event_time_utc.astimezone(target_tz)
+                except ValueError:
+                    event_time_utc = None
+                    event_time_local = None
+
+            if include_sessions:
+                update_file_state_metadata(obj, file_state, event_time_local)
             update_model_tracking(obj, file_state)
 
-            timestamp_str = obj.get("timestamp")
-            if not timestamp_str:
+            if event_time_utc is None:
                 continue
-
-            try:
-                event_time_utc = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-            except ValueError:
-                continue
-
             if not (start_utc <= event_time_utc < end_utc):
                 continue
-
             if not is_usage_item(obj):
                 continue
 
@@ -462,11 +969,8 @@ def collect_usage_data(start_local: datetime, end_local: datetime, include_sessi
                 session_record = sessions.setdefault(session_id, create_session_record(session_id))
                 add_usage(session_record, last_usage)
                 add_usage(session_record["models"][model_key], last_usage)
-
-                if session_record["first_event_at"] is None or event_time_local < session_record["first_event_at"]:
-                    session_record["first_event_at"] = event_time_local
-                if session_record["last_event_at"] is None or event_time_local > session_record["last_event_at"]:
-                    session_record["last_event_at"] = event_time_local
+                session_record["first_event_at"] = merge_time_window(session_record["first_event_at"], event_time_local, True)
+                session_record["last_event_at"] = merge_time_window(session_record["last_event_at"], event_time_local, False)
 
             if include_days:
                 day_key = event_time_local.strftime("%Y-%m-%d")
@@ -477,12 +981,19 @@ def collect_usage_data(start_local: datetime, end_local: datetime, include_sessi
             file_state["used_in_range"] = True
             file_state["last_model_seen"] = file_state["turn_default_model"]
 
-        if include_sessions and file_state["used_in_range"]:
-            apply_session_metadata(sessions[file_state["session_id"]], file_state)
+        if include_sessions:
+            metadata_record = session_catalog.setdefault(file_state["session_id"], create_session_metadata_record(file_state["session_id"]))
+            merge_session_metadata(metadata_record, file_state)
+            if file_state["used_in_range"] and file_state["session_id"] in sessions:
+                apply_session_metadata(sessions[file_state["session_id"]], metadata_record)
 
     result = {"models": model_totals}
     if include_sessions:
+        child_sessions = identify_child_sessions(sessions, session_catalog)
+        assignments = assign_parent_sessions(sessions, session_catalog, child_sessions)
         result["sessions"] = sessions
+        result["session_display"] = build_session_display_records(sessions, session_catalog, child_sessions, assignments)
+        result["session_clusters"] = build_unresolved_child_clusters(sessions, child_sessions, assignments)
     if include_days:
         result["days"] = days
     return result
@@ -514,10 +1025,6 @@ def collect_recent_usage(start_local: datetime, end_local: datetime, day_count: 
             }
         )
     return {"start_local": start_local, "end_local": end_local, "days": records}
-
-
-def sorted_model_items(models: dict):
-    return sorted(models.items(), key=lambda item: (item[0] not in PRICES, item[0] == "unknown", item[0]))
 
 
 def build_summary_lines(report: dict, start_local: datetime, end_local: datetime):
@@ -575,44 +1082,58 @@ def build_summary_lines(report: dict, start_local: datetime, end_local: datetime
 
 def build_session_lines(report: dict):
     lines = ["", "三、Session 明细"]
-    session_items = sorted(
-        report["sessions"].values(),
-        key=lambda item: (
-            item["first_event_at"] is None,
-            item["first_event_at"] or datetime.max.replace(tzinfo=ZoneInfo("UTC")),
-            item["session_id"],
-        ),
-    )
-
+    session_items = report.get("session_display", [])
     if not session_items:
-        lines.append("当日未发现 session 级 token 使用记录。")
-        return lines
-
-    for index, session in enumerate(session_items, start=1):
-        model_parts = []
-        session_cost, partial_cost = calculate_models_cost(session["models"])
-
-        for model, usage in sorted_model_items(session["models"]):
-            model_parts.append(
-                f"{model}（总Token {format_token_count(usage_total(usage))}，输入 {format_token_count(usage['input_tokens'])}，输出 {format_token_count(usage['output_tokens'])}）"
+        lines.append("当日未发现可展开的 session 级 token 使用记录。")
+    else:
+        for index, session in enumerate(session_items, start=1):
+            session_cost, partial_cost = calculate_models_cost(session["models"])
+            model_parts = build_model_parts(session["models"])
+            lines.extend(
+                [
+                    f"3.{index} {session['title']}",
+                    f"session_id：{session['session_id']}",
+                    f"时间：{format_event_window(session['first_event_at'], session['last_event_at'])}",
+                    f"cwd：{session['cwd'] or '未知'}",
+                ]
+            )
+            if session["display_kind"] == "group":
+                lines.append(f"子会话数：{session['child_count']}")
+                lines.append(f"关联项目：{'；'.join(session['project_roots']) if session['project_roots'] else '未知'}")
+            lines.extend(
+                [
+                    f"总Token：{format_token_count(usage_total(session))}",
+                    f"输入：{format_token_count(session['input_tokens'])}",
+                    f"缓存命中：{format_token_count(session['cached_input_tokens'])}",
+                    f"非缓存输入：{format_token_count(model_miss_tokens(session))}",
+                    f"输出：{format_token_count(session['output_tokens'])}",
+                    f"模型分布：{'；'.join(model_parts) if model_parts else '无'}",
+                    f"估算成本：{format_cost_text(session_cost, partial_cost)}",
+                    "",
+                ]
             )
 
-        lines.extend(
-            [
-                f"3.{index} {session['title']}",
-                f"session_id：{session['session_id']}",
-                f"时间：{format_event_window(session['first_event_at'], session['last_event_at'])}",
-                f"cwd：{session['cwd'] or '未知'}",
-                f"总Token：{format_token_count(usage_total(session))}",
-                f"输入：{format_token_count(session['input_tokens'])}",
-                f"缓存命中：{format_token_count(session['cached_input_tokens'])}",
-                f"非缓存输入：{format_token_count(model_miss_tokens(session))}",
-                f"输出：{format_token_count(session['output_tokens'])}",
-                f"模型分布：{'；'.join(model_parts) if model_parts else '无'}",
-                f"估算成本：{format_cost_text(session_cost, partial_cost)}",
-                "",
-            ]
-        )
+    lines.extend(["", "四、未归母子会话聚类"])
+    clusters = report.get("session_clusters", [])
+    if not clusters:
+        lines.append("当日未发现未归母子会话聚类。")
+    else:
+        for index, cluster in enumerate(clusters, start=1):
+            lines.extend(
+                [
+                    f"4.{index} {cluster['cwd']}",
+                    f"子会话数：{cluster['session_count']}",
+                    f"时间：{format_event_window(cluster['first_event_at'], cluster['last_event_at'])}",
+                    f"总Token：{format_token_count(usage_total(cluster['usage']))}",
+                    f"平均Token：{format_token_count(cluster['average_tokens'])}",
+                    f"中位数Token：{format_token_count(cluster['median_tokens'])}",
+                    f"P90 Token：{format_token_count(cluster['p90_tokens'])}",
+                    f"最大Token：{format_token_count(cluster['max_tokens'])}",
+                    f"模型分布：{'；'.join(build_model_parts(cluster['models'])) or '无'}",
+                    f"估算成本：{format_cost_text(cluster['total_cost'], cluster['partial_cost'])}",
+                    "",
+                ]
+            )
 
     if lines[-1] == "":
         lines.pop()
@@ -623,14 +1144,6 @@ def format_reports(report: dict, start_local: datetime, end_local: datetime):
     summary_lines = build_summary_lines(report, start_local, end_local)
     detail_lines = summary_lines + build_session_lines(report)
     return "\n".join(summary_lines), "\n".join(detail_lines) + "\n"
-
-
-def percentile_90(values: list[int]) -> int:
-    if not values:
-        return 0
-    sorted_values = sorted(values)
-    index = max(math.ceil(len(sorted_values) * 0.9) - 1, 0)
-    return sorted_values[index]
 
 
 def build_recent_summary_lines(recent_report: dict):
