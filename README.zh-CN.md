@@ -112,8 +112,9 @@ graph TD
 | 命令         | 描述                                                       |
 |--------------|------------------------------------------------------------|
 | `make run`   | **(推荐)** 启动后台守护进程，持续监控错误。                |
-| `make today` | 显示当天 token 汇总、总 Token、session 明细和预估费用。    |
+| `make today` | 显示当天 token 汇总、总 Token、活跃时长、session 明细和预估费用。 |
 | `make usage` | 与 `make today` 相同；可通过 `D=YYYY-MM-DD` 指定查询日期。 |
+| `make recent` | 显示最近 `N` 天的 token、成本与活跃时长统计；默认 `N=30`，可通过 `N=<天数>` 覆盖。 |
 | `make debug` | 输出近期 limit 事件与目标调度状态；可通过 `DEBUG_ARGS` 切换到具体 debug 子流程。 |
 | `make status`| 显示监控程序的当前状态，包括待处理和已完成的任务。         |
 | `make test`  | 运行基于脱敏真实样本构建的自动化单测。                     |
@@ -124,8 +125,9 @@ graph TD
 
 | 命令             | 描述                                                           |
 |------------------|----------------------------------------------------------------|
-| `make today`     | 显示当天 token 汇总、总 Token、session 明细和预估费用。        |
+| `make today`     | 显示当天 token 汇总、总 Token、活跃时长、session 明细和预估费用。 |
 | `make usage`     | 与 `make today` 相同；可通过 `D=YYYY-MM-DD` 指定查询日期。     |
+| `make recent`    | 显示最近 `N` 天的 token、成本与活跃时长统计；默认 `N=30`。     |
 | `make run`       | 启动守护进程，以持续监控用量超限错误。                         |
 | `make status`    | 打印监控程序的内部 JSON 状态（待处理任务、已处理错误等）。     |
 | `make debug`     | 默认输出最近 7 天的 limit 事件、候选结果和目标 pending jobs。  |
@@ -144,8 +146,11 @@ graph TD
 
 ### Usage 示例
 
-- `make today` 输出当天的 token 汇总、模型汇总和 session 级明细。
+- `make today` 输出当天的 token 汇总、模型汇总、活跃时长和 session 级明细。
 - `make usage D=2026-07-03` 输出 2026-07-03 当天的同类报告。
+- `make recent` 输出最近 30 天的 token、成本与活跃时长统计。
+- `make recent N=7` 将上述统计窗口缩短为最近 7 天。
+- 活跃时长是估算值，口径为“15 分钟空闲切断 + 每段活跃片段追加 5 分钟尾窗”。
 
 
 ## 贡献代码

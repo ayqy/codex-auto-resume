@@ -134,6 +134,50 @@ def test_format_token_count_uses_expected_units():
     assert module.format_token_count(1_250_000) == "1.25百万（1,250,000）"
 
 
+def test_build_activity_spans_merges_short_gaps_and_adds_tail_window():
+    module = load_module()
+    tz = module.ZoneInfo("Asia/Shanghai")
+    events = [
+        datetime(2026, 7, 1, 10, 0, 0, tzinfo=tz),
+        datetime(2026, 7, 1, 10, 12, 0, tzinfo=tz),
+        datetime(2026, 7, 1, 10, 40, 0, tzinfo=tz),
+    ]
+
+    spans = module.build_activity_spans(events)
+
+    assert spans == [
+        (datetime(2026, 7, 1, 10, 0, 0, tzinfo=tz), datetime(2026, 7, 1, 10, 17, 0, tzinfo=tz)),
+        (datetime(2026, 7, 1, 10, 40, 0, tzinfo=tz), datetime(2026, 7, 1, 10, 45, 0, tzinfo=tz)),
+    ]
+
+
+def test_sum_activity_seconds_clamps_window():
+    module = load_module()
+    tz = module.ZoneInfo("Asia/Shanghai")
+    spans = [
+        (datetime(2026, 7, 1, 10, 0, 0, tzinfo=tz), datetime(2026, 7, 1, 10, 17, 0, tzinfo=tz)),
+        (datetime(2026, 7, 1, 10, 40, 0, tzinfo=tz), datetime(2026, 7, 1, 10, 45, 0, tzinfo=tz)),
+    ]
+
+    total_seconds = module.sum_activity_seconds(
+        spans,
+        datetime(2026, 7, 1, 10, 5, 0, tzinfo=tz),
+        datetime(2026, 7, 1, 10, 45, 0, tzinfo=tz),
+    )
+
+    assert total_seconds == 1_020
+
+
+def test_format_duration_uses_expected_text():
+    module = load_module()
+
+    assert module.format_duration(0) == "0分钟"
+    assert module.format_duration(300) == "5分钟"
+    assert module.format_duration(3_600) == "1小时"
+    assert module.format_duration(3_900) == "1小时5分钟"
+    assert module.format_duration(898) == "15分钟"
+
+
 def test_extract_semantic_title_text_skips_noise_and_merges_lines():
     module = load_module()
 
@@ -177,6 +221,8 @@ def test_collect_usage_report_includes_session_title_and_totals(monkeypatch, cod
     assert session["input_tokens"] == 50_000_000
     assert session["cached_input_tokens"] == 15_000_000
     assert session["output_tokens"] == 3_000_000
+    assert session["active_seconds"] == 898
+    assert report["active_seconds"] == 898
 
 
 def test_collect_usage_report_uses_semantic_titles_for_june_27(monkeypatch, codex_home):
@@ -346,7 +392,8 @@ def test_collect_usage_report_aggregates_child_sessions_under_parent(monkeypatch
     end_local = datetime(2026, 6, 29, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
     report = module.collect_usage_report(start_local, end_local)
 
-    assert set(report["sessions"]) == {child_id}
+    assert set(report["sessions"]) == {parent_id, child_id}
+    assert report["sessions"][parent_id]["active_seconds"] == 358
     assert len(report["session_display"]) == 1
     display = report["session_display"][0]
     assert display["session_id"] == parent_id
@@ -356,6 +403,7 @@ def test_collect_usage_report_aggregates_child_sessions_under_parent(monkeypatch
     assert display["input_tokens"] == 100
     assert display["cached_input_tokens"] == 40
     assert display["output_tokens"] == 10
+    assert display["active_seconds"] == 478
     assert report["session_clusters"] == []
 
 
@@ -448,6 +496,168 @@ def test_collect_usage_report_clusters_unresolved_child_sessions_by_cwd(monkeypa
     assert cluster["median_tokens"] == 165
     assert cluster["p90_tokens"] == 220
     assert cluster["max_tokens"] == 220
+    assert cluster["active_seconds"] == 537
+    assert cluster["average_active_seconds"] == 300
+    assert cluster["median_active_seconds"] == 300
+    assert cluster["p90_active_seconds"] == 300
+    assert cluster["max_active_seconds"] == 300
+
+
+def test_collect_usage_report_includes_activity_only_session(monkeypatch, tmp_path):
+    module = load_module()
+    codex_home = tmp_path / "codex_home"
+    session_id = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee1"
+    write_session_file(
+        codex_home,
+        "2026-07-04",
+        "2026-07-04T10-00-00",
+        session_id,
+        [
+            {
+                "timestamp": "2026-07-04T02:00:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "session_id": session_id,
+                    "id": session_id,
+                    "cwd": "/workspace/activity-only",
+                },
+            },
+            {
+                "timestamp": "2026-07-04T02:00:01.000Z",
+                "type": "turn_context",
+                "payload": {
+                    "turn_id": "turn-activity-only",
+                    "cwd": "/workspace/activity-only",
+                    "model": "gpt-5.4-mini",
+                },
+            },
+            {
+                "timestamp": "2026-07-04T02:00:02.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "这是一个只有活跃时长没有 token 的会话。",
+                    "images": [],
+                },
+            },
+        ],
+    )
+
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    start_local = datetime(2026, 7, 4, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    end_local = datetime(2026, 7, 5, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    report = module.collect_usage_report(start_local, end_local)
+
+    assert report["active_seconds"] == 300
+    assert set(report["sessions"]) == {session_id}
+    session = report["sessions"][session_id]
+    assert session["input_tokens"] == 0
+    assert session["output_tokens"] == 0
+    assert session["active_seconds"] == 300
+    assert len(report["session_display"]) == 1
+    assert report["session_display"][0]["title"] == "这是一个只有活跃时长没有 token 的会话。"
+    assert report["session_display"][0]["active_seconds"] == 300
+
+
+def test_collect_recent_usage_merges_overlapping_daily_activity(monkeypatch, tmp_path):
+    module = load_module()
+    codex_home = tmp_path / "codex_home"
+
+    for index, minute_offset in enumerate([0, 3], start=1):
+        session_id = f"ffffffff-ffff-4fff-8fff-fffffffffff{index}"
+        write_session_file(
+            codex_home,
+            "2026-07-04",
+            f"2026-07-04T10-0{minute_offset}-00",
+            session_id,
+            [
+                {
+                    "timestamp": f"2026-07-04T02:0{minute_offset}:00.000Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "session_id": session_id,
+                        "id": session_id,
+                        "cwd": f"/workspace/recent-overlap-{index}",
+                    },
+                },
+                {
+                    "timestamp": f"2026-07-04T02:0{minute_offset}:01.000Z",
+                    "type": "turn_context",
+                    "payload": {
+                        "turn_id": f"turn-recent-overlap-{index}",
+                        "cwd": f"/workspace/recent-overlap-{index}",
+                        "model": "gpt-5.4-mini",
+                    },
+                },
+                {
+                    "timestamp": f"2026-07-04T02:0{minute_offset}:02.000Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": f"重叠活跃测试 {index}",
+                        "images": [],
+                    },
+                },
+                token_event(f"2026-07-04T02:0{minute_offset + 5}:00.000Z", 100, 20, 10),
+            ],
+        )
+
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    start_local = datetime(2026, 7, 4, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    end_local = datetime(2026, 7, 5, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    recent = module.collect_recent_usage(start_local, end_local, 1)
+
+    assert recent["active_seconds"] == 778
+    assert recent["days"][0]["active_seconds"] == 778
+
+
+def test_collect_recent_usage_splits_cross_day_activity(monkeypatch, tmp_path):
+    module = load_module()
+    codex_home = tmp_path / "codex_home"
+    session_id = "abababab-abab-4aba-8aba-abababababa1"
+    write_session_file(
+        codex_home,
+        "2026-07-03",
+        "2026-07-03T23-58-00",
+        session_id,
+        [
+            {
+                "timestamp": "2026-07-03T15:58:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "session_id": session_id,
+                    "id": session_id,
+                    "cwd": "/workspace/recent-cross-day",
+                },
+            },
+            {
+                "timestamp": "2026-07-03T15:58:01.000Z",
+                "type": "turn_context",
+                "payload": {
+                    "turn_id": "turn-recent-cross-day",
+                    "cwd": "/workspace/recent-cross-day",
+                    "model": "gpt-5.4-mini",
+                },
+            },
+            {
+                "timestamp": "2026-07-03T15:58:02.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "跨天活跃时长测试",
+                    "images": [],
+                },
+            },
+            token_event("2026-07-03T16:10:00.000Z", 100, 20, 10),
+        ],
+    )
+
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    start_local = datetime(2026, 7, 3, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    end_local = datetime(2026, 7, 5, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    recent = module.collect_recent_usage(start_local, end_local, 2)
+
+    assert [record["active_seconds"] for record in recent["days"]] == [118, 900]
 
 
 def test_main_date_summary_only_writes_full_detail(monkeypatch, codex_home, tmp_path, capsys):
@@ -475,9 +685,11 @@ def test_main_date_summary_only_writes_full_detail(monkeypatch, codex_home, tmp_
 
     assert "日期：2026-07-03" in output
     assert "总Token：5.3千万（53,000,000）" in output
+    assert "活跃时长：15分钟" in output
     assert "三、Session 明细" not in output
     assert "三、Session 明细" in detail_text
     assert "3.1 2026年7月3日这是第一行标题，会被截取并保留到句号。第二句不应进入标题。 第二行不应进入标题" in detail_text
+    assert "活跃时长：15分钟" in detail_text
 
 
 def test_main_today_summary_only_succeeds(monkeypatch, codex_home, tmp_path, capsys):
@@ -505,6 +717,7 @@ def test_main_today_summary_only_succeeds(monkeypatch, codex_home, tmp_path, cap
 
     assert "日期：2026-07-04" in output
     assert "总Token：8亿（800,000,000）" in output
+    assert "活跃时长：15分钟" in output
     assert detail_file.exists()
 
 
@@ -536,9 +749,10 @@ def test_main_recent_30_days_writes_markdown_detail(monkeypatch, codex_home, tmp
     assert "活跃天数：7" in output
     assert "总Token：8.54亿（854,302,465）" in output
     assert "总成本：$2,324.90（部分模型未计价）" in output
-    assert "2026-07-04 | 总Token 8亿（800,000,000） | 成本 $2,187.50" in output
-    assert "# 最近Token与成本明细" in detail_text
-    assert "| 2026-07-04 | 8亿（800,000,000） | $2,187.50 |" in detail_text
+    assert "总活跃时长：1小时54分钟" in output
+    assert "2026-07-04 | 总Token 8亿（800,000,000） | 成本 $2,187.50 | 活跃时长 15分钟" in output
+    assert "# 最近 Token、成本与活跃时长明细" in detail_text
+    assert "| 2026-07-04 | 8亿（800,000,000） | $2,187.50 | 15分钟 |" in detail_text
 
 
 def test_main_recent_one_day_only_counts_today(monkeypatch, codex_home, tmp_path, capsys):
@@ -569,7 +783,8 @@ def test_main_recent_one_day_only_counts_today(monkeypatch, codex_home, tmp_path
     assert "活跃天数：1" in output
     assert "总Token：8亿（800,000,000）" in output
     assert "总成本：$2,187.50" in output
-    assert "| 2026-07-04 | 8亿（800,000,000） | $2,187.50 |" in detail_text
+    assert "总活跃时长：15分钟" in output
+    assert "| 2026-07-04 | 8亿（800,000,000） | $2,187.50 | 15分钟 |" in detail_text
 
 
 def test_main_missing_sessions_returns_error(monkeypatch, tmp_path, capsys):

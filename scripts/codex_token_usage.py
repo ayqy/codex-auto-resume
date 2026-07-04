@@ -38,6 +38,8 @@ NOISE_BLOCK_REGEXES = [
     re.compile(r"<environment_context>.*?</environment_context>", re.DOTALL),
     re.compile(r"<turn_aborted>.*?</turn_aborted>", re.DOTALL),
 ]
+ACTIVE_GAP_LIMIT = timedelta(minutes=15)
+ACTIVE_TAIL_WINDOW = timedelta(minutes=5)
 
 
 def session_root() -> Path:
@@ -77,6 +79,10 @@ def create_session_record(session_id: str):
             "first_event_at": None,
             "last_event_at": None,
             "models": defaultdict(create_usage_dict),
+            "_activity_events": [],
+            "_activity_spans": [],
+            "active_seconds": 0,
+            "has_usage_in_range": False,
         }
     )
     return record
@@ -108,13 +114,21 @@ def create_display_session_record(session_id: str, title: str, cwd: Optional[str
             "child_session_ids": [],
             "project_roots": [],
             "is_synthetic_parent": False,
+            "_activity_spans": [],
+            "active_seconds": 0,
         }
     )
     return record
 
 
 def create_day_record(day: str):
-    return {"day": day, "usage": create_usage_dict(), "models": defaultdict(create_usage_dict)}
+    return {
+        "day": day,
+        "usage": create_usage_dict(),
+        "models": defaultdict(create_usage_dict),
+        "_activity_spans": [],
+        "active_seconds": 0,
+    }
 
 
 def resolve_timezone(name: Optional[str]) -> ZoneInfo:
@@ -186,6 +200,128 @@ def format_token_short(value: int) -> str:
 
 def format_token_count(value: int) -> str:
     return f"{format_token_short(value)}（{value:,}）"
+
+
+def is_activity_event(obj: dict) -> bool:
+    payload = obj.get("payload", {})
+    if not isinstance(payload, dict):
+        return False
+
+    obj_type = obj.get("type")
+    if obj_type == "event_msg":
+        payload_type = payload.get("type")
+        if payload_type == "user_message":
+            message = payload.get("message")
+            return isinstance(message, str) and bool(message.strip())
+        if payload_type != "token_count":
+            return False
+        info = payload.get("info", {})
+        if not isinstance(info, dict):
+            return False
+        last_usage = info.get("last_token_usage", {})
+        return isinstance(last_usage, dict) and bool(last_usage)
+
+    if obj_type != "response_item":
+        return False
+    return payload.get("type") in {"message", "function_call", "function_call_output"}
+
+
+def append_activity_event(record: dict, event_time_local: Optional[datetime]) -> None:
+    if event_time_local is None:
+        return
+    record["_activity_events"].append(event_time_local)
+
+
+def build_activity_spans(event_times: list[datetime]) -> list[tuple[datetime, datetime]]:
+    if not event_times:
+        return []
+
+    sorted_times = sorted(event_times)
+    spans = []
+    current_start = sorted_times[0]
+    current_end = sorted_times[0]
+
+    for event_time in sorted_times[1:]:
+        if event_time - current_end <= ACTIVE_GAP_LIMIT:
+            current_end = event_time
+            continue
+        spans.append((current_start, current_end + ACTIVE_TAIL_WINDOW))
+        current_start = event_time
+        current_end = event_time
+
+    spans.append((current_start, current_end + ACTIVE_TAIL_WINDOW))
+    return spans
+
+
+def merge_activity_spans(spans: list[tuple[datetime, datetime]]) -> list[tuple[datetime, datetime]]:
+    if not spans:
+        return []
+
+    merged = []
+    for start_at, end_at in sorted(spans, key=lambda item: (item[0], item[1])):
+        if end_at <= start_at:
+            continue
+        if not merged or start_at > merged[-1][1]:
+            merged.append((start_at, end_at))
+            continue
+        merged[-1] = (merged[-1][0], max(merged[-1][1], end_at))
+    return merged
+
+
+def clamp_activity_spans(
+    spans: list[tuple[datetime, datetime]],
+    start_at: Optional[datetime],
+    end_at: Optional[datetime],
+) -> list[tuple[datetime, datetime]]:
+    clamped = []
+    for span_start, span_end in merge_activity_spans(spans):
+        bounded_start = max(span_start, start_at) if start_at is not None else span_start
+        bounded_end = min(span_end, end_at) if end_at is not None else span_end
+        if bounded_end <= bounded_start:
+            continue
+        clamped.append((bounded_start, bounded_end))
+    return clamped
+
+
+def sum_activity_seconds(
+    spans: list[tuple[datetime, datetime]],
+    start_at: Optional[datetime] = None,
+    end_at: Optional[datetime] = None,
+) -> int:
+    total_seconds = 0
+    for span_start, span_end in clamp_activity_spans(spans, start_at, end_at):
+        total_seconds += int((span_end - span_start).total_seconds())
+    return total_seconds
+
+
+def split_activity_spans_by_day(
+    spans: list[tuple[datetime, datetime]],
+    start_local: datetime,
+    end_local: datetime,
+) -> dict[str, int]:
+    day_totals = {}
+    day_cursor = start_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    while day_cursor < end_local:
+        day_end = day_cursor + timedelta(days=1)
+        range_start = max(day_cursor, start_local)
+        range_end = min(day_end, end_local)
+        seconds = sum_activity_seconds(spans, range_start, range_end)
+        if seconds > 0:
+            day_totals[day_cursor.strftime("%Y-%m-%d")] = seconds
+        day_cursor = day_end
+    return day_totals
+
+
+def format_duration(seconds: int) -> str:
+    if seconds <= 0:
+        return "0分钟"
+    rounded_minutes = max(int(round(seconds / 60)), 1)
+    hours, minutes = divmod(rounded_minutes, 60)
+    if hours <= 0:
+        return f"{rounded_minutes}分钟"
+    if minutes == 0:
+        return f"{hours}小时"
+    return f"{hours}小时{minutes}分钟"
 
 
 def usage_total(usage: dict) -> int:
@@ -823,10 +959,15 @@ def build_session_display_records(sessions: dict, session_catalog: dict, child_s
         record["child_session_ids"] = list(child_ids)
         record["project_roots"] = sorted({child_sessions[child_id]["project_root"] for child_id in child_ids})
         record["is_synthetic_parent"] = parent_raw is None
+        activity_spans = []
         if parent_raw:
             merge_session_usage(record, parent_raw)
+            activity_spans.extend(parent_raw.get("_activity_spans", []))
         for child_id in child_ids:
             merge_session_usage(record, sessions[child_id])
+            activity_spans.extend(sessions[child_id].get("_activity_spans", []))
+        record["_activity_spans"] = merge_activity_spans(activity_spans)
+        record["active_seconds"] = sum_activity_seconds(record["_activity_spans"])
         display_records.append(record)
 
     grouped_parent_ids = set(parent_children)
@@ -839,6 +980,8 @@ def build_session_display_records(sessions: dict, session_catalog: dict, child_s
             continue
         record = create_display_session_record(session_id, session["title"], session.get("cwd"), "single")
         merge_session_usage(record, session)
+        record["_activity_spans"] = list(session.get("_activity_spans", []))
+        record["active_seconds"] = int(session.get("active_seconds", 0) or 0)
         display_records.append(record)
 
     display_records.sort(
@@ -877,6 +1020,8 @@ def build_unresolved_child_clusters(sessions: dict, child_sessions: dict, assign
                 "first_event_at": None,
                 "last_event_at": None,
                 "totals": [],
+                "active_totals": [],
+                "_activity_spans": [],
             },
         )
         cluster["session_count"] += 1
@@ -887,15 +1032,24 @@ def build_unresolved_child_clusters(sessions: dict, child_sessions: dict, assign
         cluster["first_event_at"] = merge_time_window(cluster["first_event_at"], session.get("first_event_at"), True)
         cluster["last_event_at"] = merge_time_window(cluster["last_event_at"], session.get("last_event_at"), False)
         cluster["totals"].append(usage_total(session))
+        cluster["active_totals"].append(int(session.get("active_seconds", 0) or 0))
+        cluster["_activity_spans"].extend(session.get("_activity_spans", []))
 
     results = []
     for cluster in clusters.values():
         totals = cluster.pop("totals")
+        active_totals = cluster.pop("active_totals")
+        cluster["_activity_spans"] = merge_activity_spans(cluster["_activity_spans"])
         total_cost, partial_cost = calculate_models_cost(cluster["models"])
         cluster["average_tokens"] = sum(totals) // len(totals) if totals else 0
         cluster["median_tokens"] = int(median(totals)) if totals else 0
         cluster["p90_tokens"] = percentile_90(totals)
         cluster["max_tokens"] = max(totals) if totals else 0
+        cluster["active_seconds"] = sum_activity_seconds(cluster["_activity_spans"])
+        cluster["average_active_seconds"] = sum(active_totals) // len(active_totals) if active_totals else 0
+        cluster["median_active_seconds"] = int(median(active_totals)) if active_totals else 0
+        cluster["p90_active_seconds"] = percentile_90(active_totals)
+        cluster["max_active_seconds"] = max(active_totals) if active_totals else 0
         cluster["total_cost"] = total_cost
         cluster["partial_cost"] = partial_cost
         results.append(cluster)
@@ -914,6 +1068,8 @@ def collect_usage_data(start_local: datetime, end_local: datetime, include_sessi
     utc_tz = ZoneInfo("UTC")
     start_utc = start_local.astimezone(utc_tz)
     end_utc = end_local.astimezone(utc_tz)
+    activity_start_utc = (start_local - ACTIVE_GAP_LIMIT).astimezone(utc_tz)
+    activity_end_utc = (end_local + ACTIVE_GAP_LIMIT).astimezone(utc_tz)
     target_tz = start_local.tzinfo or ZoneInfo("Asia/Shanghai")
 
     root = session_root()
@@ -922,6 +1078,7 @@ def collect_usage_data(start_local: datetime, end_local: datetime, include_sessi
 
     model_totals = defaultdict(create_usage_dict)
     sessions = {} if include_sessions else None
+    activity_sessions = sessions if include_sessions else {}
     days = {} if include_days else None
     session_catalog = {} if include_sessions else None
 
@@ -946,6 +1103,17 @@ def collect_usage_data(start_local: datetime, end_local: datetime, include_sessi
 
             if event_time_utc is None:
                 continue
+            if activity_start_utc <= event_time_utc < activity_end_utc and is_activity_event(obj):
+                session_id = file_state["session_id"]
+                activity_record = activity_sessions.setdefault(session_id, create_session_record(session_id))
+                append_activity_event(activity_record, event_time_local)
+                if start_utc <= event_time_utc < end_utc:
+                    activity_record["first_event_at"] = merge_time_window(
+                        activity_record["first_event_at"], event_time_local, True
+                    )
+                    activity_record["last_event_at"] = merge_time_window(
+                        activity_record["last_event_at"], event_time_local, False
+                    )
             if not (start_utc <= event_time_utc < end_utc):
                 continue
             if not is_usage_item(obj):
@@ -965,12 +1133,13 @@ def collect_usage_data(start_local: datetime, end_local: datetime, include_sessi
 
             add_usage(model_totals[model_key], last_usage)
 
+            session_record = activity_sessions.setdefault(session_id, create_session_record(session_id))
             if include_sessions:
-                session_record = sessions.setdefault(session_id, create_session_record(session_id))
                 add_usage(session_record, last_usage)
                 add_usage(session_record["models"][model_key], last_usage)
-                session_record["first_event_at"] = merge_time_window(session_record["first_event_at"], event_time_local, True)
-                session_record["last_event_at"] = merge_time_window(session_record["last_event_at"], event_time_local, False)
+            session_record["first_event_at"] = merge_time_window(session_record["first_event_at"], event_time_local, True)
+            session_record["last_event_at"] = merge_time_window(session_record["last_event_at"], event_time_local, False)
+            session_record["has_usage_in_range"] = True
 
             if include_days:
                 day_key = event_time_local.strftime("%Y-%m-%d")
@@ -984,10 +1153,27 @@ def collect_usage_data(start_local: datetime, end_local: datetime, include_sessi
         if include_sessions:
             metadata_record = session_catalog.setdefault(file_state["session_id"], create_session_metadata_record(file_state["session_id"]))
             merge_session_metadata(metadata_record, file_state)
-            if file_state["used_in_range"] and file_state["session_id"] in sessions:
+            if file_state["session_id"] in sessions:
                 apply_session_metadata(sessions[file_state["session_id"]], metadata_record)
 
-    result = {"models": model_totals}
+    all_activity_spans = []
+    for session_id, session_record in list(activity_sessions.items()):
+        raw_spans = build_activity_spans(session_record["_activity_events"])
+        clamped_spans = clamp_activity_spans(raw_spans, start_local, end_local)
+        session_record["_activity_spans"] = clamped_spans
+        session_record["active_seconds"] = sum_activity_seconds(clamped_spans)
+        if clamped_spans and session_record["first_event_at"] is None:
+            session_record["first_event_at"] = clamped_spans[0][0]
+            session_record["last_event_at"] = clamped_spans[-1][1]
+        all_activity_spans.extend(clamped_spans)
+
+        if not include_sessions:
+            continue
+        if usage_total(session_record) == 0 and session_record["active_seconds"] == 0:
+            sessions.pop(session_id, None)
+
+    merged_activity_spans = merge_activity_spans(all_activity_spans)
+    result = {"models": model_totals, "active_seconds": sum_activity_seconds(merged_activity_spans)}
     if include_sessions:
         child_sessions = identify_child_sessions(sessions, session_catalog)
         assignments = assign_parent_sessions(sessions, session_catalog, child_sessions)
@@ -995,6 +1181,9 @@ def collect_usage_data(start_local: datetime, end_local: datetime, include_sessi
         result["session_display"] = build_session_display_records(sessions, session_catalog, child_sessions, assignments)
         result["session_clusters"] = build_unresolved_child_clusters(sessions, child_sessions, assignments)
     if include_days:
+        for day_key, seconds in split_activity_spans_by_day(merged_activity_spans, start_local, end_local).items():
+            day_record = days.setdefault(day_key, create_day_record(day_key))
+            day_record["active_seconds"] = seconds
         result["days"] = days
     return result
 
@@ -1022,9 +1211,15 @@ def collect_recent_usage(start_local: datetime, end_local: datetime, day_count: 
                 "models": day_record["models"],
                 "total_cost": total_cost,
                 "partial_cost": partial_cost,
+                "active_seconds": int(day_record.get("active_seconds", 0) or 0),
             }
         )
-    return {"start_local": start_local, "end_local": end_local, "days": records}
+    return {
+        "start_local": start_local,
+        "end_local": end_local,
+        "days": records,
+        "active_seconds": int(report.get("active_seconds", 0) or 0),
+    }
 
 
 def build_summary_lines(report: dict, start_local: datetime, end_local: datetime):
@@ -1032,6 +1227,7 @@ def build_summary_lines(report: dict, start_local: datetime, end_local: datetime
     for _, usage in report["models"].items():
         add_usage(total_usage, usage)
     total_cost, partial_cost = calculate_models_cost(report["models"])
+    total_active_seconds = int(report.get("active_seconds", 0) or 0)
 
     lines = [
         "统计范围",
@@ -1044,6 +1240,7 @@ def build_summary_lines(report: dict, start_local: datetime, end_local: datetime
         f"缓存命中：{format_token_count(total_usage['cached_input_tokens'])}",
         f"非缓存输入：{format_token_count(model_miss_tokens(total_usage))}",
         f"输出：{format_token_count(total_usage['output_tokens'])}",
+        f"活跃时长：{format_duration(total_active_seconds)}",
         f"估算总成本：{format_cost_text(total_cost, partial_cost)}",
         "",
         "二、模型汇总",
@@ -1084,7 +1281,7 @@ def build_session_lines(report: dict):
     lines = ["", "三、Session 明细"]
     session_items = report.get("session_display", [])
     if not session_items:
-        lines.append("当日未发现可展开的 session 级 token 使用记录。")
+        lines.append("当日未发现可展开的 session 级使用记录。")
     else:
         for index, session in enumerate(session_items, start=1):
             session_cost, partial_cost = calculate_models_cost(session["models"])
@@ -1107,6 +1304,7 @@ def build_session_lines(report: dict):
                     f"缓存命中：{format_token_count(session['cached_input_tokens'])}",
                     f"非缓存输入：{format_token_count(model_miss_tokens(session))}",
                     f"输出：{format_token_count(session['output_tokens'])}",
+                    f"活跃时长：{format_duration(int(session.get('active_seconds', 0) or 0))}",
                     f"模型分布：{'；'.join(model_parts) if model_parts else '无'}",
                     f"估算成本：{format_cost_text(session_cost, partial_cost)}",
                     "",
@@ -1129,6 +1327,11 @@ def build_session_lines(report: dict):
                     f"中位数Token：{format_token_count(cluster['median_tokens'])}",
                     f"P90 Token：{format_token_count(cluster['p90_tokens'])}",
                     f"最大Token：{format_token_count(cluster['max_tokens'])}",
+                    f"总活跃时长：{format_duration(cluster['active_seconds'])}",
+                    f"平均活跃时长：{format_duration(cluster['average_active_seconds'])}",
+                    f"中位数活跃时长：{format_duration(cluster['median_active_seconds'])}",
+                    f"P90 活跃时长：{format_duration(cluster['p90_active_seconds'])}",
+                    f"最大活跃时长：{format_duration(cluster['max_active_seconds'])}",
                     f"模型分布：{'；'.join(build_model_parts(cluster['models'])) or '无'}",
                     f"估算成本：{format_cost_text(cluster['total_cost'], cluster['partial_cost'])}",
                     "",
@@ -1149,17 +1352,28 @@ def format_reports(report: dict, start_local: datetime, end_local: datetime):
 def build_recent_summary_lines(recent_report: dict):
     day_records = recent_report["days"]
     totals = [usage_total(record["usage"]) for record in day_records]
+    active_totals = [int(record.get("active_seconds", 0) or 0) for record in day_records]
     total_tokens = sum(totals)
     total_cost = sum(record["total_cost"] for record in day_records)
+    total_active_seconds = sum(active_totals)
     partial_cost = any(record["partial_cost"] for record in day_records)
-    active_days = sum(1 for total in totals if total > 0)
+    active_days = sum(1 for total in active_totals if total > 0)
     average_tokens = total_tokens // len(day_records) if day_records else 0
     average_cost = total_cost / len(day_records) if day_records else 0.0
+    average_active_seconds = total_active_seconds // len(day_records) if day_records else 0
     median_tokens = int(median(totals)) if totals else 0
+    median_active_seconds = int(median(active_totals)) if active_totals else 0
     p90_tokens = percentile_90(totals)
+    p90_active_seconds = percentile_90(active_totals)
     max_record = max(day_records, key=lambda item: usage_total(item["usage"]), default=None)
     max_tokens = usage_total(max_record["usage"]) if max_record else 0
     max_day = max_record["day"] if max_record else "未知"
+    max_cost_record = max(day_records, key=lambda item: item["total_cost"], default=None)
+    max_cost = max_cost_record["total_cost"] if max_cost_record else 0.0
+    max_cost_day = max_cost_record["day"] if max_cost_record else "未知"
+    max_active_record = max(day_records, key=lambda item: int(item.get("active_seconds", 0) or 0), default=None)
+    max_active_seconds = int(max_active_record.get("active_seconds", 0) or 0) if max_active_record else 0
+    max_active_day = max_active_record["day"] if max_active_record else "未知"
 
     return [
         "统计范围",
@@ -1169,12 +1383,18 @@ def build_recent_summary_lines(recent_report: dict):
         f"天数：{len(day_records)}",
         f"活跃天数：{active_days}",
         f"总Token：{format_token_count(total_tokens)}",
-        f"总成本：{format_cost_text(total_cost, partial_cost)}",
         f"日均Token：{format_token_count(average_tokens)}",
-        f"日均成本：${average_cost:,.2f}",
         f"中位数Token：{format_token_count(median_tokens)}",
         f"P90 Token：{format_token_count(p90_tokens)}",
         f"最大单日Token：{format_token_count(max_tokens)}（{max_day}）",
+        f"总成本：{format_cost_text(total_cost, partial_cost)}",
+        f"日均成本：${average_cost:,.2f}",
+        f"最大单日成本：${max_cost:,.2f}（{max_cost_day}）",
+        f"总活跃时长：{format_duration(total_active_seconds)}",
+        f"日均活跃时长：{format_duration(average_active_seconds)}",
+        f"中位数活跃时长：{format_duration(median_active_seconds)}",
+        f"P90 活跃时长：{format_duration(p90_active_seconds)}",
+        f"最大单日活跃时长：{format_duration(max_active_seconds)}（{max_active_day}）",
     ]
 
 
@@ -1182,7 +1402,7 @@ def build_recent_detail_lines(recent_report: dict):
     lines = ["", "二、每日明细"]
     for record in recent_report["days"]:
         lines.append(
-            f"{record['day']} | 总Token {format_token_count(usage_total(record['usage']))} | 成本 {format_cost_text(record['total_cost'], record['partial_cost'])}"
+            f"{record['day']} | 总Token {format_token_count(usage_total(record['usage']))} | 成本 {format_cost_text(record['total_cost'], record['partial_cost'])} | 活跃时长 {format_duration(int(record.get('active_seconds', 0) or 0))}"
         )
     return lines
 
@@ -1190,7 +1410,7 @@ def build_recent_detail_lines(recent_report: dict):
 def build_recent_markdown(recent_report: dict):
     summary_lines = build_recent_summary_lines(recent_report)
     detail_lines = [
-        "# 最近Token与成本明细",
+        "# 最近 Token、成本与活跃时长明细",
         "",
         "## 统计摘要",
     ]
@@ -1208,13 +1428,13 @@ def build_recent_markdown(recent_report: dict):
             "",
             "## 每日明细",
             "",
-            "| 日期 | 总Token | 成本 |",
-            "| --- | --- | --- |",
+            "| 日期 | 总Token | 成本 | 活跃时长 |",
+            "| --- | --- | --- | --- |",
         ]
     )
     for record in recent_report["days"]:
         detail_lines.append(
-            f"| {record['day']} | {format_token_count(usage_total(record['usage']))} | {format_cost_text(record['total_cost'], record['partial_cost'])} |"
+            f"| {record['day']} | {format_token_count(usage_total(record['usage']))} | {format_cost_text(record['total_cost'], record['partial_cost'])} | {format_duration(int(record.get('active_seconds', 0) or 0))} |"
         )
     return "\n".join(detail_lines) + "\n"
 
