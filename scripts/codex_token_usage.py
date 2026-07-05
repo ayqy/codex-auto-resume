@@ -38,8 +38,6 @@ NOISE_BLOCK_REGEXES = [
     re.compile(r"<environment_context>.*?</environment_context>", re.DOTALL),
     re.compile(r"<turn_aborted>.*?</turn_aborted>", re.DOTALL),
 ]
-ACTIVE_GAP_LIMIT = timedelta(minutes=15)
-ACTIVE_TAIL_WINDOW = timedelta(minutes=5)
 
 
 def session_root() -> Path:
@@ -79,7 +77,7 @@ def create_session_record(session_id: str):
             "first_event_at": None,
             "last_event_at": None,
             "models": defaultdict(create_usage_dict),
-            "_activity_events": [],
+            "_activity_turns": {},
             "_activity_spans": [],
             "active_seconds": 0,
             "has_usage_in_range": False,
@@ -202,6 +200,12 @@ def format_token_count(value: int) -> str:
     return f"{format_token_short(value)}（{value:,}）"
 
 
+def activity_turn_id(payload: dict) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    return payload.get("turn_id") or payload.get("turnId")
+
+
 def is_activity_event(obj: dict) -> bool:
     payload = obj.get("payload", {})
     if not isinstance(payload, dict):
@@ -210,9 +214,8 @@ def is_activity_event(obj: dict) -> bool:
     obj_type = obj.get("type")
     if obj_type == "event_msg":
         payload_type = payload.get("type")
-        if payload_type == "user_message":
-            message = payload.get("message")
-            return isinstance(message, str) and bool(message.strip())
+        if payload_type in {"task_started", "task_complete", "user_message", "agent_message"}:
+            return True
         if payload_type != "token_count":
             return False
         info = payload.get("info", {})
@@ -221,36 +224,117 @@ def is_activity_event(obj: dict) -> bool:
         last_usage = info.get("last_token_usage", {})
         return isinstance(last_usage, dict) and bool(last_usage)
 
+    if obj_type == "turn_context":
+        return True
+
     if obj_type != "response_item":
         return False
-    return payload.get("type") in {"message", "function_call", "function_call_output"}
+    payload_type = payload.get("type")
+    if payload_type in {"reasoning", "function_call", "function_call_output"}:
+        return True
+    return payload_type == "message" and payload.get("role") == "assistant"
 
 
-def append_activity_event(record: dict, event_time_local: Optional[datetime]) -> None:
-    if event_time_local is None:
+def create_turn_activity_record():
+    return {
+        "started_at": None,
+        "completed_at": None,
+        "last_progress_at": None,
+    }
+
+
+def ensure_turn_activity(session_record: dict, turn_id: str):
+    return session_record["_activity_turns"].setdefault(turn_id, create_turn_activity_record())
+
+
+def update_turn_start(turn_record: dict, event_time_local: datetime):
+    started_at = turn_record["started_at"]
+    if started_at is None or event_time_local < started_at:
+        turn_record["started_at"] = event_time_local
+
+
+def update_turn_progress(turn_record: dict, event_time_local: datetime):
+    last_progress_at = turn_record["last_progress_at"]
+    if last_progress_at is None or event_time_local > last_progress_at:
+        turn_record["last_progress_at"] = event_time_local
+
+
+def update_turn_complete(turn_record: dict, event_time_local: datetime):
+    completed_at = turn_record["completed_at"]
+    if completed_at is None or event_time_local > completed_at:
+        turn_record["completed_at"] = event_time_local
+
+
+def register_activity_event(session_record: dict, file_state: dict, obj: dict, event_time_local: Optional[datetime]) -> None:
+    if event_time_local is None or not is_activity_event(obj):
         return
-    record["_activity_events"].append(event_time_local)
+
+    payload = obj.get("payload", {})
+    obj_type = obj.get("type")
+    payload_type = payload.get("type") if isinstance(payload, dict) else None
+    turn_id = activity_turn_id(payload) or file_state.get("current_turn_id")
+
+    if obj_type == "event_msg" and payload_type == "task_started":
+        if turn_id is None:
+            return
+        turn_record = ensure_turn_activity(session_record, turn_id)
+        update_turn_start(turn_record, event_time_local)
+        file_state["current_turn_id"] = turn_id
+        return
+
+    if obj_type == "turn_context":
+        if turn_id is None:
+            turn_id = f"synthetic:{len(session_record['_activity_turns']) + 1}"
+        turn_record = ensure_turn_activity(session_record, turn_id)
+        update_turn_start(turn_record, event_time_local)
+        file_state["current_turn_id"] = turn_id
+        return
+
+    if obj_type == "event_msg" and payload_type == "user_message" and turn_id is None:
+        turn_id = f"synthetic:{len(session_record['_activity_turns']) + 1}"
+        turn_record = ensure_turn_activity(session_record, turn_id)
+        update_turn_start(turn_record, event_time_local)
+        file_state["current_turn_id"] = turn_id
+        return
+
+    if turn_id is None:
+        return
+
+    turn_record = ensure_turn_activity(session_record, turn_id)
+    if turn_record["started_at"] is None:
+        update_turn_start(turn_record, event_time_local)
+
+    if obj_type == "event_msg" and payload_type == "task_complete":
+        update_turn_complete(turn_record, event_time_local)
+        update_turn_progress(turn_record, event_time_local)
+        if file_state.get("current_turn_id") == turn_id:
+            file_state["current_turn_id"] = None
+        return
+
+    if obj_type == "event_msg" and payload_type == "agent_message":
+        update_turn_progress(turn_record, event_time_local)
+        return
+
+    if obj_type == "event_msg" and payload_type == "token_count":
+        update_turn_progress(turn_record, event_time_local)
+        return
+
+    if obj_type == "response_item":
+        update_turn_progress(turn_record, event_time_local)
 
 
-def build_activity_spans(event_times: list[datetime]) -> list[tuple[datetime, datetime]]:
-    if not event_times:
-        return []
-
-    sorted_times = sorted(event_times)
+def build_activity_spans(turns: dict[str, dict]) -> list[tuple[datetime, datetime]]:
     spans = []
-    current_start = sorted_times[0]
-    current_end = sorted_times[0]
-
-    for event_time in sorted_times[1:]:
-        if event_time - current_end <= ACTIVE_GAP_LIMIT:
-            current_end = event_time
+    for turn in turns.values():
+        start_at = turn.get("started_at")
+        end_candidates = [value for value in (turn.get("last_progress_at"), turn.get("completed_at")) if value is not None]
+        if start_at is None or not end_candidates:
             continue
-        spans.append((current_start, current_end + ACTIVE_TAIL_WINDOW))
-        current_start = event_time
-        current_end = event_time
-
-    spans.append((current_start, current_end + ACTIVE_TAIL_WINDOW))
-    return spans
+        end_at = max(end_candidates)
+        if end_at <= start_at:
+            continue
+        spans.append((start_at, end_at))
+    return merge_activity_spans(spans)
 
 
 def merge_activity_spans(spans: list[tuple[datetime, datetime]]) -> list[tuple[datetime, datetime]]:
@@ -585,6 +669,7 @@ def create_file_state(file_path: Path):
         "session_id": session_id,
         "turn_default_model": "unknown",
         "last_model_seen": "unknown",
+        "current_turn_id": None,
         "cwd": None,
         "title": None,
         "semantic_user_messages": [],
@@ -1068,8 +1153,6 @@ def collect_usage_data(start_local: datetime, end_local: datetime, include_sessi
     utc_tz = ZoneInfo("UTC")
     start_utc = start_local.astimezone(utc_tz)
     end_utc = end_local.astimezone(utc_tz)
-    activity_start_utc = (start_local - ACTIVE_GAP_LIMIT).astimezone(utc_tz)
-    activity_end_utc = (end_local + ACTIVE_GAP_LIMIT).astimezone(utc_tz)
     target_tz = start_local.tzinfo or ZoneInfo("Asia/Shanghai")
 
     root = session_root()
@@ -1103,10 +1186,10 @@ def collect_usage_data(start_local: datetime, end_local: datetime, include_sessi
 
             if event_time_utc is None:
                 continue
-            if activity_start_utc <= event_time_utc < activity_end_utc and is_activity_event(obj):
+            if is_activity_event(obj):
                 session_id = file_state["session_id"]
                 activity_record = activity_sessions.setdefault(session_id, create_session_record(session_id))
-                append_activity_event(activity_record, event_time_local)
+                register_activity_event(activity_record, file_state, obj, event_time_local)
                 if start_utc <= event_time_utc < end_utc:
                     activity_record["first_event_at"] = merge_time_window(
                         activity_record["first_event_at"], event_time_local, True
@@ -1158,7 +1241,7 @@ def collect_usage_data(start_local: datetime, end_local: datetime, include_sessi
 
     all_activity_spans = []
     for session_id, session_record in list(activity_sessions.items()):
-        raw_spans = build_activity_spans(session_record["_activity_events"])
+        raw_spans = build_activity_spans(session_record["_activity_turns"])
         clamped_spans = clamp_activity_spans(raw_spans, start_local, end_local)
         session_record["_activity_spans"] = clamped_spans
         session_record["active_seconds"] = sum_activity_seconds(clamped_spans)
@@ -1166,6 +1249,7 @@ def collect_usage_data(start_local: datetime, end_local: datetime, include_sessi
             session_record["first_event_at"] = clamped_spans[0][0]
             session_record["last_event_at"] = clamped_spans[-1][1]
         all_activity_spans.extend(clamped_spans)
+        session_record.pop("_activity_turns", None)
 
         if not include_sessions:
             continue

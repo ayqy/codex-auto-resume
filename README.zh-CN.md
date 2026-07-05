@@ -150,7 +150,7 @@ graph TD
 - `make usage D=2026-07-03` 输出 2026-07-03 当天的同类报告。
 - `make recent` 输出最近 30 天的 token、成本与活跃时长统计。
 - `make recent N=7` 将上述统计窗口缩短为最近 7 天。
-- 活跃时长是估算值，口径为“15 分钟空闲切断 + 每段活跃片段追加 5 分钟尾窗”。
+- 活跃时长是估算值，口径为 Codex 的 turn 生命周期：每个 turn 从 `task_started`/`turn_context` 开始，到 `task_complete` 或最后一个可观测到的 assistant/tool 进度事件结束；只有用户输入、没有 Codex 实际工作的 turn 不计入工作时长。
 
 
 ## 贡献代码

@@ -150,7 +150,7 @@ Here is a complete list of all available commands.
 - `make usage D=2026-07-03` prints the same report for July 3, 2026.
 - `make recent` prints token, cost, and active-duration statistics for the latest 30 local days.
 - `make recent N=7` narrows that report to the latest 7 local days.
-- Active duration is an estimate based on a 15-minute idle cutoff and a 5-minute trailing window per active segment.
+- Active duration is estimated from Codex turn lifecycles: each turn starts at `task_started`/`turn_context` and ends at `task_complete` or the last observed assistant/tool progress event. Pure user-input-only turns are not counted as Codex work time.
 
 
 ## Contributing
