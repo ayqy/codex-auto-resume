@@ -17,71 +17,26 @@
 
 ---
 
-## Table of Contents
-
-- [About The Project](#about-the-project)
-- [Features](#features)
-- [How It Works](#how-it-works)
-- [Scheduling Rules](#scheduling-rules)
-- [Getting Started](#getting-started)
-  - [Prerequisites](#prerequisites)
-  - [Installation](#installation)
-- [Usage](#usage)
-  - [Common Commands](#common-commands)
-  - [All Commands](#all-commands)
-- [Contributing](#contributing)
-- [License](#license)
-- [Acknowledgements](#acknowledgements)
-
-## About The Project
+## What It Does
 
 You're in the zone, deep in a coding session with Codex, and suddenly... **"You've hit your usage limit."**
 
-Your focus is shattered. You have to remember to come back in an hour, find the right session, reopen the terminal, and try to piece together your train of thought.
+Your focus is shattered. You have to remember to come back in an hour to resume your work.
 
-**Codex Auto-Resume** solves this problem. It's a lightweight, fire-and-forget daemon that monitors your Codex activity. When it detects a usage limit error, it automatically schedules and triggers a new terminal session that resumes your work right where you left off, as soon as the lockout period is over.
-
-It's designed to be a seamless, invisible assistant that keeps you productive.
+**Codex Auto-Resume** solves this. It runs in the background, watches for usage limit errors, and automatically opens a new terminal to resume your session as soon as the lockout is over.
 
 ## Features
 
-- 🎯 **Automated Usage-Limit Detection**: Scans local Codex logs to detect usage-limit events and their retry timestamps.
-- 🧠 **Intelligent Session Resolution**: Identifies the exact session and working directory affected by the usage limit.
-- 💻 **Cross-Platform Terminal Integration**: Works with iTerm2, Terminal.app, gnome-terminal, and more.
-- ⏰ **Scheduled & Debuggable Resumption**: Schedules resumes automatically and exposes scheduling/recovery debug flows when inspection is needed.
-- 📊 **Token Usage Reporting**: Includes a script to summarize daily token usage and estimate costs.
-- 🛡️ **Robust State Management**: Tracks processed errors and pending jobs to prevent duplicates.
-
-## How It Works
-
-The tool runs a small daemon in the background that follows a simple, robust workflow.
-
-```mermaid
-graph TD
-    A[Start Watcher: make run] --> B{Scan Codex Logs};
-    B --> C{Usage Limit Found?};
-    C -- No --> B;
-    C -- Yes --> D[Parse Session ID & Retry Time];
-    D --> E[Schedule Resume Task for 10 min after Retry];
-    E --> F{Time to Run?};
-    F -- No --> E;
-    F -- Yes --> G[Open New Terminal & Run `codex resume`];
-```
-
-## Scheduling Rules
-
-The watcher maintains `pending_jobs` with three rules:
-
-1. Unexpired usage-limit events from different `session_id` values can coexist, but each session keeps only one active pending job: the latest and strongest candidate for that session.
-2. Global secondary-window events outrank ordinary primary `retry at` events. In practice, both `secondary.used_percent == 100` and `credits exhausted while secondary active` are treated as `global_window` candidates.
-3. Once a `global_window` candidate is detected, every not-yet-triggered session is rescheduled to run 10 minutes after that global retry time, because the primary window is no longer actionable once the secondary quota is exhausted.
+- **Automatic Session Resumption**: Detects usage limit lockouts and automatically schedules a new terminal to open right when you can resume.
+- **Cross-Platform**: Works on macOS (iTerm2, Terminal.app) and Linux (gnome-terminal, etc.).
+- **Usage Analytics**: Provides commands to track your token usage, costs, and active coding time.
+- **Resilient**: Works even if some of the usual log files are unavailable, ensuring you don't miss a resumption.
 
 ## Getting Started
 
 ### Prerequisites
 
 - Python 3.x
-- `make` (optional, but recommended for easy command access)
 - An existing Codex installation.
 
 ### Installation
@@ -101,69 +56,62 @@ The watcher maintains `pending_jobs` with three rules:
     ```bash
     make run
     ```
-    That's it! The watcher is now running in the background.
+    This starts the watcher in your current terminal. Keep it running to monitor your Codex sessions.
 
 ## Usage
 
-### Common Commands
-
-These are the commands you'll use most frequently.
+### Main Commands
 
 | Command      | Description                                                                          |
 |--------------|--------------------------------------------------------------------------------------|
-| `make run`   | **(Recommended)** Starts the watcher in the background to continuously monitor for errors. |
-| `make today` | Shows today's token summary, total tokens, active duration, session breakdown, and estimated costs. |
-| `make usage` | Shows the same report as `make today`; pass `D=YYYY-MM-DD` to inspect a specific day.     |
-| `make recent` | Shows token, cost, and active-duration stats for the latest `N` local days; pass `N=<days>` to override the default 30-day window. |
-| `make debug` | Prints recent limit events and target scheduling state. You can also pass `DEBUG_ARGS` to inspect a specific debug flow. |
-| `make status`| Displays the watcher's current state, including pending and completed jobs.            |
-| `make test`  | Runs the automated test suite against sanitized fixtures derived from real-world samples. |
-
-### All Commands
-
-Here is a complete list of all available commands.
-
-| Command         | Description                                                                       |
-|-----------------|-----------------------------------------------------------------------------------|
-| `make today`    | Show today's token summary, total tokens, active duration, session breakdown, and estimated costs. |
-| `make usage`    | Show the same report as `make today`; pass `D=YYYY-MM-DD` for a specific day.     |
-| `make recent`   | Show token, cost, and active-duration stats for the latest `N` local days (`N=30` by default). |
-| `make run`      | Start the watcher daemon to continuously monitor for usage limit errors.          |
-| `make status`   | Print the internal JSON state of the watcher (pending jobs, processed errors, etc.). |
-| `make debug`    | Run the default debug view: recent 7-day limit events, confirmed candidates, and desired pending jobs. |
-| `make test`     | Run the automated test suite with sanitized fixtures.                             |
-| `make clean`    | Remove all temporary files, logs, and state generated by the watcher.             |
-| `make chmod`    | Apply `+x` permissions to all shell scripts in the `scripts/` directory.          |
-
-### Debug Variants
-
-`make debug` accepts `DEBUG_ARGS` to reach focused debug subcommands:
-
-- `make debug DEBUG_ARGS="--debug-limit-history --days 14"` shows recent limit history and scheduling decisions.
-- `make debug DEBUG_ARGS="--debug-session <session_id>"` prints merged metadata and candidates for one session.
-- `make debug DEBUG_ARGS="--debug-schedule-once"` runs one scheduling cycle without starting the daemon.
-- `make debug DEBUG_ARGS="--debug-force-latest"` force-triggers the latest detected session for debugging.
+| `make run`   | **(Most important)** Starts the background watcher to monitor for usage limits and resume your session automatically. |
+| `make today` | Shows a detailed report of your token usage, active time, and estimated costs for today. |
+| `make usage` | Shows the same report for a specific day. (e.g., `make usage D=2026-07-03`) |
+| `make recent`| Shows usage stats for the last 30 days. (e.g., `make recent N=7` for the last 7 days) |
+| `make status`| Shows the current status of the watcher, including pending and triggered resume jobs. |
+| `make test`  | Runs the automated tests for the project. |
 
 ### Usage Examples
 
-- `make today` prints today's token totals, per-model summary, active duration, and session-level breakdown.
-- `make usage D=2026-07-03` prints the same report for July 3, 2026.
-- `make recent` prints token, cost, and active-duration statistics for the latest 30 local days.
-- `make recent N=7` narrows that report to the latest 7 local days.
-- Active duration is estimated from Codex turn lifecycles: each turn starts at `task_started`/`turn_context` and ends at `task_complete` or the last observed assistant/tool progress event. Pure user-input-only turns are not counted as Codex work time.
+-   `make today`
+    > Get a summary of your usage for today.
 
+-   `make usage D=2026-07-03`
+    > Get a usage report for a specific date.
+
+-   `make recent N=7`
+    > See your usage statistics for the last 7 days.
+
+-   `make today F=/tmp/codex-today.txt`
+    > Save today's detailed report to a specific file.
+
+<details>
+<summary><b>Advanced Usage & Debugging</b></summary>
+
+For more advanced use cases, you can use the `make debug` command or call the Python scripts directly.
+
+#### Debug Commands
+
+-   `make debug`: Prints a full debug dashboard.
+-   `make debug DEBUG_ARGS="--debug-limit-history --days 14"`: Show recent limit history.
+-   `make debug DEBUG_ARGS="--debug-session <session_id>"`: Print merged metadata for a specific session.
+-   `make debug DEBUG_ARGS="--debug-schedule-once"`: Run one scheduling cycle and exit.
+-   `make debug DEBUG_ARGS="--debug-force-latest"`: Force-trigger the latest detected session.
+
+#### Direct Script Execution
+
+You can also run the usage script directly for more control, such as specifying exact time ranges or timezones.
+
+```bash
+python3 scripts/codex_token_usage.py "2026-07-01 00:00:00" "2026-07-01 23:59:59" -z America/Los_Angeles
+```
+
+</details>
 
 ## Contributing
 
-Contributions are what make the open source community such an amazing place to learn, inspire, and create. Any contributions you make are **greatly appreciated**.
-
-Please see `CONTRIBUTING.md` for details on our code of conduct, and the process for submitting pull requests to us.
+Contributions are welcome! Please see `CONTRIBUTING.md` for more details.
 
 ## License
 
 Distributed under the MIT License. See `LICENSE` for more information.
-
-## Acknowledgements
-
-- [Shields.io](https://shields.io) for the awesome badges.
-- Inspired by the need to stay focused during long coding sessions.

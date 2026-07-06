@@ -29,6 +29,9 @@
 - [使用方法](#使用方法)
   - [常用命令](#常用命令)
   - [所有命令](#所有命令)
+  - [Debug 子命令](#debug-子命令)
+  - [报表输出与高级参数](#报表输出与高级参数)
+  - [使用示例](#使用示例)
 - [贡献代码](#贡献代码)
 - [许可证](#许可证)
 - [致谢](#致谢)
@@ -39,42 +42,47 @@
 
 您的专注力瞬间被打破。您必须记着在一小时后回来，找到正确的会话，重新打开终端，然后努力拼凑回刚才的思路。
 
-**Codex Auto-Resume** 正是为解决此问题而生。它是一个轻量级的、即开即用的守护程序，负责监控您的 Codex 活动。当检测到用量超限错误时，它会自动安排并在锁定时间结束后，触发一个新的终端会话，让您从中断的地方无缝继续。
+**Codex Auto-Resume** 正是为解决此问题而生。它会通过 `make run` 启动一个长期运行的 watcher/监控进程，持续监控您的 Codex 活动；当检测到用量超限错误时，它会在锁定时间结束后自动安排新的终端会话，让您从中断的地方无缝继续。
 
-它旨在成为一个无感、高效的助手，让您保持高效的生产力。
+运行 watcher 时请保持当前终端开启；如果希望脱离当前 shell，请交给您自己的 supervisor 或进程管理器托管。
 
 ## 功能特性
 
-- 🎯 **自动检测用量超限**: 扫描本地 Codex 日志，实时检测用量超限事件及其重试时间戳。
-- 🧠 **智能会话解析**: 准确识别受影响的会话 ID 和项目工作目录。
+- 🎯 **多来源用量超限检测**: 联合检查 `logs_2.sqlite`、rollout JSONL 文件以及 structured websocket `429` payload，识别用量超限候选和重试窗口。
+- 🧠 **更稳健的会话定位**: 结合 state DB、rollout metadata 与缓存的线程信息定位会话；当 `thread_id` 缺失时，还能借助邻近的 `process_uuid` 上下文恢复。
 - 💻 **跨平台终端集成**: 支持 iTerm2、Terminal.app、gnome-terminal 等多种终端应用。
-- ⏰ **自动恢复与可调试恢复**: 自动安排恢复任务，并在需要排查时提供调试调度与调试恢复能力。
-- 📊 **Token 用量报告**: 内置脚本，可汇总每日 Token 使用量并估算开销。
-- 🛡️ **稳健的状态管理**: 精准追踪已处理的错误和待处理的任务，防止重复或遗漏。
+- ⏰ **调度编排、对账与调试能力**: 支持会话级/全局窗口规则、全局二级窗口覆盖、`pending_jobs` 对账、过期清理，以及 dry-run 和 force-latest 调试流程。
+- 📊 **面向 Session 的用量分析**: 提供日报、最近 `N` 天统计、成本估算、活跃时长、session 标题清洗、母子会话聚合与未归类子会话聚类。
+- 🛡️ **数据库异常时的回退能力**: 当 `logs_2.sqlite` 或 `state_5.sqlite` 暂时不可用时，仍可借助 rollout 文件和缓存元数据继续运行，而不是直接失败。
 
 ## 工作原理
 
-本工具在后台运行一个小型的守护进程，遵循一个简单而稳健的工作流。
+本工具运行的是一个长期运行的 watcher/监控进程，遵循一个简单而稳健的工作流。
 
 ```mermaid
 graph TD
-    A[启动监控: make run] --> B{扫描 Codex 日志};
-    B --> C{发现用量超限?};
-    C -- 否 --> B;
-    C -- 是 --> D[解析会话 ID 和重试时间];
-    D --> E[安排恢复任务(重试时间后10分钟)];
-    E --> F{是否到达执行时间?};
-    F -- 否 --> E;
-    F -- 是 --> G[打开新终端并运行 `codex resume`];
+    A[启动监控: make run] --> B[检查 logs_2.sqlite 与 rollout JSONL];
+    B --> C{发现用量超限候选?};
+    C -- 否 --> H[休眠至下一次轮询或待执行任务];
+    C -- 是 --> D[从 state DB / rollout / cache 补全会话元数据];
+    D --> E[应用会话级 / 全局调度规则];
+    E --> F[对 pending_jobs 做对账];
+    F --> G{当前是否有到期任务?};
+    G -- 否 --> H;
+    H --> B;
+    G -- 是 --> I[打开新终端并执行 `codex resume`];
 ```
+
+当日志库短暂不可读时，watcher 仍会借助 rollout 文件与缓存的线程元数据继续对账和调度。
 
 ## 调度规则
 
-监控器按照下面 3 条规则维护 `pending_jobs`:
+监控器按照下面 4 条规则维护 `pending_jobs`:
 
 1. 不同 `session_id` 的未过期用量超限事件会并存调度；同一个 `session_id` 只保留 1 条活跃任务，始终选择该会话当前最晚、最强的候选。
 2. 二级总额度窗口事件优先于普通的一级 `retry at` 事件。实现上，`secondary.used_percent == 100` 以及 `credits exhausted while secondary active` 都会被视为 `global_window` 候选。
 3. 一旦监听到 `global_window` 候选，所有尚未触发的会话恢复任务都会统一改到该候选的重试时间后 10 分钟执行，因为一级窗口在二级总额度耗尽后已不再有效。
+4. 每轮扫描都会重新对账 `pending_jobs`，刷新元数据，替换更弱或更旧的任务，并把已不再生效的候选标记为过期。
 
 ## 开始使用
 
@@ -101,7 +109,7 @@ graph TD
     ```bash
     make run
     ```
-    就是这样！监控程序现在已在后台运行。
+    这会在当前 shell 中启动长期运行的 watcher；如果希望脱离当前终端，请交给您自己的进程管理方式。
 
 ## 使用方法
 
@@ -111,12 +119,12 @@ graph TD
 
 | 命令         | 描述                                                       |
 |--------------|------------------------------------------------------------|
-| `make run`   | **(推荐)** 启动后台守护进程，持续监控错误。                |
-| `make today` | 显示当天 token 汇总、总 Token、活跃时长、session 明细和预估费用。 |
-| `make usage` | 与 `make today` 相同；可通过 `D=YYYY-MM-DD` 指定查询日期。 |
-| `make recent` | 显示最近 `N` 天的 token、成本与活跃时长统计；默认 `N=30`，可通过 `N=<天数>` 覆盖。 |
-| `make debug` | 输出近期 limit 事件与目标调度状态；可通过 `DEBUG_ARGS` 切换到具体 debug 子流程。 |
-| `make status`| 显示监控程序的当前状态，包括待处理和已完成的任务。         |
+| `make run`   | **(推荐)** 在当前 shell 中启动长期运行的 watcher 进程，持续监控用量超限错误。 |
+| `make today` | 显示当天的 token 汇总、模型汇总、活跃时长、session/group 明细、未归类子会话聚类和预估成本；可通过 `F=<path>` 指定明细文件路径。 |
+| `make usage` | 与 `make today` 相同；可通过 `D=YYYY-MM-DD` 指定查询日期，并通过 `F=<path>` 指定明细文件路径。 |
+| `make recent` | 显示最近 `N` 天的 token、成本与活跃时长统计；默认 `N=30`，可通过 `N=<天数>` 覆盖，并通过 `F=<path>` 指定 Markdown 明细文件路径。 |
+| `make debug` | 默认输出完整 debug dashboard；也可通过 `DEBUG_ARGS` 切换到聚焦的 debug 子流程。 |
+| `make status`| 输出 watcher 的 JSON 状态，包括 `pending_jobs`、触发历史和最近一次检测到的元数据。 |
 | `make test`  | 运行基于脱敏真实样本构建的自动化单测。                     |
 
 ### 所有命令
@@ -125,17 +133,19 @@ graph TD
 
 | 命令             | 描述                                                           |
 |------------------|----------------------------------------------------------------|
-| `make today`     | 显示当天 token 汇总、总 Token、活跃时长、session 明细和预估费用。 |
-| `make usage`     | 与 `make today` 相同；可通过 `D=YYYY-MM-DD` 指定查询日期。     |
-| `make recent`    | 显示最近 `N` 天的 token、成本与活跃时长统计；默认 `N=30`。     |
-| `make run`       | 启动守护进程，以持续监控用量超限错误。                         |
-| `make status`    | 打印监控程序的内部 JSON 状态（待处理任务、已处理错误等）。     |
-| `make debug`     | 默认输出最近 7 天的 limit 事件、候选结果和目标 pending jobs。  |
+| `make today`     | 显示当天的 token 汇总、模型汇总、活跃时长、session/group 明细、未归类子会话聚类和预估成本；可通过 `F=<path>` 指定明细文件路径。 |
+| `make usage`     | 与 `make today` 相同；可通过 `D=YYYY-MM-DD` 指定查询日期，并通过 `F=<path>` 指定明细文件路径。 |
+| `make recent`    | 显示最近 `N` 天的 token、成本与活跃时长统计；默认 `N=30`，支持 `N=<天数>` 与 `F=<path>`，明细导出为 Markdown。 |
+| `make run`       | 在当前 shell 中启动长期运行的 watcher 进程，以持续监控用量超限错误。 |
+| `make status`    | 打印 watcher 的内部 JSON 状态，包括 `pending_jobs`、`triggered_jobs` 和最近一次检测到的元数据。 |
+| `make debug`     | 默认输出包含 `Desired Pending Jobs`、`Confirmed Candidates`、`Rollout Limit Events`、`Recovered Structured 429 Events`、`Suspected Matches` 的 debug dashboard。 |
 | `make test`      | 运行自动化单测与脱敏 fixtures。                                |
 | `make clean`     | 删除监控程序生成的所有临时文件、日志和状态。                   |
 | `make chmod`     | 为 `scripts/` 目录下的所有 shell 脚本赋予 `+x` 执行权限。      |
 
 ### Debug 子命令
+
+默认 `make debug` 会输出 `Desired Pending Jobs`、`Confirmed Candidates`、`Rollout Limit Events`、`Recovered Structured 429 Events`、`Suspected Matches`。
 
 `make debug` 支持通过 `DEBUG_ARGS` 进入具体 debug 子流程：
 
@@ -144,13 +154,24 @@ graph TD
 - `make debug DEBUG_ARGS="--debug-schedule-once"` 仅执行一轮调试调度，不启动常驻进程。
 - `make debug DEBUG_ARGS="--debug-force-latest"` 对最近检测到的会话执行调试恢复。
 
-### Usage 示例
+### 报表输出与高级参数
 
-- `make today` 输出当天的 token 汇总、模型汇总、活跃时长和 session 级明细。
+- `make today` 与 `make usage` 的详细报表包含 overall summary、model summary、session detail，以及未归类子会话聚类。
+- session 标题来自语义化用户请求，并会剔除 AGENTS 指令块、`[MODE: ...]`、JSON 状态噪音、shell command echo 行等非语义内容。
+- 当 Codex 启动 `.24h-studio` 子 run 时，只要能从 run metadata 推断关系，报表就会把子 session 的用量归并回父 session；无法归母时，则按 `cwd` 聚类，并展示 average/median/P90/max 的 token 与 active duration 指标。
+- active duration 来自 Codex turn 生命周期；重叠区间会合并，跨天区间会按本地日拆分，只有用户输入但没有观察到 Codex 实际工作的 turn 不计入工作时长。
+- 所有 usage 命令都会打印明细文件路径；不传 `F=<path>` 时会自动写入临时文件。日报明细是纯文本，`recent` 明细是 Markdown。
+- 直接调用 `scripts/codex_token_usage.py` 时，还支持 `-s/--summary-only`、`-z/--tz`，以及显式 `start_time end_time` 时间范围。
+
+### 使用示例
+
+- `make today` 输出当天的 token 汇总、模型汇总、活跃时长、session/group 明细和未归类子会话聚类。
 - `make usage D=2026-07-03` 输出 2026-07-03 当天的同类报告。
 - `make recent` 输出最近 30 天的 token、成本与活跃时长统计。
 - `make recent N=7` 将上述统计窗口缩短为最近 7 天。
-- 活跃时长是估算值，口径为 Codex 的 turn 生命周期：每个 turn 从 `task_started`/`turn_context` 开始，到 `task_complete` 或最后一个可观测到的 assistant/tool 进度事件结束；只有用户输入、没有 Codex 实际工作的 turn 不计入工作时长。
+- `make today F=/tmp/codex-today.txt` 将当天详细报告写入固定的文本文件路径。
+- `make recent N=7 F=/tmp/codex-recent-7d.md` 将最近 7 天的详细报告写入固定的 Markdown 文件路径。
+- `python3 scripts/codex_token_usage.py "2026-07-01 00:00:00" "2026-07-01 23:59:59" -z America/Los_Angeles -f /tmp/codex-usage-la.txt` 按显式时间范围和时区生成 usage 报表。
 
 
 ## 贡献代码
