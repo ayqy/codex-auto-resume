@@ -52,7 +52,13 @@
     make chmod
     ```
 
-3.  **启动监控**:
+3.  **配置终端代理**:
+    ```bash
+    make config
+    ```
+    该命令会把终端代理写入 `config.json`，包括 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY`。项目不再依赖本地 `pxy` shell 函数。
+
+4.  **启动监控**:
     ```bash
     make run
     ```
@@ -64,6 +70,8 @@
 
 | 命令 | 描述 |
 |---|---|
+| `make config` | 交互式配置 `config.json` 中的终端代理。 |
+| `make config proxy` | 配置 `config.json` 中的 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY`。 |
 | `make run` | **(最重要)** 启动后台监控进程，持续监测用量限制并自动为您恢复会话。 |
 | `make today` | 显示您今天的 token 使用量、活跃时间及预估开销的详细报告。 |
 | `make usage` | 显示指定某一天的同样内容的报告。(例如: `make usage D=2026-07-03`) |
@@ -72,6 +80,12 @@
 | `make test` | 运行项目中的自动化测试。 |
 
 ### 使用示例
+
+-   `make config`
+    > 按顺序配置所有支持的代理项：HTTP、HTTPS 和 ALL_PROXY。
+
+-   `make config proxy`
+    > 更新自动恢复终端使用的 HTTP/HTTPS/ALL 代理。
 
 -   `make today`
     > 获取您今天的用量摘要。
@@ -84,6 +98,8 @@
 
 -   `make today F=/tmp/codex-today.txt`
     > 将今天的详细报告保存到指定文件。
+
+自动恢复现在会先从目标会话的 rollout 日志中恢复原会话使用的模型和推理强度，再执行 `codex resume`，以避免切换模型导致缓存连续性丢失。
 
 <details>
 <summary><b>高级用法与调试</b></summary>

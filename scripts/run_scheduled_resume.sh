@@ -16,11 +16,13 @@ shell_bin="${SHELL:-/bin/bash}"
 
 export CODEX_RESUME_SESSION_ID="${session_id}"
 export CODEX_RESUME_TARGET_CWD="${target_cwd}"
+export CODEX_AUTO_RESUME_SCRIPT_DIR="${script_dir}"
 
 command_payload=$(cat <<'EOF'
 cd "$CODEX_RESUME_TARGET_CWD"
-pxy
-codex resume -m gpt-5.4 -c model_reasoning_effort='medium' --yolo "$CODEX_RESUME_SESSION_ID" "continue"
+eval "$(python3 "$CODEX_AUTO_RESUME_SCRIPT_DIR/configure_config.py" --emit-shell-runtime)"
+eval "$(python3 "$CODEX_AUTO_RESUME_SCRIPT_DIR/resolve_session_resume.py" "$CODEX_RESUME_SESSION_ID" --emit-shell-runtime)"
+codex resume -m "$CODEX_RESUME_MODEL" -c "model_reasoning_effort=$CODEX_RESUME_EFFORT" --yolo "$CODEX_RESUME_SESSION_ID" "continue"
 EOF
 )
 

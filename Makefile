@@ -10,7 +10,7 @@ D ?=
 N ?= 30
 F ?=
 
-.PHONY: today usage recent run status debug clean chmod test
+.PHONY: today usage recent run status debug clean chmod test config proxy
 
 today: usage
 
@@ -39,6 +39,9 @@ run:
 	@mkdir -p "$(LOG_DIR)"
 	@$(PYTHON) "$(APP_DIR)/scripts/watch_usage_limit.py"
 
+config:
+	@$(PYTHON) "$(APP_DIR)/scripts/configure_config.py" $(filter-out $@,$(MAKECMDGOALS))
+
 status:
 	@mkdir -p "$(LOG_DIR)"
 	@$(PYTHON) "$(APP_DIR)/scripts/watch_usage_limit.py" --status
@@ -56,3 +59,11 @@ clean:
 
 chmod:
 	@chmod +x "$(APP_DIR)/scripts/"*.sh
+
+proxy:
+	@if [ -n "$(filter config,$(MAKECMDGOALS))" ]; then \
+		:; \
+	else \
+		echo "usage: make config $@"; \
+		exit 1; \
+	fi

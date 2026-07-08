@@ -52,7 +52,13 @@ Your focus is shattered. You have to remember to come back in an hour to resume 
     make chmod
     ```
 
-3.  **Start the watcher**:
+3.  **Configure terminal proxy**:
+    ```bash
+    make config
+    ```
+    This writes your terminal proxy settings to `config.json`, including `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`. The project no longer depends on a local `pxy` shell function.
+
+4.  **Start the watcher**:
     ```bash
     make run
     ```
@@ -64,6 +70,8 @@ Your focus is shattered. You have to remember to come back in an hour to resume 
 
 | Command      | Description                                                                          |
 |--------------|--------------------------------------------------------------------------------------|
+| `make config`| Interactively configure the terminal proxy values stored in `config.json`. |
+| `make config proxy`| Configure the `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` values in `config.json`. |
 | `make run`   | **(Most important)** Starts the background watcher to monitor for usage limits and resume your session automatically. |
 | `make today` | Shows a detailed report of your token usage, active time, and estimated costs for today. |
 | `make usage` | Shows the same report for a specific day. (e.g., `make usage D=2026-07-03`) |
@@ -72,6 +80,12 @@ Your focus is shattered. You have to remember to come back in an hour to resume 
 | `make test`  | Runs the automated tests for the project. |
 
 ### Usage Examples
+
+-   `make config`
+    > Configure every supported proxy setting in order: HTTP, HTTPS, and ALL_PROXY.
+
+-   `make config proxy`
+    > Update the HTTP/HTTPS/ALL proxy used by the auto-resume terminal.
 
 -   `make today`
     > Get a summary of your usage for today.
@@ -84,6 +98,8 @@ Your focus is shattered. You have to remember to come back in an hour to resume 
 
 -   `make today F=/tmp/codex-today.txt`
     > Save today's detailed report to a specific file.
+
+Auto-resume now restores the original session model and reasoning effort from that session's rollout log before running `codex resume`. This avoids switching models and losing cache continuity.
 
 <details>
 <summary><b>Advanced Usage & Debugging</b></summary>
