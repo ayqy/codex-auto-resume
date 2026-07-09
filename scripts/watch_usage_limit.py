@@ -19,6 +19,12 @@ TIME_RE = re.compile(r"try again at ([0-9]{1,2}:[0-9]{2} [AP]M)")
 RESETS_AT_RE = re.compile(r'"resets_at":\s*(\d+)')
 PRIMARY_RESET_AT_HEADER_RE = re.compile(r'"X-Codex-Primary-Reset-At":"(\d+)"')
 SESSION_ID_RE = re.compile(r"rollout-.*-([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$")
+WORKAT_TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+PREWARM_MODEL = "gpt-5.4-mini"
+PREWARM_EFFORT = "low"
+PREWARM_PROMPT = "Just say Hi"
+PREWARM_LATE_WINDOW = timedelta(minutes=5)
+PREWARM_TIMEOUT_SECONDS = 300
 
 
 @dataclass
@@ -35,6 +41,7 @@ class UsageLimitWatcher:
     def __init__(self, base_dir: Path, cleanup_on_init: bool = True):
         self.base_dir = base_dir
         self.codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+        self.config_path = self.base_dir / "config.json"
         self.logs_db = self.codex_home / "logs_2.sqlite"
         self.state_db = self.codex_home / "state_5.sqlite"
         self.sessions_root = self.codex_home / "sessions"
@@ -47,6 +54,7 @@ class UsageLimitWatcher:
         self.rollout_index_cache = None
         self.rollout_index_built_at = 0.0
         self.state_db_warning_contexts = set()
+        self.config_warning_contexts = set()
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.state = self.load_state()
@@ -58,6 +66,7 @@ class UsageLimitWatcher:
             "last_seen_log_id": 0,
             "processed_error_keys": [],
             "pending_jobs": [],
+            "prewarm_jobs": [],
             "triggered_jobs": [],
             "last_detected_error": None,
             "last_detected_session_id": None,
@@ -77,6 +86,8 @@ class UsageLimitWatcher:
         state.update(loaded)
         if not isinstance(state.get("thread_cache"), dict):
             state["thread_cache"] = {}
+        if not isinstance(state.get("prewarm_jobs"), list):
+            state["prewarm_jobs"] = []
         return state
 
     def save_state(self, state=None):
@@ -93,6 +104,41 @@ class UsageLimitWatcher:
         print(line)
         with self.log_path.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
+
+    def parse_workat_text(self, value: str):
+        match = WORKAT_TIME_RE.match(str(value).strip())
+        if not match:
+            raise ValueError(f"invalid workat time: {value}")
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        return hour, minute, f"{hour:02d}:{minute:02d}"
+
+    def normalize_workat_values(self, values):
+        if values is None:
+            return []
+        if not isinstance(values, list):
+            raise ValueError("config.workat must be an array")
+        unique = {}
+        for item in values:
+            if not isinstance(item, str):
+                raise ValueError("config.workat entries must be strings")
+            _, _, normalized = self.parse_workat_text(item)
+            unique[normalized] = True
+        return sorted(unique.keys())
+
+    def load_runtime_config(self):
+        if not self.config_path.exists():
+            return {"workat": []}
+        try:
+            raw = json.loads(self.config_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("config.json must contain a JSON object")
+            return {
+                "workat": self.normalize_workat_values(raw.get("workat", [])),
+            }
+        except Exception as exc:
+            self.log_config_warning_once("failed to load runtime config", exc)
+            return {"workat": []}
 
     def connect(self, path: Path):
         uri = f"file:{path}?mode=ro"
@@ -210,6 +256,38 @@ class UsageLimitWatcher:
             return True
         return scheduled_run_at <= now
 
+    def find_global_candidate_invalidator(self, global_candidate: dict, candidates):
+        global_event_dt = global_candidate.get("event_dt")
+        global_retry_at = global_candidate.get("retry_at")
+        if not global_event_dt or not global_retry_at:
+            return None
+        invalidators = []
+        for candidate in candidates:
+            if candidate is global_candidate:
+                continue
+            candidate_event_dt = candidate.get("event_dt")
+            candidate_retry_at = candidate.get("retry_at")
+            if not candidate_event_dt or not candidate_retry_at:
+                continue
+            if candidate_event_dt <= global_event_dt:
+                continue
+            if candidate_event_dt >= global_retry_at:
+                continue
+            if candidate_retry_at >= global_retry_at:
+                continue
+            invalidators.append(candidate)
+        if not invalidators:
+            return None
+        return max(invalidators, key=self.sort_key_for_max)
+
+    def discard_invalidated_global_candidates(self, candidates):
+        filtered = []
+        for candidate in candidates:
+            if candidate.get("governs_all_sessions") and self.find_global_candidate_invalidator(candidate, candidates):
+                continue
+            filtered.append(candidate)
+        return filtered
+
     def normalize_candidate_metadata(self, candidate: dict):
         limit_kind = candidate.get("limit_kind") or ""
         retry_source = candidate.get("retry_source") or ""
@@ -235,6 +313,12 @@ class UsageLimitWatcher:
             return
         self.state_db_warning_contexts.add(context)
         self.log(f"{context}: {exc}; fallback to rollout/cache")
+
+    def log_config_warning_once(self, context: str, exc: Exception):
+        if context in self.config_warning_contexts:
+            return
+        self.config_warning_contexts.add(context)
+        self.log(f"{context}: {exc}; fallback to empty workat schedule")
 
     def default_thread_info(self, session_id: str):
         return {
@@ -314,45 +398,258 @@ class UsageLimitWatcher:
     def cleanup_state(self):
         pending_jobs = self.state.get("pending_jobs", [])
         if not pending_jobs:
-            return
+            changed = False
+        else:
+            cleaned_jobs = []
+            changed = False
+            for job in pending_jobs:
+                if job.get("status") != "pending":
+                    cleaned_jobs.append(job)
+                    continue
 
-        cleaned_jobs = []
-        changed = False
-        for job in pending_jobs:
-            if job.get("status") != "pending":
-                cleaned_jobs.append(job)
-                continue
-
-            session_id = job.get("session_id")
-            scheduled_run_at = job.get("scheduled_run_at")
-            if not session_id or not scheduled_run_at:
-                changed = True
-                continue
-            try:
-                datetime.fromisoformat(scheduled_run_at)
-            except ValueError:
-                changed = True
-                continue
-
-            thread_info = self.thread_exists(session_id)
-            if self.has_meaningful_thread_info(thread_info):
-                normalized = dict(job)
-                normalized["title"] = thread_info.get("title")
-                normalized["rollout_path"] = thread_info.get("rollout_path")
-                normalized["cwd"] = thread_info.get("cwd")
-                if normalized != job:
+                session_id = job.get("session_id")
+                scheduled_run_at = job.get("scheduled_run_at")
+                if not session_id or not scheduled_run_at:
                     changed = True
-                    self.log(f"updated pending job metadata for session {session_id}")
-                cleaned_jobs.append(normalized)
-                continue
+                    continue
+                try:
+                    datetime.fromisoformat(scheduled_run_at)
+                except ValueError:
+                    changed = True
+                    continue
 
-            cleaned_jobs.append(job)
-        if changed:
-            self.state["pending_jobs"] = cleaned_jobs
-            self.save_state()
+                thread_info = self.thread_exists(session_id)
+                if self.has_meaningful_thread_info(thread_info):
+                    normalized = dict(job)
+                    normalized["title"] = thread_info.get("title")
+                    normalized["rollout_path"] = thread_info.get("rollout_path")
+                    normalized["cwd"] = thread_info.get("cwd")
+                    if normalized != job:
+                        changed = True
+                        self.log(f"updated pending job metadata for session {session_id}")
+                    cleaned_jobs.append(normalized)
+                    continue
+
+                cleaned_jobs.append(job)
+            if changed:
+                self.state["pending_jobs"] = cleaned_jobs
+                self.save_state()
         now = datetime.now().astimezone()
         desired_jobs_by_session, _, _, allow_absent_prune = self.build_desired_pending_jobs(now=now)
         self.reconcile_pending_jobs(desired_jobs_by_session, now, allow_absent_prune=allow_absent_prune)
+        desired_prewarm_jobs = self.build_desired_prewarm_jobs(now=now)
+        self.reconcile_prewarm_jobs(desired_prewarm_jobs, now)
+
+    def build_prewarm_job(self, workat: str, workat_at: datetime, now: datetime):
+        scheduled_run_at = workat_at - timedelta(hours=4)
+        run_deadline_at = scheduled_run_at + PREWARM_LATE_WINDOW
+        return {
+            "job_key": f"{workat_at.date().isoformat()}|{workat}",
+            "workat": workat,
+            "workat_at": workat_at.isoformat(),
+            "scheduled_run_at": scheduled_run_at.isoformat(),
+            "run_deadline_at": run_deadline_at.isoformat(),
+            "expected_reset_at": (workat_at + timedelta(hours=1)).isoformat(),
+            "model": PREWARM_MODEL,
+            "effort": PREWARM_EFFORT,
+            "prompt_preview": PREWARM_PROMPT,
+            "status": "pending",
+            "created_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+        }
+
+    def prewarm_jobs_equivalent(self, current: dict, desired: dict):
+        keys = (
+            "job_key",
+            "workat",
+            "workat_at",
+            "scheduled_run_at",
+            "run_deadline_at",
+            "expected_reset_at",
+            "model",
+            "effort",
+            "prompt_preview",
+            "status",
+        )
+        return all(current.get(key) == desired.get(key) for key in keys)
+
+    def build_desired_prewarm_jobs(self, now: Optional[datetime] = None):
+        now = now or datetime.now().astimezone()
+        config = self.load_runtime_config()
+        workat_values = config.get("workat") or []
+        if not workat_values:
+            return {}
+
+        desired_jobs = {}
+        for day_offset in (0, 1):
+            work_day = now.date() + timedelta(days=day_offset)
+            for workat in workat_values:
+                hour, minute, normalized = self.parse_workat_text(workat)
+                workat_at = datetime(
+                    work_day.year,
+                    work_day.month,
+                    work_day.day,
+                    hour,
+                    minute,
+                    tzinfo=self.local_tz,
+                )
+                job = self.build_prewarm_job(normalized, workat_at, now)
+                run_deadline_at = datetime.fromisoformat(job["run_deadline_at"])
+                if run_deadline_at <= now:
+                    continue
+                desired_jobs[job["job_key"]] = job
+        return desired_jobs
+
+    def reconcile_prewarm_jobs(self, desired_jobs_by_key: dict, now: datetime):
+        pending_by_key = {}
+        for job in self.state["prewarm_jobs"]:
+            if job.get("status") == "pending" and job.get("job_key"):
+                pending_by_key.setdefault(job["job_key"], []).append(job)
+
+        changed = False
+        for job_key, desired in desired_jobs_by_key.items():
+            existing_jobs = pending_by_key.get(job_key, [])
+            matched_job = None
+            for job in existing_jobs:
+                if self.prewarm_jobs_equivalent(job, desired):
+                    matched_job = job
+                    break
+
+            if matched_job:
+                merged = dict(desired)
+                merged["created_at"] = matched_job.get("created_at") or desired.get("created_at")
+                merged["updated_at"] = now.isoformat()
+                if merged != matched_job:
+                    matched_job.clear()
+                    matched_job.update(merged)
+                    changed = True
+                    self.log(f"updated prewarm job metadata for {job_key}")
+            else:
+                for job in existing_jobs:
+                    if job.get("status") != "pending":
+                        continue
+                    job["status"] = "expired"
+                    job["status_reason"] = "schedule_no_longer_active"
+                    job["expired_at"] = now.isoformat()
+                    job["updated_at"] = now.isoformat()
+                    changed = True
+                    self.log(f"expired prewarm job for {job_key}: schedule no longer active")
+                self.state["prewarm_jobs"].append(desired)
+                changed = True
+                self.log(
+                    f"scheduled prewarm job {job_key} scheduled_run_at={desired['scheduled_run_at']} "
+                    f"expected_reset_at={desired['expected_reset_at']}"
+                )
+
+            for job in existing_jobs:
+                if job is matched_job or job.get("status") != "pending":
+                    continue
+                if job.get("status") == "pending":
+                    job["status"] = "expired"
+                    job["status_reason"] = "schedule_no_longer_active"
+                    job["expired_at"] = now.isoformat()
+                    job["updated_at"] = now.isoformat()
+                    changed = True
+                    self.log(f"expired duplicate prewarm job for {job_key}")
+
+        for job_key, existing_jobs in pending_by_key.items():
+            if job_key in desired_jobs_by_key:
+                continue
+            for job in existing_jobs:
+                if job.get("status") != "pending":
+                    continue
+                job["status"] = "expired"
+                job["status_reason"] = "schedule_no_longer_active"
+                job["expired_at"] = now.isoformat()
+                job["updated_at"] = now.isoformat()
+                changed = True
+                self.log(f"expired prewarm job for {job_key}: schedule no longer active")
+
+        if changed:
+            self.save_state()
+        return changed
+
+    def summarize_stderr(self, value: Optional[str], limit: int = 500):
+        if not value:
+            return None
+        text = value.strip()
+        if len(text) <= limit:
+            return text
+        return text[: limit - 3] + "..."
+
+    def trigger_due_prewarm_jobs(self, now: Optional[datetime] = None, suppress_for_resume: bool = False):
+        now = now or datetime.now().astimezone()
+        updated = False
+        script_path = str((self.base_dir / "scripts" / "run_workat_prewarm.sh").resolve())
+        for job in self.state["prewarm_jobs"]:
+            if job.get("status") != "pending":
+                continue
+            scheduled_run_at_text = job.get("scheduled_run_at")
+            run_deadline_at_text = job.get("run_deadline_at")
+            if not scheduled_run_at_text or not run_deadline_at_text:
+                continue
+            try:
+                scheduled_run_at = datetime.fromisoformat(scheduled_run_at_text)
+                run_deadline_at = datetime.fromisoformat(run_deadline_at_text)
+            except ValueError:
+                continue
+            if now > run_deadline_at:
+                job["status"] = "expired"
+                job["status_reason"] = "missed_prewarm_deadline"
+                job["expired_at"] = now.isoformat()
+                job["updated_at"] = now.isoformat()
+                updated = True
+                self.log(f"expired prewarm job {job.get('job_key')}: missed deadline")
+                continue
+            if scheduled_run_at > now:
+                continue
+            if suppress_for_resume:
+                job["status"] = "expired"
+                job["status_reason"] = "suppressed_by_resume_priority"
+                job["expired_at"] = now.isoformat()
+                job["updated_at"] = now.isoformat()
+                updated = True
+                self.log(f"expired prewarm job {job.get('job_key')}: suppressed by auto resume priority")
+                continue
+            try:
+                result = subprocess.run(
+                    [script_path],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=PREWARM_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired as exc:
+                job["status"] = "failed"
+                job["status_reason"] = "command_timed_out"
+                job["failed_at"] = now.isoformat()
+                job["updated_at"] = now.isoformat()
+                job["stderr_excerpt"] = self.summarize_stderr(exc.stderr)
+                updated = True
+                self.log(f"prewarm job {job.get('job_key')} failed: command timed out")
+                continue
+
+            if result.returncode == 0:
+                job["status"] = "triggered"
+                job["triggered_at"] = now.isoformat()
+                job["updated_at"] = now.isoformat()
+                job["exit_code"] = result.returncode
+                self.log(f"triggered workat prewarm job {job.get('job_key')}")
+            else:
+                job["status"] = "failed"
+                job["status_reason"] = "command_failed"
+                job["failed_at"] = now.isoformat()
+                job["updated_at"] = now.isoformat()
+                job["exit_code"] = result.returncode
+                job["stderr_excerpt"] = self.summarize_stderr(result.stderr)
+                self.log(
+                    f"workat prewarm job {job.get('job_key')} failed: "
+                    f"{self.summarize_stderr(result.stderr) or 'unknown error'}"
+                )
+            updated = True
+        if updated:
+            self.save_state()
+        return updated
 
     def fetch_recent_logs(self):
         return self.fetch_logs_matching(limit=400)
@@ -605,6 +902,39 @@ class UsageLimitWatcher:
 
     def parse_iso_timestamp(self, value: str):
         return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(self.local_tz)
+
+    def should_localize_output_key(self, key: Optional[str]):
+        if not key:
+            return False
+        return key == "ts" or key == "mtime" or key.endswith("_at")
+
+    def maybe_localize_output_string(self, value: str):
+        text = value.strip()
+        if "T" not in text:
+            return value
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return value
+        if parsed.tzinfo is None:
+            return value
+        return parsed.astimezone(self.local_tz).isoformat()
+
+    def serialize_user_value(self, value, key: Optional[str] = None):
+        if isinstance(value, dict):
+            return {item_key: self.serialize_user_value(item_value, item_key) for item_key, item_value in value.items()}
+        if isinstance(value, list):
+            return [self.serialize_user_value(item) for item in value]
+        if isinstance(value, datetime):
+            return value.astimezone(self.local_tz).isoformat()
+        if isinstance(value, str):
+            return self.maybe_localize_output_string(value)
+        if isinstance(value, (int, float)) and self.should_localize_output_key(key):
+            try:
+                return datetime.fromtimestamp(value, tz=ZoneInfo("UTC")).astimezone(self.local_tz).isoformat()
+            except (OverflowError, OSError, ValueError):
+                return value
+        return value
 
     def extract_json_object(self, text: str):
         start = text.find("{")
@@ -1113,6 +1443,7 @@ class UsageLimitWatcher:
             "candidate_family": governing_candidate.get("candidate_family"),
             "origin_source": candidate.get("source"),
             "origin_error_id": str(candidate.get("error_id")),
+            "origin_event_at": candidate["event_dt"].isoformat(),
             "origin_retry_at": candidate["retry_at"].isoformat(),
             "origin_scheduled_run_at": candidate["scheduled_run_at"].isoformat(),
             "origin_retry_source": candidate.get("retry_source"),
@@ -1122,6 +1453,7 @@ class UsageLimitWatcher:
             "governing_source": governing_candidate.get("source"),
             "governing_session_id": governing_candidate.get("session_id"),
             "governing_error_id": str(governing_candidate.get("error_id")),
+            "governing_event_at": governing_candidate["event_dt"].isoformat(),
             "governing_retry_at": governing_candidate["retry_at"].isoformat(),
             "governing_scheduled_run_at": governing_candidate["scheduled_run_at"].isoformat(),
             "governing_retry_source": governing_candidate.get("retry_source"),
@@ -1145,6 +1477,7 @@ class UsageLimitWatcher:
             "candidate_family",
             "origin_source",
             "origin_error_id",
+            "origin_event_at",
             "origin_retry_at",
             "origin_scheduled_run_at",
             "origin_retry_source",
@@ -1154,6 +1487,7 @@ class UsageLimitWatcher:
             "governing_source",
             "governing_session_id",
             "governing_error_id",
+            "governing_event_at",
             "governing_retry_at",
             "governing_scheduled_run_at",
             "governing_retry_source",
@@ -1167,6 +1501,7 @@ class UsageLimitWatcher:
     def build_desired_pending_jobs(self, now: Optional[datetime] = None, days: int = 14):
         now = now or datetime.now().astimezone()
         candidates, logs_available = self.collect_confirmed_candidates(days=days)
+        candidates = self.discard_invalidated_global_candidates(candidates)
         active_candidates = []
         latest_per_session = {}
         global_governing_candidate = None
@@ -1519,14 +1854,104 @@ class UsageLimitWatcher:
         )
         return best
 
+    def extract_message_text(self, content):
+        if not isinstance(content, list):
+            return ""
+        parts = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+        return "\n".join(parts).strip()
+
+    def is_usage_limit_text(self, text: str):
+        lowered = text.lower()
+        return "usage limit" in lowered or "try again at" in lowered
+
+    def rollout_entry_has_normal_agent_message(self, obj: dict):
+        payload = obj.get("payload", {})
+        if not isinstance(payload, dict):
+            return False
+        if obj.get("type") == "response_item" and payload.get("type") == "message" and payload.get("role") == "assistant":
+            message_text = self.extract_message_text(payload.get("content"))
+            return bool(message_text and not self.is_usage_limit_text(message_text))
+        if obj.get("type") == "event_msg" and payload.get("type") == "task_complete":
+            message_text = payload.get("last_agent_message")
+            return isinstance(message_text, str) and bool(message_text.strip()) and not self.is_usage_limit_text(
+                message_text
+            )
+        return False
+
+    def session_has_normal_agent_activity_after(self, session_id: str, after_dt: datetime):
+        thread_info = self.thread_exists(session_id)
+        rollout_path = thread_info.get("rollout_path")
+        if not rollout_path:
+            return False
+        path = Path(rollout_path)
+        if not path.exists():
+            return False
+        try:
+            with path.open(encoding="utf-8") as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    timestamp = obj.get("timestamp")
+                    if not timestamp:
+                        continue
+                    event_dt = self.parse_iso_timestamp(timestamp)
+                    if event_dt <= after_dt:
+                        continue
+                    if self.rollout_entry_has_normal_agent_message(obj):
+                        return True
+        except Exception:
+            return False
+        return False
+
+    def parse_job_resume_checkpoint(self, job: dict):
+        for key in ("origin_event_at", "governing_event_at", "origin_retry_at", "retry_at", "scheduled_run_at"):
+            value = job.get(key)
+            if not value or not isinstance(value, str):
+                continue
+            try:
+                return datetime.fromisoformat(value)
+            except ValueError:
+                continue
+        return None
+
     def trigger_due_jobs(self):
         now = datetime.now().astimezone()
         updated = False
+        summary = {
+            "attempted": 0,
+            "triggered": 0,
+            "failed": 0,
+            "skipped_manual": 0,
+        }
         for job in self.state["pending_jobs"]:
             if job["status"] != "pending":
                 continue
             scheduled_run_at = datetime.fromisoformat(job["scheduled_run_at"])
             if scheduled_run_at > now:
+                continue
+            resume_checkpoint = self.parse_job_resume_checkpoint(job)
+            if resume_checkpoint and self.session_has_normal_agent_activity_after(job["session_id"], resume_checkpoint):
+                job["status"] = "expired"
+                job["status_reason"] = "session_already_resumed_manually"
+                job["expired_at"] = now.isoformat()
+                job["updated_at"] = now.isoformat()
+                updated = True
+                summary["skipped_manual"] += 1
+                self.log(
+                    f"skipped terminal resume for session {job['session_id']}: "
+                    f"detected normal agent activity after {resume_checkpoint.isoformat()}"
+                )
                 continue
             command = [
                 sys.executable,
@@ -1534,17 +1959,20 @@ class UsageLimitWatcher:
                 job["session_id"],
                 job.get("cwd") or "",
             ]
+            summary["attempted"] += 1
             result = subprocess.run(command, capture_output=True, text=True, check=False)
             triggered_entry = dict(job)
             triggered_entry["triggered_at"] = now.isoformat()
             if result.returncode == 0:
                 job["status"] = "triggered"
                 triggered_entry["status"] = "triggered"
+                summary["triggered"] += 1
                 self.log(f"triggered terminal resume for session {job['session_id']}")
             else:
                 job["status"] = "failed"
                 triggered_entry["status"] = "failed"
                 triggered_entry["stderr"] = result.stderr.strip()
+                summary["failed"] += 1
                 self.log(
                     f"failed to trigger terminal resume for session {job['session_id']}: "
                     f"{result.stderr.strip()}"
@@ -1553,6 +1981,7 @@ class UsageLimitWatcher:
             updated = True
         if updated:
             self.save_state()
+        return summary
 
     def run_once(self):
         now = datetime.now().astimezone()
@@ -1580,7 +2009,12 @@ class UsageLimitWatcher:
             now,
             allow_absent_prune=allow_absent_prune,
         )
-        self.trigger_due_jobs()
+        resume_summary = self.trigger_due_jobs()
+        desired_prewarm_jobs = self.build_desired_prewarm_jobs(now=now)
+        if desired_prewarm_jobs:
+            self.log(f"reconciling prewarm jobs count={len(desired_prewarm_jobs)}")
+        self.reconcile_prewarm_jobs(desired_prewarm_jobs, now)
+        self.trigger_due_prewarm_jobs(now=now, suppress_for_resume=resume_summary["attempted"] > 0)
         return 0
 
     def force_latest(self):
@@ -1612,13 +2046,7 @@ class UsageLimitWatcher:
     def serialize_candidate(self, candidate: Optional[dict]):
         if not candidate:
             return None
-        serialized = dict(candidate)
-        for key in ("event_dt", "retry_at", "scheduled_run_at"):
-            if serialized.get(key):
-                serialized[key] = serialized[key].isoformat()
-        if serialized.get("thread_info"):
-            serialized["thread_info"] = dict(serialized["thread_info"])
-        return serialized
+        return self.serialize_user_value(candidate)
 
     def format_candidate_brief(self, candidate: dict, index: int):
         thread_info = candidate.get("thread_info") or {}
@@ -1745,11 +2173,11 @@ class UsageLimitWatcher:
             "all_log_candidates": [self.serialize_candidate(item) for item in sorted(log_candidates, key=self.sort_key_for_retry_desc, reverse=True)],
             "all_rollout_candidates": [self.serialize_candidate(item) for item in sorted(rollout_candidates, key=self.sort_key_for_retry_desc, reverse=True)],
         }
-        print(json.dumps(output, ensure_ascii=False, indent=2))
+        print(json.dumps(self.serialize_user_value(output), ensure_ascii=False, indent=2))
         return 0
 
     def print_status(self):
-        print(json.dumps(self.state, ensure_ascii=False, indent=2))
+        print(json.dumps(self.serialize_user_value(self.state), ensure_ascii=False, indent=2))
         return 0
 
     def compute_sleep_seconds(self, now: Optional[datetime] = None):
@@ -1757,6 +2185,21 @@ class UsageLimitWatcher:
         sleep_seconds = float(self.poll_interval)
         nearest_pending_seconds = None
         for job in self.state["pending_jobs"]:
+            if job.get("status") != "pending":
+                continue
+            scheduled_run_at_text = job.get("scheduled_run_at")
+            if not scheduled_run_at_text:
+                continue
+            try:
+                scheduled_run_at = datetime.fromisoformat(scheduled_run_at_text)
+            except ValueError:
+                continue
+            seconds_until_due = (scheduled_run_at - now).total_seconds()
+            if seconds_until_due <= 0:
+                return 1.0
+            if nearest_pending_seconds is None or seconds_until_due < nearest_pending_seconds:
+                nearest_pending_seconds = seconds_until_due
+        for job in self.state.get("prewarm_jobs", []):
             if job.get("status") != "pending":
                 continue
             scheduled_run_at_text = job.get("scheduled_run_at")

@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import sys
 from pathlib import Path
 
 
-VALID_SECTIONS = {"proxy"}
+VALID_SECTIONS = {"proxy", "workat"}
+WORKAT_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
 
 def get_config_path() -> Path:
@@ -20,7 +22,8 @@ def default_config() -> dict:
             "http": "",
             "https": "",
             "all": "",
-        }
+        },
+        "workat": [],
     }
 
 
@@ -39,6 +42,9 @@ def load_config(path: Path) -> dict:
     if not isinstance(raw, dict):
         raise ValueError("config.json must contain a JSON object")
 
+    extras = {key: value for key, value in raw.items() if key not in {"proxy", "workat"}}
+    config.update(extras)
+
     proxy = raw.get("proxy")
     if proxy is not None and not isinstance(proxy, dict):
         raise ValueError("config.proxy must be an object")
@@ -50,6 +56,9 @@ def load_config(path: Path) -> dict:
         if "all" in proxy:
             config["proxy"]["all"] = normalize_text(proxy.get("all"))
 
+    if "workat" in raw:
+        config["workat"] = normalize_workat_list(raw.get("workat"))
+
     return config
 
 
@@ -59,7 +68,7 @@ def save_config(path: Path, config: dict) -> None:
 
 def parse_sections(argv: list[str]) -> list[str]:
     if not argv:
-        return ["proxy"]
+        return ["proxy", "workat"]
 
     sections = []
     for item in argv:
@@ -87,6 +96,55 @@ def prompt_proxy_section(config: dict) -> None:
     current_proxy["all"] = prompt_text("ALL_PROXY", current_proxy["all"])
 
 
+def parse_workat_text(value: str) -> tuple[int, str]:
+    normalized = normalize_text(value)
+    match = WORKAT_RE.match(normalized)
+    if not match:
+        raise ValueError(f"invalid workat time: {value}")
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    return hour * 60 + minute, f"{hour:02d}:{minute:02d}"
+
+
+def normalize_workat_list(values) -> list[str]:
+    if values is None:
+        return []
+    if not isinstance(values, list):
+        raise ValueError("config.workat must be an array")
+
+    unique = {}
+    for item in values:
+        if not isinstance(item, str):
+            raise ValueError("config.workat entries must be strings")
+        _, normalized = parse_workat_text(item)
+        unique[normalized] = True
+    return sorted(unique.keys())
+
+
+def parse_workat_input(raw: str) -> list[str]:
+    parts = [segment.strip() for segment in raw.split(",")]
+    values = [segment for segment in parts if segment]
+    return normalize_workat_list(values)
+
+
+def prompt_workat_section(config: dict) -> None:
+    current_values = config.get("workat", [])
+    current_text = ",".join(current_values)
+    print("Configuring workat")
+    while True:
+        raw = input(f"Workat times (HH:MM, comma-separated) [{current_text}]: ").strip()
+        if raw == "":
+            return
+        if raw == "-":
+            config["workat"] = []
+            return
+        try:
+            config["workat"] = parse_workat_input(raw)
+            return
+        except ValueError:
+            print("Invalid workat format. Use HH:MM,HH:MM (example: 10:30,14:00).")
+
+
 def emit_shell_runtime(config: dict) -> str:
     lines = [
         "unset http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY",
@@ -112,7 +170,7 @@ def emit_shell_runtime(config: dict) -> str:
 
 
 def usage() -> str:
-    return "usage: configure_config.py [proxy] | --emit-shell-runtime"
+    return "usage: configure_config.py [proxy] [workat] | --emit-shell-runtime"
 
 
 def run_interactive(argv: list[str]) -> int:
@@ -123,6 +181,8 @@ def run_interactive(argv: list[str]) -> int:
     for section in sections:
         if section == "proxy":
             prompt_proxy_section(config)
+        elif section == "workat":
+            prompt_workat_section(config)
 
     save_config(path, config)
     print(f"Saved config to {path}")

@@ -52,11 +52,11 @@
     make chmod
     ```
 
-3.  **配置终端代理**:
+3.  **配置终端代理和 workat 时间表**:
     ```bash
     make config
     ```
-    该命令会把终端代理写入 `config.json`，包括 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY`。项目不再依赖本地 `pxy` shell 函数。
+    该命令会以交互方式把终端代理和可选的 `workat` 时间表写入 `config.json`。代理包括 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY`。`workat` 支持一个或多个 `HH:MM` 时间点，例如 `10:30,14:00`。
 
 4.  **启动监控**:
     ```bash
@@ -70,8 +70,9 @@
 
 | 命令 | 描述 |
 |---|---|
-| `make config` | 交互式配置 `config.json` 中的终端代理。 |
+| `make config` | 交互式配置 `config.json` 中的代理和 `workat`。 |
 | `make config proxy` | 配置 `config.json` 中的 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY`。 |
+| `make config workat` | 使用 `HH:MM` 格式配置 `config.json` 中一个或多个每日 `workat` 时间点。 |
 | `make run` | **(最重要)** 启动后台监控进程，持续监测用量限制并自动为您恢复会话。 |
 | `make today` | 显示您今天的 token 使用量、活跃时间及预估开销的详细报告。 |
 | `make usage` | 显示指定某一天的同样内容的报告。(例如: `make usage D=2026-07-03`) |
@@ -82,10 +83,13 @@
 ### 使用示例
 
 -   `make config`
-    > 按顺序配置所有支持的代理项：HTTP、HTTPS 和 ALL_PROXY。
+    > 先配置代理，再按需配置一个或多个 `workat` 时间点。
 
 -   `make config proxy`
     > 更新自动恢复终端使用的 HTTP/HTTPS/ALL 代理。
+
+-   `make config workat`
+    > 仅更新 `workat` 时间表，例如 `10:30,14:00`。
 
 -   `make today`
     > 获取您今天的用量摘要。
@@ -100,6 +104,8 @@
     > 将今天的详细报告保存到指定文件。
 
 自动恢复现在会先从目标会话的 rollout 日志中恢复原会话使用的模型和推理强度，再执行 `codex resume`，以避免切换模型导致缓存连续性丢失。
+
+如果配置了 `workat`，`make run` 还会在每个 `workat - 4 小时` 的时间点静默执行一次预热探针。该探针固定使用非交互 `codex exec`、模型 `gpt-5.4-mini`、`low` 推理强度以及提示词 `Just say Hi`，以最小 token 成本刷新滚动窗口，并且不会弹出终端打扰用户。
 
 <details>
 <summary><b>高级用法与调试</b></summary>

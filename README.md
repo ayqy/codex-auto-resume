@@ -52,11 +52,11 @@ Your focus is shattered. You have to remember to come back in an hour to resume 
     make chmod
     ```
 
-3.  **Configure terminal proxy**:
+3.  **Configure terminal proxy and workat schedule**:
     ```bash
     make config
     ```
-    This writes your terminal proxy settings to `config.json`, including `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`. The project no longer depends on a local `pxy` shell function.
+    This interactively writes your terminal proxy settings and optional `workat` schedule to `config.json`. Proxy settings include `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`. `workat` accepts one or more `HH:MM` values such as `10:30,14:00`.
 
 4.  **Start the watcher**:
     ```bash
@@ -70,8 +70,9 @@ Your focus is shattered. You have to remember to come back in an hour to resume 
 
 | Command      | Description                                                                          |
 |--------------|--------------------------------------------------------------------------------------|
-| `make config`| Interactively configure the terminal proxy values stored in `config.json`. |
+| `make config`| Interactively configure both proxy and `workat` values stored in `config.json`. |
 | `make config proxy`| Configure the `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` values in `config.json`. |
+| `make config workat`| Configure one or more daily `workat` values in `config.json` using `HH:MM` format. |
 | `make run`   | **(Most important)** Starts the background watcher to monitor for usage limits and resume your session automatically. |
 | `make today` | Shows a detailed report of your token usage, active time, and estimated costs for today. |
 | `make usage` | Shows the same report for a specific day. (e.g., `make usage D=2026-07-03`) |
@@ -82,10 +83,13 @@ Your focus is shattered. You have to remember to come back in an hour to resume 
 ### Usage Examples
 
 -   `make config`
-    > Configure every supported proxy setting in order: HTTP, HTTPS, and ALL_PROXY.
+    > Configure proxy settings first, then optionally configure one or more `workat` times.
 
 -   `make config proxy`
     > Update the HTTP/HTTPS/ALL proxy used by the auto-resume terminal.
+
+-   `make config workat`
+    > Update only the `workat` schedule, for example `10:30,14:00`.
 
 -   `make today`
     > Get a summary of your usage for today.
@@ -100,6 +104,8 @@ Your focus is shattered. You have to remember to come back in an hour to resume 
     > Save today's detailed report to a specific file.
 
 Auto-resume now restores the original session model and reasoning effort from that session's rollout log before running `codex resume`. This avoids switching models and losing cache continuity.
+
+If `workat` is configured, `make run` also schedules a silent prewarm probe at `workat - 4 hours` for each configured time. The probe runs non-interactively with `codex exec`, fixed model `gpt-5.4-mini`, fixed `low` effort, and prompt `Just say Hi`, so it refreshes the rolling window with minimal token cost and without opening a terminal window.
 
 <details>
 <summary><b>Advanced Usage & Debugging</b></summary>

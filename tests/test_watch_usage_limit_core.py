@@ -94,6 +94,19 @@ def seed_logs(path: Path):
     )
 
 
+def write_config(base_dir: Path, workat: list[str] | None):
+    payload = {
+        "proxy": {
+            "http": "",
+            "https": "",
+            "all": "",
+        }
+    }
+    if workat is not None:
+        payload["workat"] = workat
+    write_json(base_dir / "config.json", payload)
+
+
 def test_build_desired_pending_jobs_handles_global_override(module, monkeypatch, base_dir, codex_home):
     seed_logs(codex_home / "logs_2.sqlite")
     watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
@@ -109,6 +122,79 @@ def test_build_desired_pending_jobs_handles_global_override(module, monkeypatch,
     job = desired_jobs["22222222-2222-4222-8222-222222222222"]
     assert job["governing_limit_scope"] == "global_window"
     assert job["governing_session_id"] == "22222222-2222-4222-8222-222222222222"
+
+
+def test_build_desired_pending_jobs_discards_invalidated_global_candidate(module, monkeypatch, base_dir, codex_home):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    now = datetime(2026, 7, 10, 3, 0, 0, tzinfo=watcher.local_tz)
+
+    def make_candidate(
+        session_id: str,
+        error_id: str,
+        event_dt: datetime,
+        retry_at: datetime,
+        retry_source: str,
+        limit_kind: str,
+        primary_used: float,
+        secondary_used: float,
+    ):
+        return watcher.normalize_candidate_metadata(
+            {
+                "source": "rollout",
+                "priority": 2,
+                "signal_strength": "rollout",
+                "event_dt": event_dt,
+                "error_id": error_id,
+                "session_id": session_id,
+                "retry_at": retry_at,
+                "scheduled_run_at": retry_at + timedelta(minutes=10),
+                "thread_info": watcher.default_thread_info(session_id),
+                "message": "limit",
+                "message_preview": "limit",
+                "retry_source": retry_source,
+                "reason": "usage limit",
+                "limit_kind": limit_kind,
+                "primary_used_percent": primary_used,
+                "secondary_used_percent": secondary_used,
+                "credits_has": False,
+                "credits_balance": "0",
+            }
+        )
+
+    stale_global = make_candidate(
+        session_id="stale-global-session",
+        error_id="stale-global-error",
+        event_dt=datetime(2026, 7, 9, 6, 54, 37, tzinfo=watcher.local_tz),
+        retry_at=datetime(2026, 7, 13, 7, 56, 32, tzinfo=watcher.local_tz),
+        retry_source="credits.secondary.resets_at",
+        limit_kind="rollout_secondary_credits_exhausted",
+        primary_used=52.0,
+        secondary_used=100.0,
+    )
+    newer_session_limit = make_candidate(
+        session_id="fresh-session",
+        error_id="fresh-session-error",
+        event_dt=datetime(2026, 7, 10, 2, 55, 0, tzinfo=watcher.local_tz),
+        retry_at=datetime(2026, 7, 10, 3, 15, 56, tzinfo=watcher.local_tz),
+        retry_source="credits.primary.resets_at",
+        limit_kind="rollout_primary_credits_exhausted",
+        primary_used=100.0,
+        secondary_used=42.0,
+    )
+
+    monkeypatch.setattr(
+        watcher,
+        "collect_confirmed_candidates",
+        lambda days=14, log_limit=5000, rollout_limit_threads=400: ([stale_global, newer_session_limit], True),
+    )
+
+    desired_jobs, global_candidate, active_candidates, logs_available = watcher.build_desired_pending_jobs(now=now, days=14)
+
+    assert logs_available is True
+    assert global_candidate is None
+    assert len(active_candidates) == 1
+    assert set(desired_jobs) == {"fresh-session"}
+    assert desired_jobs["fresh-session"]["governing_limit_scope"] == "session_window"
 
 
 def test_reconcile_pending_jobs_marks_replaced_and_expired(module, monkeypatch, base_dir, codex_home):
@@ -163,3 +249,137 @@ def test_collect_confirmed_candidates_falls_back_when_logs_db_unavailable(module
 
     assert logs_available is False
     assert any(candidate["source"] == "rollout" for candidate in candidates)
+
+
+def test_build_desired_prewarm_jobs_skips_when_workat_not_configured(module, monkeypatch, base_dir, codex_home):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    now = datetime(2026, 7, 9, 6, 0, 0, tzinfo=watcher.local_tz)
+
+    desired_jobs = watcher.build_desired_prewarm_jobs(now=now)
+
+    assert desired_jobs == {}
+
+
+def test_build_desired_prewarm_jobs_generates_today_and_tomorrow(module, monkeypatch, base_dir, codex_home):
+    write_config(base_dir, ["14:00", "10:30"])
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    now = datetime(2026, 7, 9, 6, 0, 0, tzinfo=watcher.local_tz)
+
+    desired_jobs = watcher.build_desired_prewarm_jobs(now=now)
+
+    assert sorted(desired_jobs) == [
+        "2026-07-09|10:30",
+        "2026-07-09|14:00",
+        "2026-07-10|10:30",
+        "2026-07-10|14:00",
+    ]
+    assert desired_jobs["2026-07-09|10:30"]["scheduled_run_at"] == "2026-07-09T06:30:00+08:00"
+    assert desired_jobs["2026-07-09|10:30"]["expected_reset_at"] == "2026-07-09T11:30:00+08:00"
+    assert desired_jobs["2026-07-09|10:30"]["model"] == "gpt-5.4-mini"
+    assert desired_jobs["2026-07-09|10:30"]["effort"] == "low"
+    assert desired_jobs["2026-07-09|10:30"]["prompt_preview"] == "Just say Hi"
+
+
+def test_reconcile_prewarm_jobs_expires_old_schedule_and_adds_new_job(module, monkeypatch, base_dir, codex_home):
+    write_config(base_dir, ["14:00"])
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    now = datetime(2026, 7, 9, 8, 0, 0, tzinfo=watcher.local_tz)
+    watcher.state["prewarm_jobs"] = [
+        {
+            "job_key": "2026-07-09|10:30",
+            "workat": "10:30",
+            "workat_at": "2026-07-09T10:30:00+08:00",
+            "scheduled_run_at": "2026-07-09T06:30:00+08:00",
+            "run_deadline_at": "2026-07-09T06:35:00+08:00",
+            "expected_reset_at": "2026-07-09T11:30:00+08:00",
+            "model": "gpt-5.4-mini",
+            "effort": "low",
+            "prompt_preview": "Just say Hi",
+            "status": "pending",
+            "created_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+        }
+    ]
+
+    desired_jobs = watcher.build_desired_prewarm_jobs(now=now)
+    watcher.reconcile_prewarm_jobs(desired_jobs, now)
+
+    statuses = {job["job_key"]: job["status"] for job in watcher.state["prewarm_jobs"]}
+    assert statuses["2026-07-09|10:30"] == "expired"
+    assert statuses["2026-07-09|14:00"] == "pending"
+
+
+def test_trigger_due_prewarm_jobs_marks_late_job_expired(module, monkeypatch, base_dir, codex_home):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    now = datetime(2026, 7, 9, 6, 36, 0, tzinfo=watcher.local_tz)
+    watcher.state["prewarm_jobs"] = [
+        {
+            "job_key": "2026-07-09|10:30",
+            "workat": "10:30",
+            "workat_at": "2026-07-09T10:30:00+08:00",
+            "scheduled_run_at": "2026-07-09T06:30:00+08:00",
+            "run_deadline_at": "2026-07-09T06:35:00+08:00",
+            "expected_reset_at": "2026-07-09T11:30:00+08:00",
+            "model": "gpt-5.4-mini",
+            "effort": "low",
+            "prompt_preview": "Just say Hi",
+            "status": "pending",
+            "created_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+        }
+    ]
+
+    watcher.trigger_due_prewarm_jobs(now=now)
+
+    job = watcher.state["prewarm_jobs"][0]
+    assert job["status"] == "expired"
+    assert job["status_reason"] == "missed_prewarm_deadline"
+
+
+def test_trigger_due_prewarm_jobs_is_suppressed_when_resume_has_priority(module, monkeypatch, base_dir, codex_home):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    now = datetime(2026, 7, 9, 6, 31, 0, tzinfo=watcher.local_tz)
+    watcher.state["prewarm_jobs"] = [
+        {
+            "job_key": "2026-07-09|10:30",
+            "workat": "10:30",
+            "workat_at": "2026-07-09T10:30:00+08:00",
+            "scheduled_run_at": "2026-07-09T06:30:00+08:00",
+            "run_deadline_at": "2026-07-09T06:35:00+08:00",
+            "expected_reset_at": "2026-07-09T11:30:00+08:00",
+            "model": "gpt-5.4-mini",
+            "effort": "low",
+            "prompt_preview": "Just say Hi",
+            "status": "pending",
+            "created_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+        }
+    ]
+
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("prewarm command should not run when auto resume has priority")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    watcher.trigger_due_prewarm_jobs(now=now, suppress_for_resume=True)
+
+    job = watcher.state["prewarm_jobs"][0]
+    assert job["status"] == "expired"
+    assert job["status_reason"] == "suppressed_by_resume_priority"
+    assert calls == []
+
+
+def test_compute_sleep_seconds_prefers_nearest_prewarm_job(module, monkeypatch, base_dir, codex_home):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    now = datetime(2026, 7, 9, 6, 0, 0, tzinfo=watcher.local_tz)
+    watcher.state["pending_jobs"] = [
+        {"status": "pending", "scheduled_run_at": (now + timedelta(seconds=90)).isoformat()},
+    ]
+    watcher.state["prewarm_jobs"] = [
+        {"status": "pending", "scheduled_run_at": (now + timedelta(seconds=42)).isoformat()},
+    ]
+
+    assert watcher.compute_sleep_seconds(now=now) == 42.0

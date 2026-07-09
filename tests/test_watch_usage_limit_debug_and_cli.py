@@ -84,6 +84,38 @@ def test_main_status_outputs_json(module, monkeypatch, base_dir, codex_home, cap
     assert module.main() == 0
     data = json.loads(capsys.readouterr().out)
     assert "pending_jobs" in data
+    assert "prewarm_jobs" in data
+
+
+def test_print_status_localizes_user_facing_timestamps(module, monkeypatch, base_dir, codex_home, capsys):
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    watcher = module.UsageLimitWatcher(base_dir, cleanup_on_init=False)
+    watcher.state["thread_cache"] = {
+        "session-local-time": {
+            "id": "session-local-time",
+            "rollout_path": None,
+            "title": None,
+            "cwd": None,
+            "model_provider": None,
+            "created_at": 1782345224,
+            "updated_at": 1782348824,
+            "source": "state_db",
+        }
+    }
+    watcher.state["pending_jobs"] = [
+        {
+            "session_id": "session-local-time",
+            "status": "pending",
+            "scheduled_run_at": "2026-06-24T23:53:44Z",
+        }
+    ]
+
+    assert watcher.print_status() == 0
+    data = json.loads(capsys.readouterr().out)
+
+    assert data["thread_cache"]["session-local-time"]["created_at"] == "2026-06-25T07:53:44+08:00"
+    assert data["thread_cache"]["session-local-time"]["updated_at"] == "2026-06-25T08:53:44+08:00"
+    assert data["pending_jobs"][0]["scheduled_run_at"] == "2026-06-25T07:53:44+08:00"
 
 
 def test_main_debug_limit_history_outputs_sections(module, monkeypatch, base_dir, codex_home, capsys):
