@@ -55,6 +55,7 @@ class UsageLimitWatcher:
         self.rollout_index_built_at = 0.0
         self.state_db_warning_contexts = set()
         self.config_warning_contexts = set()
+        self.cycle_report = None
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.state = self.load_state()
@@ -98,12 +99,78 @@ class UsageLimitWatcher:
         Path(tmp_name).write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp_name, self.state_path)
 
-    def log(self, message: str):
+    def log(self, message: str, *, console: bool = True):
         ts = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{ts}] {message}"
-        print(line)
+        if console:
+            print(line)
         with self.log_path.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
+
+    def begin_cycle_report(self, now: datetime):
+        self.cycle_report = {
+            "started_at": now.isoformat(),
+            "events": [],
+            "event_keys": set(),
+        }
+
+    def record_cycle_event(self, category: str, message: str):
+        report = self.cycle_report
+        if report is None:
+            self.log(message)
+            return
+        key = (category, message)
+        if key in report["event_keys"]:
+            return
+        report["event_keys"].add(key)
+        report["events"].append({"category": category, "message": message})
+
+    def count_pending_jobs(self):
+        return sum(1 for job in self.state.get("pending_jobs", []) if job.get("status") == "pending")
+
+    def count_prewarm_jobs(self):
+        return sum(1 for job in self.state.get("prewarm_jobs", []) if job.get("status") == "pending")
+
+    def next_scheduled_run_at_text(self):
+        timestamps = []
+        for job in self.state.get("pending_jobs", []):
+            if job.get("status") != "pending":
+                continue
+            value = job.get("scheduled_run_at")
+            if not value or not isinstance(value, str):
+                continue
+            try:
+                timestamps.append(datetime.fromisoformat(value))
+            except ValueError:
+                continue
+        for job in self.state.get("prewarm_jobs", []):
+            if job.get("status") != "pending":
+                continue
+            value = job.get("scheduled_run_at")
+            if not value or not isinstance(value, str):
+                continue
+            try:
+                timestamps.append(datetime.fromisoformat(value))
+            except ValueError:
+                continue
+        if not timestamps:
+            return "-"
+        return min(timestamps).isoformat()
+
+    def emit_cycle_report(self, now: datetime):
+        report = self.cycle_report
+        if report is None:
+            return
+        pending_count = self.count_pending_jobs()
+        prewarm_count = self.count_prewarm_jobs()
+        next_run_at = self.next_scheduled_run_at_text()
+        if report["events"]:
+            self.log(f"changes pending={pending_count} prewarm={prewarm_count} next={next_run_at}")
+            for item in report["events"]:
+                self.log(item["message"])
+        else:
+            self.log(f"ok pending={pending_count} prewarm={prewarm_count} next={next_run_at}")
+        self.cycle_report = None
 
     def parse_workat_text(self, value: str):
         match = WORKAT_TIME_RE.match(str(value).strip())
@@ -312,13 +379,13 @@ class UsageLimitWatcher:
         if context in self.state_db_warning_contexts:
             return
         self.state_db_warning_contexts.add(context)
-        self.log(f"{context}: {exc}; fallback to rollout/cache")
+        self.log(f"{context}: {exc}; fallback to rollout/cache", console=False)
 
     def log_config_warning_once(self, context: str, exc: Exception):
         if context in self.config_warning_contexts:
             return
         self.config_warning_contexts.add(context)
-        self.log(f"{context}: {exc}; fallback to empty workat schedule")
+        self.log(f"{context}: {exc}; fallback to empty workat schedule", console=False)
 
     def default_thread_info(self, session_id: str):
         return {
@@ -396,6 +463,8 @@ class UsageLimitWatcher:
         return self.error_key(session_id, retry_at, error_id)
 
     def cleanup_state(self):
+        now = datetime.now().astimezone()
+        self.begin_cycle_report(now)
         pending_jobs = self.state.get("pending_jobs", [])
         if not pending_jobs:
             changed = False
@@ -426,7 +495,7 @@ class UsageLimitWatcher:
                     normalized["cwd"] = thread_info.get("cwd")
                     if normalized != job:
                         changed = True
-                        self.log(f"updated pending job metadata for session {session_id}")
+                        self.log(f"updated pending job metadata for session {session_id}", console=False)
                     cleaned_jobs.append(normalized)
                     continue
 
@@ -434,11 +503,18 @@ class UsageLimitWatcher:
             if changed:
                 self.state["pending_jobs"] = cleaned_jobs
                 self.save_state()
-        now = datetime.now().astimezone()
-        desired_jobs_by_session, _, _, allow_absent_prune = self.build_desired_pending_jobs(now=now)
-        self.reconcile_pending_jobs(desired_jobs_by_session, now, allow_absent_prune=allow_absent_prune)
+        desired_jobs_by_session, _, _, allow_absent_prune, prune_reasons_by_session = self.build_desired_pending_jobs(
+            now=now
+        )
+        self.reconcile_pending_jobs(
+            desired_jobs_by_session,
+            now,
+            allow_absent_prune=allow_absent_prune,
+            prune_reasons_by_session=prune_reasons_by_session,
+        )
         desired_prewarm_jobs = self.build_desired_prewarm_jobs(now=now)
         self.reconcile_prewarm_jobs(desired_prewarm_jobs, now)
+        self.emit_cycle_report(now)
 
     def build_prewarm_job(self, workat: str, workat_at: datetime, now: datetime):
         scheduled_run_at = workat_at - timedelta(hours=4)
@@ -523,7 +599,7 @@ class UsageLimitWatcher:
                     matched_job.clear()
                     matched_job.update(merged)
                     changed = True
-                    self.log(f"updated prewarm job metadata for {job_key}")
+                    self.log(f"updated prewarm job metadata for {job_key}", console=False)
             else:
                 for job in existing_jobs:
                     if job.get("status") != "pending":
@@ -533,12 +609,13 @@ class UsageLimitWatcher:
                     job["expired_at"] = now.isoformat()
                     job["updated_at"] = now.isoformat()
                     changed = True
-                    self.log(f"expired prewarm job for {job_key}: schedule no longer active")
+                    self.log(f"expired prewarm job for {job_key}: schedule no longer active", console=False)
                 self.state["prewarm_jobs"].append(desired)
                 changed = True
                 self.log(
                     f"scheduled prewarm job {job_key} scheduled_run_at={desired['scheduled_run_at']} "
-                    f"expected_reset_at={desired['expected_reset_at']}"
+                    f"expected_reset_at={desired['expected_reset_at']}",
+                    console=False,
                 )
 
             for job in existing_jobs:
@@ -550,7 +627,7 @@ class UsageLimitWatcher:
                     job["expired_at"] = now.isoformat()
                     job["updated_at"] = now.isoformat()
                     changed = True
-                    self.log(f"expired duplicate prewarm job for {job_key}")
+                    self.log(f"expired duplicate prewarm job for {job_key}", console=False)
 
         for job_key, existing_jobs in pending_by_key.items():
             if job_key in desired_jobs_by_key:
@@ -563,7 +640,7 @@ class UsageLimitWatcher:
                 job["expired_at"] = now.isoformat()
                 job["updated_at"] = now.isoformat()
                 changed = True
-                self.log(f"expired prewarm job for {job_key}: schedule no longer active")
+                self.log(f"expired prewarm job for {job_key}: schedule no longer active", console=False)
 
         if changed:
             self.save_state()
@@ -599,7 +676,7 @@ class UsageLimitWatcher:
                 job["expired_at"] = now.isoformat()
                 job["updated_at"] = now.isoformat()
                 updated = True
-                self.log(f"expired prewarm job {job.get('job_key')}: missed deadline")
+                self.log(f"expired prewarm job {job.get('job_key')}: missed deadline", console=False)
                 continue
             if scheduled_run_at > now:
                 continue
@@ -609,7 +686,7 @@ class UsageLimitWatcher:
                 job["expired_at"] = now.isoformat()
                 job["updated_at"] = now.isoformat()
                 updated = True
-                self.log(f"expired prewarm job {job.get('job_key')}: suppressed by auto resume priority")
+                self.log(f"expired prewarm job {job.get('job_key')}: suppressed by auto resume priority", console=False)
                 continue
             try:
                 result = subprocess.run(
@@ -626,7 +703,8 @@ class UsageLimitWatcher:
                 job["updated_at"] = now.isoformat()
                 job["stderr_excerpt"] = self.summarize_stderr(exc.stderr)
                 updated = True
-                self.log(f"prewarm job {job.get('job_key')} failed: command timed out")
+                self.log(f"prewarm job {job.get('job_key')} failed: command timed out", console=False)
+                self.record_cycle_event("prewarm_failed", f"prewarm job {job.get('job_key')} failed")
                 continue
 
             if result.returncode == 0:
@@ -634,7 +712,7 @@ class UsageLimitWatcher:
                 job["triggered_at"] = now.isoformat()
                 job["updated_at"] = now.isoformat()
                 job["exit_code"] = result.returncode
-                self.log(f"triggered workat prewarm job {job.get('job_key')}")
+                self.record_cycle_event("prewarm_triggered", f"triggered workat prewarm job {job.get('job_key')}")
             else:
                 job["status"] = "failed"
                 job["status_reason"] = "command_failed"
@@ -644,8 +722,10 @@ class UsageLimitWatcher:
                 job["stderr_excerpt"] = self.summarize_stderr(result.stderr)
                 self.log(
                     f"workat prewarm job {job.get('job_key')} failed: "
-                    f"{self.summarize_stderr(result.stderr) or 'unknown error'}"
+                    f"{self.summarize_stderr(result.stderr) or 'unknown error'}",
+                    console=False,
                 )
+                self.record_cycle_event("prewarm_failed", f"prewarm job {job.get('job_key')} failed")
             updated = True
         if updated:
             self.save_state()
@@ -1153,7 +1233,7 @@ class UsageLimitWatcher:
         if self.has_meaningful_thread_info(merged):
             self.cache_thread_info(merged)
             return merged
-        self.log(f"using minimal thread metadata for session {thread_id}")
+        self.log(f"using minimal thread metadata for session {thread_id}", console=False)
         return merged
 
     def fetch_recent_threads(self, limit: int = 20):
@@ -1407,7 +1487,7 @@ class UsageLimitWatcher:
     def inspect_latest_rollout_error(self):
         candidates = self.collect_rollout_candidates(days=14, limit_threads=50)
         if not candidates:
-            self.log("no usage limit error found in recent rollouts")
+            self.log("no usage limit error found in recent rollouts", console=False)
             return None
         return max(candidates, key=self.sort_key_for_max)
 
@@ -1419,7 +1499,7 @@ class UsageLimitWatcher:
         try:
             log_candidates = self.collect_log_candidates(days=days, limit=log_limit)
         except sqlite3.Error as exc:
-            self.log(f"检查日志时无法访问数据库: {exc}")
+            self.log(f"检查日志时无法访问数据库: {exc}", console=False)
             log_candidates = []
             logs_available = False
         rollout_candidates = self.collect_rollout_candidates(days=days, limit_threads=rollout_limit_threads)
@@ -1519,12 +1599,24 @@ class UsageLimitWatcher:
                     candidate,
                 )
         desired_jobs_by_session = {}
+        prune_reasons_by_session = {}
         for session_id, candidate in latest_per_session.items():
+            resume_checkpoint = self.candidate_resume_checkpoint(candidate)
+            if resume_checkpoint and self.session_has_normal_agent_activity_after(session_id, resume_checkpoint):
+                prune_reasons_by_session[session_id] = "session_already_resumed_manually"
+                continue
             governing_candidate = global_governing_candidate or candidate
             desired_jobs_by_session[session_id] = self.build_job_from_candidate(candidate, governing_candidate, now)
-        return desired_jobs_by_session, global_governing_candidate, active_candidates, logs_available
+        return desired_jobs_by_session, global_governing_candidate, active_candidates, logs_available, prune_reasons_by_session
 
-    def reconcile_pending_jobs(self, desired_jobs_by_session: dict, now: datetime, allow_absent_prune: bool = True):
+    def reconcile_pending_jobs(
+        self,
+        desired_jobs_by_session: dict,
+        now: datetime,
+        allow_absent_prune: bool = True,
+        prune_reasons_by_session: Optional[dict] = None,
+    ):
+        prune_reasons_by_session = prune_reasons_by_session or {}
         pending_by_session = {}
         for job in self.state["pending_jobs"]:
             if job.get("status") == "pending" and job.get("session_id"):
@@ -1547,7 +1639,7 @@ class UsageLimitWatcher:
                     matched_job.clear()
                     matched_job.update(merged)
                     changed = True
-                    self.log(f"updated pending job metadata for session {session_id}")
+                    self.log(f"updated pending job metadata for session {session_id}", console=False)
             else:
                 for job in existing_jobs:
                     if job.get("status") != "pending":
@@ -1560,7 +1652,8 @@ class UsageLimitWatcher:
                     changed = True
                     self.log(
                         f"replaced pending job for session {session_id}: "
-                        f"{old_time} -> {desired['scheduled_run_at']}"
+                        f"{old_time} -> {desired['scheduled_run_at']}",
+                        console=False,
                     )
                 self.state["pending_jobs"].append(desired)
                 changed = True
@@ -1569,8 +1662,10 @@ class UsageLimitWatcher:
                     f"scheduled_run_at={desired['scheduled_run_at']} "
                     f"origin_retry_at={desired['origin_retry_at']} "
                     f"governing_session={desired['governing_session_id']} "
-                    f"governing_scope={desired['governing_limit_scope']}"
+                    f"governing_scope={desired['governing_limit_scope']}",
+                    console=False,
                 )
+                self.record_cycle_event("scheduled_session", f"scheduled session {session_id} at {desired['scheduled_run_at']}")
                 continue
 
             for job in existing_jobs:
@@ -1584,7 +1679,8 @@ class UsageLimitWatcher:
                 changed = True
                 self.log(
                     f"replaced pending job for session {session_id}: "
-                    f"{old_time} -> {desired['scheduled_run_at']}"
+                    f"{old_time} -> {desired['scheduled_run_at']}",
+                    console=False,
                 )
 
         if allow_absent_prune:
@@ -1601,14 +1697,22 @@ class UsageLimitWatcher:
                         scheduled_run_at = None
                     if scheduled_run_at and scheduled_run_at <= now:
                         continue
+                    prune_reason = prune_reasons_by_session.get(session_id)
                     job["status"] = "expired"
-                    job["status_reason"] = "candidate_no_longer_active"
+                    job["status_reason"] = prune_reason or "candidate_no_longer_active"
                     job["expired_at"] = now.isoformat()
                     changed = True
-                    self.log(
-                        f"expired pending job for session {session_id}: "
-                        f"scheduled_run_at={job.get('scheduled_run_at')}"
-                    )
+                    if prune_reason == "session_already_resumed_manually":
+                        self.record_cycle_event(
+                            "cancelled_resumed_session",
+                            f"cancelled pending session {session_id}: resumed normally",
+                        )
+                    else:
+                        self.log(
+                            f"expired pending job for session {session_id}: "
+                            f"scheduled_run_at={job.get('scheduled_run_at')}",
+                            console=False,
+                        )
 
         if changed:
             self.save_state()
@@ -1618,7 +1722,7 @@ class UsageLimitWatcher:
         try:
             rows = self.fetch_recent_logs()
         except sqlite3.Error as exc:
-            self.log(f"检查日志时无法访问数据库: {exc}")
+            self.log(f"检查日志时无法访问数据库: {exc}", console=False)
             return None
 
         if not rows:
@@ -1631,13 +1735,14 @@ class UsageLimitWatcher:
 
         candidates = self.collect_log_candidates_from_rows(rows)
         if not candidates:
-            self.log("no usage limit error found in recent logs")
+            self.log("no usage limit error found in recent logs", console=False)
             return None
         result = max(candidates, key=self.sort_key_for_max)
         self.log(
             f"matched usage limit error priority={result['priority']} session_id={result['session_id']} "
             f"retry_source={result['retry_source']} retry_at={result['retry_at'].isoformat()} "
-            f"scheduled={result['scheduled_run_at'].isoformat()}"
+            f"scheduled={result['scheduled_run_at'].isoformat()}",
+            console=False,
         )
         return result
 
@@ -1842,7 +1947,7 @@ class UsageLimitWatcher:
     def inspect_latest_error(self):
         candidates, _ = self.collect_confirmed_candidates(days=14)
         if not candidates:
-            self.log("no usage limit error found in recent logs or rollouts")
+            self.log("no usage limit error found in recent logs or rollouts", console=False)
             return None
         best = max(candidates, key=self.sort_key_for_max)
         self.log(
@@ -1850,7 +1955,8 @@ class UsageLimitWatcher:
             f"retry_source={best['retry_source']} retry_at={best['retry_at'].isoformat()} "
             f"scheduled={best['scheduled_run_at'].isoformat()} "
             f"scope={best.get('limit_scope')} governs_all={best.get('governs_all_sessions')} "
-            f"cwd={best['thread_info'].get('cwd')}"
+            f"cwd={best['thread_info'].get('cwd')}",
+            console=False,
         )
         return best
 
@@ -1914,6 +2020,13 @@ class UsageLimitWatcher:
             return False
         return False
 
+    def candidate_resume_checkpoint(self, candidate: dict):
+        for key in ("event_dt", "retry_at", "scheduled_run_at"):
+            value = candidate.get(key)
+            if value is not None and hasattr(value, "isoformat"):
+                return value
+        return None
+
     def parse_job_resume_checkpoint(self, job: dict):
         for key in ("origin_event_at", "governing_event_at", "origin_retry_at", "retry_at", "scheduled_run_at"):
             value = job.get(key)
@@ -1950,7 +2063,12 @@ class UsageLimitWatcher:
                 summary["skipped_manual"] += 1
                 self.log(
                     f"skipped terminal resume for session {job['session_id']}: "
-                    f"detected normal agent activity after {resume_checkpoint.isoformat()}"
+                    f"detected normal agent activity after {resume_checkpoint.isoformat()}",
+                    console=False,
+                )
+                self.record_cycle_event(
+                    "cancelled_resumed_session",
+                    f"cancelled pending session {job['session_id']}: resumed normally",
                 )
                 continue
             command = [
@@ -1967,7 +2085,7 @@ class UsageLimitWatcher:
                 job["status"] = "triggered"
                 triggered_entry["status"] = "triggered"
                 summary["triggered"] += 1
-                self.log(f"triggered terminal resume for session {job['session_id']}")
+                self.record_cycle_event("resume_triggered", f"triggered terminal resume for session {job['session_id']}")
             else:
                 job["status"] = "failed"
                 triggered_entry["status"] = "failed"
@@ -1975,7 +2093,12 @@ class UsageLimitWatcher:
                 summary["failed"] += 1
                 self.log(
                     f"failed to trigger terminal resume for session {job['session_id']}: "
-                    f"{result.stderr.strip()}"
+                    f"{result.stderr.strip()}",
+                    console=False,
+                )
+                self.record_cycle_event(
+                    "resume_failed",
+                    f"failed to trigger terminal resume for session {job['session_id']}",
                 )
             self.state["triggered_jobs"].append(triggered_entry)
             updated = True
@@ -1985,6 +2108,7 @@ class UsageLimitWatcher:
 
     def run_once(self):
         now = datetime.now().astimezone()
+        self.begin_cycle_report(now)
         latest_result = self.inspect_latest_error()
         if latest_result:
             self.state["last_detected_error"] = latest_result["message"]
@@ -1994,27 +2118,30 @@ class UsageLimitWatcher:
             self.state["last_detected_cwd"] = latest_result["thread_info"].get("cwd")
             self.save_state()
 
-        desired_jobs_by_session, global_governing_candidate, active_candidates, allow_absent_prune = self.build_desired_pending_jobs(
-            now=now
+        desired_jobs_by_session, global_governing_candidate, active_candidates, allow_absent_prune, prune_reasons_by_session = (
+            self.build_desired_pending_jobs(now=now)
         )
         if latest_result and not active_candidates:
-            self.log("detected retry time is already in the past; mark as expired and skip scheduling")
+            self.log("detected retry time is already in the past; mark as expired and skip scheduling", console=False)
         if active_candidates:
             self.log(
                 f"reconciling pending jobs sessions={len(desired_jobs_by_session)} "
-                f"global_override={'yes' if global_governing_candidate else 'no'}"
+                f"global_override={'yes' if global_governing_candidate else 'no'}",
+                console=False,
             )
         self.reconcile_pending_jobs(
             desired_jobs_by_session,
             now,
             allow_absent_prune=allow_absent_prune,
+            prune_reasons_by_session=prune_reasons_by_session,
         )
         resume_summary = self.trigger_due_jobs()
         desired_prewarm_jobs = self.build_desired_prewarm_jobs(now=now)
         if desired_prewarm_jobs:
-            self.log(f"reconciling prewarm jobs count={len(desired_prewarm_jobs)}")
+            self.log(f"reconciling prewarm jobs count={len(desired_prewarm_jobs)}", console=False)
         self.reconcile_prewarm_jobs(desired_prewarm_jobs, now)
         self.trigger_due_prewarm_jobs(now=now, suppress_for_resume=resume_summary["attempted"] > 0)
+        self.emit_cycle_report(now)
         return 0
 
     def force_latest(self):

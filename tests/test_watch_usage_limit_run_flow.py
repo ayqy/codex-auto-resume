@@ -222,7 +222,7 @@ def test_run_once_executes_prewarm_jobs_without_usage_limit_events(module, monke
 
     monkeypatch.setattr(module, "datetime", FakeDateTime)
     monkeypatch.setattr(watcher, "inspect_latest_error", lambda: None)
-    monkeypatch.setattr(watcher, "build_desired_pending_jobs", lambda now=None: ({}, None, [], True))
+    monkeypatch.setattr(watcher, "build_desired_pending_jobs", lambda now=None: ({}, None, [], True, {}))
 
     class Result:
         returncode = 0
@@ -313,6 +313,238 @@ def test_trigger_due_jobs_skips_session_that_already_has_agent_reply(module, mon
     assert calls == []
 
 
+def test_run_once_cancels_future_pending_job_when_session_already_resumed(module, monkeypatch, base_dir, codex_home):
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    watcher = module.UsageLimitWatcher(base_dir, cleanup_on_init=False)
+    rollout_path = (
+        codex_home
+        / "sessions"
+        / "2026"
+        / "06"
+        / "25"
+        / "rollout-2026-06-25T07-51-22-11111111-1111-4111-8111-111111111111.jsonl"
+    )
+    rollout_path.write_text(
+        rollout_path.read_text(encoding="utf-8")
+        + '\n{"timestamp":"2026-06-25T00:10:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"正常返回"}]}}\n',
+        encoding="utf-8",
+    )
+    watcher.state["pending_jobs"] = [
+        {
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "retry_at": "2026-06-25T08:05:00+08:00",
+            "scheduled_run_at": "2026-06-25T08:15:00+08:00",
+            "error_log_id": "limit-1",
+            "status": "pending",
+            "cwd": "/workspace/sample-app",
+            "origin_event_at": "2026-06-25T07:53:44+08:00",
+            "origin_retry_at": "2026-06-25T08:05:00+08:00",
+            "origin_scheduled_run_at": "2026-06-25T08:15:00+08:00",
+            "governing_event_at": "2026-06-25T07:53:44+08:00",
+            "governing_retry_at": "2026-06-25T08:05:00+08:00",
+            "governing_scheduled_run_at": "2026-06-25T08:15:00+08:00",
+        }
+    ]
+
+    class FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = datetime(2026, 6, 25, 8, 12, 0, tzinfo=watcher.local_tz)
+            return current if tz else current.replace(tzinfo=None)
+
+        @classmethod
+        def fromtimestamp(cls, ts, tz=None):
+            return datetime.fromtimestamp(ts, tz=tz)
+
+        @classmethod
+        def fromisoformat(cls, value):
+            return datetime.fromisoformat(value)
+
+        @classmethod
+        def strptime(cls, date_string, fmt):
+            return datetime.strptime(date_string, fmt)
+
+    monkeypatch.setattr(module, "datetime", FakeDateTime)
+    monkeypatch.setattr(watcher, "inspect_latest_error", lambda: None)
+
+    candidate = watcher.normalize_candidate_metadata(
+        {
+            "source": "rollout",
+            "priority": 2,
+            "signal_strength": "rollout",
+            "event_dt": datetime(2026, 6, 25, 7, 53, 44, tzinfo=watcher.local_tz),
+            "error_id": "rollout:11111111-1111-4111-8111-111111111111:1:limit",
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "retry_at": datetime(2026, 6, 25, 8, 5, 0, tzinfo=watcher.local_tz),
+            "scheduled_run_at": datetime(2026, 6, 25, 8, 15, 0, tzinfo=watcher.local_tz),
+            "thread_info": watcher.default_thread_info("11111111-1111-4111-8111-111111111111"),
+            "message": "limit",
+            "message_preview": "limit",
+            "retry_source": "credits.primary.resets_at",
+            "reason": "usage limit",
+            "limit_kind": "rollout_primary_credits_exhausted",
+            "primary_used_percent": 100.0,
+            "secondary_used_percent": 31.0,
+            "credits_has": False,
+            "credits_balance": "0",
+        }
+    )
+    monkeypatch.setattr(
+        watcher,
+        "collect_confirmed_candidates",
+        lambda days=14, log_limit=5000, rollout_limit_threads=400: ([candidate], True),
+    )
+
+    assert watcher.run_once() == 0
+    job = watcher.state["pending_jobs"][0]
+    assert job["status"] == "expired"
+    assert job["status_reason"] == "session_already_resumed_manually"
+
+
+def test_run_once_only_cancels_resumed_pending_session(module, monkeypatch, base_dir, codex_home):
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    watcher = module.UsageLimitWatcher(base_dir, cleanup_on_init=False)
+    watcher.state["pending_jobs"] = [
+        {
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "retry_at": "2026-06-25T08:05:00+08:00",
+            "scheduled_run_at": "2026-06-25T08:15:00+08:00",
+            "error_log_id": "limit-1",
+            "status": "pending",
+            "cwd": "/workspace/sample-app",
+            "origin_event_at": "2026-06-25T07:53:44+08:00",
+            "origin_retry_at": "2026-06-25T08:05:00+08:00",
+            "origin_scheduled_run_at": "2026-06-25T08:15:00+08:00",
+            "governing_event_at": "2026-06-25T07:53:44+08:00",
+            "governing_retry_at": "2026-06-25T08:05:00+08:00",
+            "governing_scheduled_run_at": "2026-06-25T08:15:00+08:00",
+        },
+        {
+            "session_id": "22222222-2222-4222-8222-222222222222",
+            "retry_at": "2026-06-25T08:06:00+08:00",
+            "scheduled_run_at": "2026-06-25T08:16:00+08:00",
+            "error_log_id": "limit-2",
+            "status": "pending",
+            "cwd": "/workspace/secondary-project",
+            "origin_event_at": "2026-06-25T07:54:44+08:00",
+            "origin_retry_at": "2026-06-25T08:06:00+08:00",
+            "origin_scheduled_run_at": "2026-06-25T08:16:00+08:00",
+            "governing_event_at": "2026-06-25T07:54:44+08:00",
+            "governing_retry_at": "2026-06-25T08:06:00+08:00",
+            "governing_scheduled_run_at": "2026-06-25T08:16:00+08:00",
+        },
+    ]
+
+    class FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = datetime(2026, 6, 25, 8, 12, 0, tzinfo=watcher.local_tz)
+            return current if tz else current.replace(tzinfo=None)
+
+        @classmethod
+        def fromtimestamp(cls, ts, tz=None):
+            return datetime.fromtimestamp(ts, tz=tz)
+
+        @classmethod
+        def fromisoformat(cls, value):
+            return datetime.fromisoformat(value)
+
+        @classmethod
+        def strptime(cls, date_string, fmt):
+            return datetime.strptime(date_string, fmt)
+
+    monkeypatch.setattr(module, "datetime", FakeDateTime)
+    monkeypatch.setattr(watcher, "inspect_latest_error", lambda: None)
+
+    session_one = watcher.normalize_candidate_metadata(
+        {
+            "source": "rollout",
+            "priority": 2,
+            "signal_strength": "rollout",
+            "event_dt": datetime(2026, 6, 25, 7, 53, 44, tzinfo=watcher.local_tz),
+            "error_id": "rollout:11111111-1111-4111-8111-111111111111:1:limit",
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "retry_at": datetime(2026, 6, 25, 8, 5, 0, tzinfo=watcher.local_tz),
+            "scheduled_run_at": datetime(2026, 6, 25, 8, 15, 0, tzinfo=watcher.local_tz),
+            "thread_info": watcher.default_thread_info("11111111-1111-4111-8111-111111111111"),
+            "message": "limit",
+            "message_preview": "limit",
+            "retry_source": "credits.primary.resets_at",
+            "reason": "usage limit",
+            "limit_kind": "rollout_primary_credits_exhausted",
+            "primary_used_percent": 100.0,
+            "secondary_used_percent": 31.0,
+            "credits_has": False,
+            "credits_balance": "0",
+        }
+    )
+    session_two = watcher.normalize_candidate_metadata(
+        {
+            "source": "rollout",
+            "priority": 2,
+            "signal_strength": "rollout",
+            "event_dt": datetime(2026, 6, 25, 7, 54, 44, tzinfo=watcher.local_tz),
+            "error_id": "rollout:22222222-2222-4222-8222-222222222222:1:limit",
+            "session_id": "22222222-2222-4222-8222-222222222222",
+            "retry_at": datetime(2026, 6, 25, 8, 6, 0, tzinfo=watcher.local_tz),
+            "scheduled_run_at": datetime(2026, 6, 25, 8, 16, 0, tzinfo=watcher.local_tz),
+            "thread_info": watcher.default_thread_info("22222222-2222-4222-8222-222222222222"),
+            "message": "limit",
+            "message_preview": "limit",
+            "retry_source": "credits.primary.resets_at",
+            "reason": "usage limit",
+            "limit_kind": "rollout_primary_credits_exhausted",
+            "primary_used_percent": 100.0,
+            "secondary_used_percent": 31.0,
+            "credits_has": False,
+            "credits_balance": "0",
+        }
+    )
+    monkeypatch.setattr(
+        watcher,
+        "collect_confirmed_candidates",
+        lambda days=14, log_limit=5000, rollout_limit_threads=400: ([session_one, session_two], True),
+    )
+    monkeypatch.setattr(
+        watcher,
+        "session_has_normal_agent_activity_after",
+        lambda session_id, after_dt: session_id == "11111111-1111-4111-8111-111111111111",
+    )
+
+    assert watcher.run_once() == 0
+
+    resumed_jobs = [
+        job
+        for job in watcher.state["pending_jobs"]
+        if job["session_id"] == "11111111-1111-4111-8111-111111111111"
+    ]
+    other_jobs = [
+        job for job in watcher.state["pending_jobs"] if job["session_id"] == "22222222-2222-4222-8222-222222222222"
+    ]
+
+    assert resumed_jobs[0]["status"] == "expired"
+    assert resumed_jobs[0]["status_reason"] == "session_already_resumed_manually"
+    assert any(job["status"] == "pending" for job in other_jobs)
+
+
+def test_run_once_without_user_visible_changes_prints_single_summary_line(
+    module, monkeypatch, base_dir, codex_home, capsys
+):
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    watcher = module.UsageLimitWatcher(base_dir, cleanup_on_init=False)
+    monkeypatch.setattr(watcher, "inspect_latest_error", lambda: None)
+    monkeypatch.setattr(watcher, "build_desired_pending_jobs", lambda now=None: ({}, None, [], True, {}))
+
+    assert watcher.run_once() == 0
+
+    output_lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert len(output_lines) == 1
+    assert "ok pending=0 prewarm=0 next=-" in output_lines[0]
+    assert "selected latest usage limit candidate" not in output_lines[0]
+    assert "reconciling pending jobs" not in output_lines[0]
+    assert "updated pending job metadata" not in output_lines[0]
+
+
 def test_run_once_suppresses_due_prewarm_when_resume_runs(module, monkeypatch, base_dir, codex_home):
     write_config(base_dir, ["10:30"])
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
@@ -354,7 +586,7 @@ def test_run_once_suppresses_due_prewarm_when_resume_runs(module, monkeypatch, b
 
     monkeypatch.setattr(module, "datetime", FakeDateTime)
     monkeypatch.setattr(watcher, "inspect_latest_error", lambda: None)
-    monkeypatch.setattr(watcher, "build_desired_pending_jobs", lambda now=None: ({}, None, [], True))
+    monkeypatch.setattr(watcher, "build_desired_pending_jobs", lambda now=None: ({}, None, [], True, {}))
 
     class Result:
         returncode = 0

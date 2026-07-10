@@ -73,7 +73,7 @@
 | `make config` | 交互式配置 `config.json` 中的代理和 `workat`。 |
 | `make config proxy` | 配置 `config.json` 中的 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY`。 |
 | `make config workat` | 使用 `HH:MM` 格式配置 `config.json` 中一个或多个每日 `workat` 时间点。 |
-| `make run` | **(最重要)** 启动后台监控进程，持续监测用量限制并自动为您恢复会话。 |
+| `make run` | **(最重要)** 启动后台监控进程，持续监测用量限制并自动为您恢复会话。控制台输出会刻意保持精简，详细诊断继续写入 `tmp/logs/watcher.log`。 |
 | `make today` | 显示您今天的 token 使用量、活跃时间及预估开销的详细报告。 |
 | `make usage` | 显示指定某一天的同样内容的报告。(例如: `make usage D=2026-07-03`) |
 | `make recent`| 显示过去 30 天的用量统计。(例如: `make recent N=7` 显示过去 7 天) |
@@ -105,7 +105,11 @@
 
 自动恢复现在会先从目标会话的 rollout 日志中恢复原会话使用的模型和推理强度，再执行 `codex resume`，以避免切换模型导致缓存连续性丢失。
 
+如果某个已调度的会话后来收到了新的正常 AI 消息，watcher 会在下一次轮询时自动取消这个 pending schedule，而不是等到计划触发时间才跳过。
+
 如果配置了 `workat`，`make run` 还会在每个 `workat - 4 小时` 的时间点静默执行一次预热探针。该探针固定使用非交互 `codex exec`、模型 `gpt-5.4-mini`、`low` 推理强度以及提示词 `Just say Hi`，以最小 token 成本刷新滚动窗口，并且不会弹出终端打扰用户。
+
+当 `make run` 运行正常且本轮没有用户需要关注的变化时，控制台只会输出一行简短摘要。如果需要查看完整内部轨迹，请检查 `tmp/logs/watcher.log`；`tmp/state.json` 仍然是 pending / triggered 任务的最终状态来源。
 
 <details>
 <summary><b>高级用法与调试</b></summary>

@@ -112,11 +112,14 @@ def test_build_desired_pending_jobs_handles_global_override(module, monkeypatch,
     watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
     now = datetime(2026, 6, 26, 12, 9, 0, tzinfo=watcher.local_tz)
 
-    desired_jobs, global_candidate, active_candidates, logs_available = watcher.build_desired_pending_jobs(now=now, days=14)
+    desired_jobs, global_candidate, active_candidates, logs_available, prune_reasons = watcher.build_desired_pending_jobs(
+        now=now, days=14
+    )
 
     assert logs_available is True
     assert len(active_candidates) >= 1
     assert global_candidate is not None
+    assert prune_reasons == {}
     assert global_candidate["limit_scope"] == "global_window"
     assert "22222222-2222-4222-8222-222222222222" in desired_jobs
     job = desired_jobs["22222222-2222-4222-8222-222222222222"]
@@ -188,11 +191,14 @@ def test_build_desired_pending_jobs_discards_invalidated_global_candidate(module
         lambda days=14, log_limit=5000, rollout_limit_threads=400: ([stale_global, newer_session_limit], True),
     )
 
-    desired_jobs, global_candidate, active_candidates, logs_available = watcher.build_desired_pending_jobs(now=now, days=14)
+    desired_jobs, global_candidate, active_candidates, logs_available, prune_reasons = watcher.build_desired_pending_jobs(
+        now=now, days=14
+    )
 
     assert logs_available is True
     assert global_candidate is None
     assert len(active_candidates) == 1
+    assert prune_reasons == {}
     assert set(desired_jobs) == {"fresh-session"}
     assert desired_jobs["fresh-session"]["governing_limit_scope"] == "session_window"
 
@@ -216,9 +222,14 @@ def test_reconcile_pending_jobs_marks_replaced_and_expired(module, monkeypatch, 
         "status": "pending",
     }
     watcher.state["pending_jobs"] = [old_job, expired_job]
-    desired_jobs, _, _, _ = watcher.build_desired_pending_jobs(now=now, days=14)
+    desired_jobs, _, _, _, prune_reasons = watcher.build_desired_pending_jobs(now=now, days=14)
 
-    watcher.reconcile_pending_jobs(desired_jobs, now, allow_absent_prune=True)
+    watcher.reconcile_pending_jobs(
+        desired_jobs,
+        now,
+        allow_absent_prune=True,
+        prune_reasons_by_session=prune_reasons,
+    )
 
     statuses = {job["session_id"]: job["status"] for job in watcher.state["pending_jobs"]}
     assert statuses["expired-session"] == "expired"
@@ -249,6 +260,17 @@ def test_collect_confirmed_candidates_falls_back_when_logs_db_unavailable(module
 
     assert logs_available is False
     assert any(candidate["source"] == "rollout" for candidate in candidates)
+
+
+def test_thread_exists_state_db_fallback_is_file_only(module, monkeypatch, base_dir, codex_home, capsys):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    watcher.state_db.write_text("not a sqlite db", encoding="utf-8")
+
+    thread_info = watcher.thread_exists("11111111-1111-4111-8111-111111111111")
+
+    assert capsys.readouterr().out == ""
+    assert thread_info["id"] == "11111111-1111-4111-8111-111111111111"
+    assert "fallback to rollout/cache" in watcher.log_path.read_text(encoding="utf-8")
 
 
 def test_build_desired_prewarm_jobs_skips_when_workat_not_configured(module, monkeypatch, base_dir, codex_home):
