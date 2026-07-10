@@ -94,6 +94,14 @@ def seed_logs(path: Path):
     )
 
 
+def write_rollout(path: Path, entries: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries) + "\n",
+        encoding="utf-8",
+    )
+
+
 def write_config(base_dir: Path, workat: list[str] | None):
     payload = {
         "proxy": {
@@ -113,7 +121,7 @@ def test_build_desired_pending_jobs_handles_global_override(module, monkeypatch,
     now = datetime(2026, 6, 26, 12, 9, 0, tzinfo=watcher.local_tz)
 
     desired_jobs, global_candidate, active_candidates, logs_available, prune_reasons = watcher.build_desired_pending_jobs(
-        now=now, days=14
+        now=now, days=30
     )
 
     assert logs_available is True
@@ -222,7 +230,7 @@ def test_reconcile_pending_jobs_marks_replaced_and_expired(module, monkeypatch, 
         "status": "pending",
     }
     watcher.state["pending_jobs"] = [old_job, expired_job]
-    desired_jobs, _, _, _, prune_reasons = watcher.build_desired_pending_jobs(now=now, days=14)
+    desired_jobs, _, _, _, prune_reasons = watcher.build_desired_pending_jobs(now=now, days=30)
 
     watcher.reconcile_pending_jobs(
         desired_jobs,
@@ -235,6 +243,242 @@ def test_reconcile_pending_jobs_marks_replaced_and_expired(module, monkeypatch, 
     assert statuses["expired-session"] == "expired"
     assert any(job["status"] == "replaced" for job in watcher.state["pending_jobs"] if job["session_id"] == "22222222-2222-4222-8222-222222222222")
     assert any(job["status"] == "pending" and job["error_log_id"] != "old-error" for job in watcher.state["pending_jobs"] if job["session_id"] == "22222222-2222-4222-8222-222222222222")
+
+
+def test_choose_session_candidate_prefers_latest_event_over_later_scheduled_run_at(module, monkeypatch, base_dir, codex_home):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    session_id = "latest-session"
+    current = watcher.normalize_candidate_metadata(
+        {
+            "source": "rollout",
+            "priority": 2,
+            "signal_strength": "rollout",
+            "event_dt": datetime(2026, 7, 10, 10, 57, 29, tzinfo=watcher.local_tz),
+            "error_id": "rollout:latest-session:1:rollout_primary_limit",
+            "session_id": session_id,
+            "retry_at": datetime(2026, 7, 10, 11, 4, 48, tzinfo=watcher.local_tz),
+            "scheduled_run_at": datetime(2026, 7, 10, 11, 14, 48, tzinfo=watcher.local_tz),
+            "thread_info": watcher.default_thread_info(session_id),
+            "message": "older rollout limit",
+            "message_preview": "older rollout limit",
+            "retry_source": "rate_limits.primary.resets_at",
+            "reason": "rollout primary usage limit reached",
+            "limit_kind": "rollout_primary_limit",
+            "primary_used_percent": 100.0,
+            "secondary_used_percent": 31.0,
+            "credits_has": False,
+            "credits_balance": "0",
+        }
+    )
+    challenger = watcher.normalize_candidate_metadata(
+        {
+            "source": "logs",
+            "priority": 1,
+            "signal_strength": "strong",
+            "event_dt": datetime(2026, 7, 10, 10, 58, 47, tzinfo=watcher.local_tz),
+            "error_id": "57303522",
+            "session_id": session_id,
+            "retry_at": datetime(2026, 7, 10, 11, 4, 0, tzinfo=watcher.local_tz),
+            "scheduled_run_at": datetime(2026, 7, 10, 11, 14, 0, tzinfo=watcher.local_tz),
+            "thread_info": watcher.default_thread_info(session_id),
+            "message": "newer explicit limit",
+            "message_preview": "newer explicit limit",
+            "retry_source": "message",
+            "reason": "explicit usage limit turn error",
+            "limit_kind": "log_turn_error",
+            "primary_used_percent": 100.0,
+            "secondary_used_percent": 31.0,
+            "credits_has": False,
+            "credits_balance": "0",
+        }
+    )
+
+    assert watcher.choose_session_candidate(current, challenger) == challenger
+
+
+def test_collect_rollout_candidates_for_thread_skips_transient_limit_when_normal_agent_message_follows(
+    module, monkeypatch, base_dir, codex_home
+):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    session_id = "transient-rollout-session"
+    rollout_path = (
+        codex_home / "sessions" / "2026" / "07" / "10" / f"rollout-2026-07-10T10-55-00-{session_id}.jsonl"
+    )
+    write_rollout(
+        rollout_path,
+        [
+            {
+                "timestamp": "2026-07-10T02:55:00.000Z",
+                "type": "turn_context",
+                "payload": {
+                    "cwd": "/workspace/transient",
+                    "title": "Transient rollout session",
+                    "model_provider": "openai",
+                },
+            },
+            {
+                "timestamp": "2026-07-10T02:57:29.073Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                        "rate_limits": {
+                            "limit_id": "codex",
+                            "primary": {"used_percent": 100.0, "resets_at": 1783652688},
+                            "secondary": {"used_percent": 31.0, "resets_at": 1784239488},
+                            "credits": {"has_credits": True, "balance": "12"},
+                        },
+                    },
+                },
+            {
+                "timestamp": "2026-07-10T02:57:34.124Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "继续正常执行"}],
+                },
+            },
+            {
+                "timestamp": "2026-07-10T02:58:47.229Z",
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "turn-1", "last_agent_message": None},
+            },
+        ],
+    )
+    thread_info = watcher.parse_rollout_metadata(rollout_path, session_id=session_id)
+
+    assert watcher.collect_rollout_candidates_for_thread(thread_info) == []
+
+
+def test_collect_rollout_candidates_for_thread_keeps_terminal_limit_without_following_agent_message(
+    module, monkeypatch, base_dir, codex_home
+):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    session_id = "terminal-rollout-session"
+    rollout_path = (
+        codex_home / "sessions" / "2026" / "07" / "10" / f"rollout-2026-07-10T10-55-00-{session_id}.jsonl"
+    )
+    write_rollout(
+        rollout_path,
+        [
+            {
+                "timestamp": "2026-07-10T02:55:00.000Z",
+                "type": "turn_context",
+                "payload": {
+                    "cwd": "/workspace/terminal",
+                    "title": "Terminal rollout session",
+                    "model_provider": "openai",
+                },
+            },
+            {
+                "timestamp": "2026-07-10T02:57:29.073Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                        "rate_limits": {
+                            "limit_id": "codex",
+                            "primary": {"used_percent": 100.0, "resets_at": 1783652688},
+                            "secondary": {"used_percent": 31.0, "resets_at": 1784239488},
+                            "credits": {"has_credits": True, "balance": "12"},
+                        },
+                    },
+                },
+            {
+                "timestamp": "2026-07-10T02:58:47.229Z",
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "turn-1", "last_agent_message": None},
+            },
+        ],
+    )
+    thread_info = watcher.parse_rollout_metadata(rollout_path, session_id=session_id)
+
+    candidates = watcher.collect_rollout_candidates_for_thread(thread_info)
+
+    assert len(candidates) == 1
+    assert candidates[0]["source"] == "rollout"
+    assert candidates[0]["reason"] == "rollout primary usage limit reached"
+
+
+def test_build_desired_pending_jobs_prefers_latest_log_error_after_transient_rollout_limit(
+    module, monkeypatch, base_dir, codex_home
+):
+    session_id = "019f49c4-e8b6-7523-a3fa-45312102d488"
+    create_logs_db(
+        codex_home / "logs_2.sqlite",
+        [
+            {
+                "id": 57303522,
+                "ts": int(datetime(2026, 7, 10, 10, 58, 47, tzinfo=module.ZoneInfo("Asia/Shanghai")).timestamp()),
+                "level": "INFO",
+                "thread_id": session_id,
+                "process_uuid": "pid:test:transient",
+                "feedback_log_body": (
+                    f'session_loop{{thread_id={session_id}}}: '
+                    "run_turn: Turn error: You've hit your usage limit. Upgrade to Pro "
+                    "(https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage "
+                    "to purchase more credits or try again at 11:04 AM."
+                ),
+            }
+        ],
+    )
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    rollout_path = (
+        codex_home / "sessions" / "2026" / "07" / "10" / f"rollout-2026-07-10T10-04-29-{session_id}.jsonl"
+    )
+    write_rollout(
+        rollout_path,
+        [
+            {
+                "timestamp": "2026-07-10T02:55:00.000Z",
+                "type": "turn_context",
+                "payload": {
+                    "cwd": "/workspace/transient",
+                    "title": "Transient session",
+                    "model_provider": "openai",
+                },
+            },
+            {
+                "timestamp": "2026-07-10T02:57:29.073Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                        "rate_limits": {
+                            "limit_id": "codex",
+                            "primary": {"used_percent": 100.0, "resets_at": 1783652688},
+                            "secondary": {"used_percent": 31.0, "resets_at": 1784239488},
+                            "credits": {"has_credits": True, "balance": "12"},
+                        },
+                    },
+                },
+            {
+                "timestamp": "2026-07-10T02:57:34.124Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "继续正常执行"}],
+                },
+            },
+            {
+                "timestamp": "2026-07-10T02:58:47.229Z",
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "turn-1", "last_agent_message": None},
+            },
+        ],
+    )
+    record = {"session_id": session_id, "rollout_path": str(rollout_path), "mtime": rollout_path.stat().st_mtime}
+    monkeypatch.setattr(watcher, "scan_rollout_index", lambda force=False: {"by_session": {session_id: record}, "recent": [record]})
+
+    desired_jobs, _, _, _, prune_reasons = watcher.build_desired_pending_jobs(
+        now=datetime(2026, 7, 10, 11, 0, 0, tzinfo=watcher.local_tz),
+        days=14,
+    )
+
+    assert prune_reasons == {}
+    assert session_id in desired_jobs
+    assert desired_jobs[session_id]["origin_source"] == "logs"
+    assert desired_jobs[session_id]["origin_error_id"] == "57303522"
+    assert desired_jobs[session_id]["scheduled_run_at"] == "2026-07-10T11:14:00+08:00"
 
 
 def test_compute_sleep_seconds_for_due_and_future_jobs(module, monkeypatch, base_dir, codex_home):
@@ -256,7 +500,7 @@ def test_collect_confirmed_candidates_falls_back_when_logs_db_unavailable(module
     broken_logs = codex_home / "logs_2.sqlite"
     broken_logs.write_text("not a sqlite db", encoding="utf-8")
 
-    candidates, logs_available = watcher.collect_confirmed_candidates(days=14)
+    candidates, logs_available = watcher.collect_confirmed_candidates(days=30)
 
     assert logs_available is False
     assert any(candidate["source"] == "rollout" for candidate in candidates)

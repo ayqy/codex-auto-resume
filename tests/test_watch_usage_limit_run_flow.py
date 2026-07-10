@@ -149,9 +149,31 @@ def test_run_once_updates_state_and_triggers_due_jobs(module, monkeypatch, base_
 
 
 def test_force_latest_success_and_failure(module, monkeypatch, base_dir, codex_home):
-    seed_logs(codex_home / "logs_2.sqlite")
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     watcher = module.UsageLimitWatcher(base_dir, cleanup_on_init=False)
+    candidate = watcher.normalize_candidate_metadata(
+        {
+            "source": "logs",
+            "priority": 1,
+            "signal_strength": "strong",
+            "event_dt": datetime(2026, 7, 3, 6, 0, 0, tzinfo=watcher.local_tz),
+            "error_id": "force-latest-error",
+            "session_id": "22222222-2222-4222-8222-222222222222",
+            "retry_at": datetime(2026, 7, 3, 6, 5, 0, tzinfo=watcher.local_tz),
+            "scheduled_run_at": datetime(2026, 7, 3, 6, 15, 0, tzinfo=watcher.local_tz),
+            "thread_info": watcher.default_thread_info("22222222-2222-4222-8222-222222222222"),
+            "message": "force latest",
+            "message_preview": "force latest",
+            "retry_source": "message",
+            "reason": "explicit usage limit turn error",
+            "limit_kind": "log_turn_error",
+            "primary_used_percent": 100.0,
+            "secondary_used_percent": 31.0,
+            "credits_has": False,
+            "credits_balance": "0",
+        }
+    )
+    monkeypatch.setattr(watcher, "inspect_latest_error", lambda: candidate)
 
     class Success:
         returncode = 0

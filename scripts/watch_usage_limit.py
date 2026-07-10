@@ -226,6 +226,16 @@ class UsageLimitWatcher:
         error_id = str(candidate.get("error_id", ""))
         return (retry_at, event_dt, -priority, error_id)
 
+    def same_session_candidate_sort_key(self, candidate: dict):
+        event_dt = candidate.get("event_dt") or datetime.fromtimestamp(0, tz=ZoneInfo("UTC"))
+        trust_rank = self.candidate_trust_rank(candidate)
+        scope_rank = self.candidate_scope_rank(candidate)
+        family_rank = self.candidate_family_rank(candidate)
+        retry_at = candidate.get("retry_at") or datetime.fromtimestamp(0, tz=ZoneInfo("UTC"))
+        scheduled_run_at = candidate.get("scheduled_run_at") or datetime.fromtimestamp(0, tz=ZoneInfo("UTC"))
+        error_id = str(candidate.get("error_id", ""))
+        return (event_dt, trust_rank, scope_rank, family_rank, retry_at, scheduled_run_at, error_id)
+
     def candidate_trust_rank(self, candidate: dict):
         source = candidate.get("source")
         signal_strength = candidate.get("signal_strength")
@@ -242,6 +252,14 @@ class UsageLimitWatcher:
             return current
         if current is None:
             return challenger
+        if challenger.get("session_id") and challenger.get("session_id") == current.get("session_id"):
+            if self.same_session_candidate_sort_key(challenger) != self.same_session_candidate_sort_key(current):
+                return (
+                    challenger
+                    if self.same_session_candidate_sort_key(challenger) > self.same_session_candidate_sort_key(current)
+                    else current
+                )
+            return challenger if str(challenger.get("error_id", "")) > str(current.get("error_id", "")) else current
         if self.candidate_scope_rank(challenger) != self.candidate_scope_rank(current):
             return challenger if self.candidate_scope_rank(challenger) > self.candidate_scope_rank(current) else current
         if self.candidate_family_rank(challenger) != self.candidate_family_rank(current):
@@ -286,18 +304,8 @@ class UsageLimitWatcher:
             return current
         if current is None:
             return challenger
-        if self.candidate_scope_rank(challenger) != self.candidate_scope_rank(current):
-            return challenger if self.candidate_scope_rank(challenger) > self.candidate_scope_rank(current) else current
-        challenger_time = challenger.get("scheduled_run_at") or challenger.get("retry_at")
-        current_time = current.get("scheduled_run_at") or current.get("retry_at")
-        if challenger_time != current_time:
-            return challenger if challenger_time > current_time else current
-        if self.candidate_family_rank(challenger) != self.candidate_family_rank(current):
-            return challenger if self.candidate_family_rank(challenger) > self.candidate_family_rank(current) else current
-        if self.candidate_trust_rank(challenger) != self.candidate_trust_rank(current):
-            return challenger if self.candidate_trust_rank(challenger) > self.candidate_trust_rank(current) else current
-        if self.sort_key_for_max(challenger) != self.sort_key_for_max(current):
-            return challenger if self.sort_key_for_max(challenger) > self.sort_key_for_max(current) else current
+        if self.same_session_candidate_sort_key(challenger) != self.same_session_candidate_sort_key(current):
+            return challenger if self.same_session_candidate_sort_key(challenger) > self.same_session_candidate_sort_key(current) else current
         return challenger if str(challenger.get("error_id", "")) > str(current.get("error_id", "")) else current
 
     def choose_global_governing_candidate(self, current: Optional[dict], challenger: Optional[dict]):
@@ -1308,6 +1316,14 @@ class UsageLimitWatcher:
         }
         return self.normalize_candidate_metadata(candidate)
 
+    def rollout_entry_is_task_boundary(self, obj: dict):
+        payload = obj.get("payload", {})
+        if not isinstance(payload, dict):
+            return False
+        if obj.get("type") != "event_msg":
+            return False
+        return payload.get("type") in {"task_complete", "task_started"}
+
     def collect_rollout_candidates_for_thread(self, thread_info: dict):
         rollout_path = thread_info.get("rollout_path")
         if not rollout_path:
@@ -1317,6 +1333,18 @@ class UsageLimitWatcher:
             return []
 
         candidates = []
+        pending_limit_candidates = []
+
+        def flush_pending_limit_candidates():
+            nonlocal pending_limit_candidates
+            if pending_limit_candidates:
+                candidates.extend(
+                    candidate
+                    for candidate in pending_limit_candidates
+                    if not candidate.get("transient_rollout_limit")
+                )
+            pending_limit_candidates = []
+
         previous_state = None
         try:
             with path.open(encoding="utf-8") as handle:
@@ -1333,6 +1361,11 @@ class UsageLimitWatcher:
                     if not timestamp:
                         continue
                     event_dt = self.parse_iso_timestamp(timestamp)
+                    if self.rollout_entry_has_normal_agent_message(obj):
+                        for candidate in pending_limit_candidates:
+                            candidate["transient_rollout_limit"] = True
+                    if self.rollout_entry_is_task_boundary(obj):
+                        flush_pending_limit_candidates()
                     text = line
                     payload = obj.get("payload", {})
                     if not isinstance(payload, dict) or payload.get("type") != "token_count":
@@ -1389,7 +1422,8 @@ class UsageLimitWatcher:
                             credits_balance=credits_balance,
                         )
                         if candidate:
-                            candidates.append(candidate)
+                            candidate["transient_rollout_limit"] = False
+                            pending_limit_candidates.append(candidate)
 
                     if current_state["secondary_active"] and not previous_state["secondary_active"]:
                         retry_at = datetime.fromtimestamp(int(secondary_reset), tz=ZoneInfo("UTC")).astimezone(
@@ -1410,7 +1444,8 @@ class UsageLimitWatcher:
                             credits_balance=credits_balance,
                         )
                         if candidate:
-                            candidates.append(candidate)
+                            candidate["transient_rollout_limit"] = False
+                            pending_limit_candidates.append(candidate)
 
                     if current_state["credits_empty"] and not previous_state["credits_empty"]:
                         reset_ts = None
@@ -1449,6 +1484,7 @@ class UsageLimitWatcher:
                                 candidates.append(candidate)
 
                     previous_state = current_state
+            flush_pending_limit_candidates()
         except Exception:
             return []
         return candidates
