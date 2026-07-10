@@ -211,7 +211,9 @@ def test_build_desired_pending_jobs_discards_invalidated_global_candidate(module
     assert desired_jobs["fresh-session"]["governing_limit_scope"] == "session_window"
 
 
-def test_reconcile_pending_jobs_marks_replaced_and_expired(module, monkeypatch, base_dir, codex_home):
+def test_reconcile_pending_jobs_marks_replaced_and_preserves_future_pending_without_prune_reason(
+    module, monkeypatch, base_dir, codex_home
+):
     seed_logs(codex_home / "logs_2.sqlite")
     watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
     now = datetime(2026, 6, 26, 12, 9, 0, tzinfo=watcher.local_tz)
@@ -240,7 +242,7 @@ def test_reconcile_pending_jobs_marks_replaced_and_expired(module, monkeypatch, 
     )
 
     statuses = {job["session_id"]: job["status"] for job in watcher.state["pending_jobs"]}
-    assert statuses["expired-session"] == "expired"
+    assert statuses["expired-session"] == "pending"
     assert any(job["status"] == "replaced" for job in watcher.state["pending_jobs"] if job["session_id"] == "22222222-2222-4222-8222-222222222222")
     assert any(job["status"] == "pending" and job["error_log_id"] != "old-error" for job in watcher.state["pending_jobs"] if job["session_id"] == "22222222-2222-4222-8222-222222222222")
 

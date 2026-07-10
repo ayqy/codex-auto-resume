@@ -567,6 +567,61 @@ def test_run_once_without_user_visible_changes_prints_single_summary_line(
     assert "updated pending job metadata" not in output_lines[0]
 
 
+def test_run_once_keeps_future_pending_job_when_candidates_temporarily_missing(module, monkeypatch, base_dir, codex_home):
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    watcher = module.UsageLimitWatcher(base_dir, cleanup_on_init=False)
+    now = datetime(2026, 6, 25, 8, 12, 0, tzinfo=watcher.local_tz)
+    watcher.state["pending_jobs"] = [
+        {
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "retry_at": "2026-06-25T08:05:00+08:00",
+            "scheduled_run_at": "2026-06-25T08:15:00+08:00",
+            "error_log_id": "limit-1",
+            "status": "pending",
+            "cwd": "/workspace/sample-app",
+            "origin_event_at": "2026-06-25T07:53:44+08:00",
+            "origin_retry_at": "2026-06-25T08:05:00+08:00",
+            "origin_scheduled_run_at": "2026-06-25T08:15:00+08:00",
+            "governing_event_at": "2026-06-25T07:53:44+08:00",
+            "governing_retry_at": "2026-06-25T08:05:00+08:00",
+            "governing_scheduled_run_at": "2026-06-25T08:15:00+08:00",
+        }
+    ]
+
+    class FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now if tz else now.replace(tzinfo=None)
+
+        @classmethod
+        def fromtimestamp(cls, ts, tz=None):
+            return datetime.fromtimestamp(ts, tz=tz)
+
+        @classmethod
+        def fromisoformat(cls, value):
+            return datetime.fromisoformat(value)
+
+        @classmethod
+        def strptime(cls, date_string, fmt):
+            return datetime.strptime(date_string, fmt)
+
+    monkeypatch.setattr(module, "datetime", FakeDateTime)
+    monkeypatch.setattr(watcher, "inspect_latest_error", lambda: None)
+    monkeypatch.setattr(watcher, "build_desired_pending_jobs", lambda now=None: ({}, None, [], True, {}))
+
+    calls = []
+
+    def fake_run(command, capture_output, text, check, timeout=None):
+        calls.append(command)
+        raise AssertionError("future pending job should not trigger subprocess")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    assert watcher.run_once() == 0
+    assert watcher.state["pending_jobs"][0]["status"] == "pending"
+    assert calls == []
+
+
 def test_run_once_suppresses_due_prewarm_when_resume_runs(module, monkeypatch, base_dir, codex_home):
     write_config(base_dir, ["10:30"])
     monkeypatch.setenv("CODEX_HOME", str(codex_home))

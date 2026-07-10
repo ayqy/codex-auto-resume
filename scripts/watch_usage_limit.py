@@ -16,6 +16,8 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 TIME_RE = re.compile(r"try again at ([0-9]{1,2}:[0-9]{2} [AP]M)")
+LONG_TIME_RE = re.compile(r"try again at ([A-Z][a-z]{2} \d{1,2}(?:st|nd|rd|th), \d{4} \d{1,2}:\d{2} [AP]M)\.?")
+ORDINAL_DAY_RE = re.compile(r"(\d{1,2})(st|nd|rd|th)")
 RESETS_AT_RE = re.compile(r'"resets_at":\s*(\d+)')
 PRIMARY_RESET_AT_HEADER_RE = re.compile(r'"X-Codex-Primary-Reset-At":"(\d+)"')
 SESSION_ID_RE = re.compile(r"rollout-.*-([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$")
@@ -1096,9 +1098,8 @@ class UsageLimitWatcher:
             "credits_balance": credits.get("balance") or headers.get("X-Codex-Credits-Balance"),
         }
 
-    def parse_retry_time(self, rows, target_row: LogRow):
-        event_dt = datetime.fromtimestamp(target_row.ts, tz=ZoneInfo("UTC")).astimezone(self.local_tz)
-        match = TIME_RE.search(target_row.feedback_log_body)
+    def parse_retry_time_from_message(self, text: str, event_dt: datetime):
+        match = TIME_RE.search(text)
         if match:
             parsed_time = datetime.strptime(match.group(1), "%I:%M %p").time()
             retry_at = event_dt.replace(
@@ -1109,6 +1110,20 @@ class UsageLimitWatcher:
             )
             if retry_at < event_dt - timedelta(minutes=1):
                 retry_at += timedelta(days=1)
+            return retry_at
+
+        match = LONG_TIME_RE.search(text)
+        if not match:
+            return None
+
+        normalized = ORDINAL_DAY_RE.sub(r"\1", match.group(1))
+        parsed = datetime.strptime(normalized, "%b %d, %Y %I:%M %p")
+        return parsed.replace(tzinfo=self.local_tz)
+
+    def parse_retry_time(self, rows, target_row: LogRow):
+        event_dt = datetime.fromtimestamp(target_row.ts, tz=ZoneInfo("UTC")).astimezone(self.local_tz)
+        retry_at = self.parse_retry_time_from_message(target_row.feedback_log_body, event_dt)
+        if retry_at is not None:
             return retry_at, "message"
 
         ordered_rows = [target_row] + [row for row in rows if row.id != target_row.id]
@@ -1723,6 +1738,7 @@ class UsageLimitWatcher:
             for session_id, existing_jobs in pending_by_session.items():
                 if session_id in desired_jobs_by_session:
                     continue
+                prune_reason = prune_reasons_by_session.get(session_id)
                 for job in existing_jobs:
                     if job.get("status") != "pending":
                         continue
@@ -1733,9 +1749,10 @@ class UsageLimitWatcher:
                         scheduled_run_at = None
                     if scheduled_run_at and scheduled_run_at <= now:
                         continue
-                    prune_reason = prune_reasons_by_session.get(session_id)
+                    if not prune_reason:
+                        continue
                     job["status"] = "expired"
-                    job["status_reason"] = prune_reason or "candidate_no_longer_active"
+                    job["status_reason"] = prune_reason
                     job["expired_at"] = now.isoformat()
                     changed = True
                     if prune_reason == "session_already_resumed_manually":

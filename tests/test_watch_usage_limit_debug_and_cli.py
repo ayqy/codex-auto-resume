@@ -197,3 +197,24 @@ def test_sample_parse_logic_is_covered_as_unit_test(module, monkeypatch, base_di
     assert retry_at.minute == 13
     assert retry_at.date().isoformat() == "2026-06-26"
     assert source == "message"
+
+
+def test_parse_retry_time_supports_long_date_message_format(module, monkeypatch, base_dir, codex_home):
+    watcher = module.UsageLimitWatcher(base_dir, cleanup_on_init=False)
+    row = module.LogRow(
+        id=2,
+        ts=int(datetime(2026, 7, 10, 12, 57, 44, tzinfo=module.ZoneInfo("UTC")).timestamp()),
+        level="INFO",
+        thread_id="sample-session",
+        process_uuid="pid:test:sample",
+        feedback_log_body=(
+            "Turn error: You've hit your usage limit. Upgrade to Pro "
+            "(https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage "
+            "to purchase more credits or try again at Jul 11th, 2026 12:59 AM."
+        ),
+    )
+
+    retry_at, source = watcher.parse_retry_time([row], row)
+
+    assert retry_at.isoformat() == "2026-07-11T00:59:00+08:00"
+    assert source == "message"
