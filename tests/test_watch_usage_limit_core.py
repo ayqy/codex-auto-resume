@@ -401,6 +401,156 @@ def test_collect_rollout_candidates_for_thread_keeps_terminal_limit_without_foll
     assert candidates[0]["reason"] == "rollout primary usage limit reached"
 
 
+def test_collect_rollout_candidates_for_thread_detects_terminal_premium_credits_exhausted_from_previous_primary_reset(
+    module, monkeypatch, base_dir, codex_home
+):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    session_id = "terminal-premium-session"
+    rollout_path = (
+        codex_home / "sessions" / "2026" / "07" / "10" / f"rollout-2026-07-10T20-03-02-{session_id}.jsonl"
+    )
+    write_rollout(
+        rollout_path,
+        [
+            {
+                "timestamp": "2026-07-10T12:03:02.125Z",
+                "type": "session_meta",
+                "payload": {
+                    "session_id": session_id,
+                    "cwd": "/workspace/premium-terminal",
+                    "title": "Terminal premium session",
+                    "model_provider": "openai",
+                },
+            },
+            {
+                "timestamp": "2026-07-10T12:31:44.365Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "limit_id": "codex",
+                        "primary": {"used_percent": 80.0, "window_minutes": 300, "resets_at": 1783702749},
+                        "secondary": {"used_percent": 44.0, "window_minutes": 10080, "resets_at": 1784239488},
+                        "credits": None,
+                        "individual_limit": None,
+                        "plan_type": "plus",
+                        "rate_limit_reached_type": None,
+                    },
+                },
+            },
+            {
+                "timestamp": "2026-07-10T12:37:40.342Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "limit_id": "premium",
+                        "primary": None,
+                        "secondary": None,
+                        "credits": {"has_credits": False, "unlimited": False, "balance": "0"},
+                        "individual_limit": None,
+                        "plan_type": "plus",
+                        "rate_limit_reached_type": None,
+                    },
+                },
+            },
+            {
+                "timestamp": "2026-07-10T12:37:40.347Z",
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "turn-1", "last_agent_message": None},
+            },
+        ],
+    )
+    thread_info = watcher.parse_rollout_metadata(rollout_path, session_id=session_id)
+
+    candidates = watcher.collect_rollout_candidates_for_thread(thread_info)
+
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate["source"] == "rollout"
+    assert candidate["limit_kind"] == "rollout_premium_credits_exhausted"
+    assert candidate["retry_source"] == "inferred.previous_primary_reset_at"
+    assert candidate["reason"] == "rollout premium credits exhausted inferred from previous primary reset"
+    assert candidate["candidate_family"] == "session_credits_exhausted"
+    assert candidate["limit_scope"] == "session_window"
+    assert candidate["retry_at"].isoformat() == "2026-07-11T00:59:09+08:00"
+    assert candidate["scheduled_run_at"].isoformat() == "2026-07-11T01:09:09+08:00"
+
+
+def test_collect_rollout_candidates_for_thread_skips_transient_premium_credits_exhausted_when_normal_agent_message_follows(
+    module, monkeypatch, base_dir, codex_home
+):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    session_id = "transient-premium-session"
+    rollout_path = (
+        codex_home / "sessions" / "2026" / "07" / "10" / f"rollout-2026-07-10T20-03-02-{session_id}.jsonl"
+    )
+    write_rollout(
+        rollout_path,
+        [
+            {
+                "timestamp": "2026-07-10T12:03:02.125Z",
+                "type": "session_meta",
+                "payload": {
+                    "session_id": session_id,
+                    "cwd": "/workspace/premium-transient",
+                    "title": "Transient premium session",
+                    "model_provider": "openai",
+                },
+            },
+            {
+                "timestamp": "2026-07-10T12:31:44.365Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "limit_id": "codex",
+                        "primary": {"used_percent": 80.0, "window_minutes": 300, "resets_at": 1783702749},
+                        "secondary": {"used_percent": 44.0, "window_minutes": 10080, "resets_at": 1784239488},
+                        "credits": None,
+                        "individual_limit": None,
+                        "plan_type": "plus",
+                        "rate_limit_reached_type": None,
+                    },
+                },
+            },
+            {
+                "timestamp": "2026-07-10T12:37:40.342Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "limit_id": "premium",
+                        "primary": None,
+                        "secondary": None,
+                        "credits": {"has_credits": False, "unlimited": False, "balance": "0"},
+                        "individual_limit": None,
+                        "plan_type": "plus",
+                        "rate_limit_reached_type": None,
+                    },
+                },
+            },
+            {
+                "timestamp": "2026-07-10T12:37:40.345Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "继续正常执行"}],
+                },
+            },
+            {
+                "timestamp": "2026-07-10T12:37:40.347Z",
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "turn-1", "last_agent_message": None},
+            },
+        ],
+    )
+    thread_info = watcher.parse_rollout_metadata(rollout_path, session_id=session_id)
+
+    assert watcher.collect_rollout_candidates_for_thread(thread_info) == []
+
+
 def test_build_desired_pending_jobs_prefers_latest_log_error_after_transient_rollout_limit(
     module, monkeypatch, base_dir, codex_home
 ):

@@ -1349,6 +1349,7 @@ class UsageLimitWatcher:
 
         candidates = []
         pending_limit_candidates = []
+        latest_primary_reset_context = None
 
         def flush_pending_limit_candidates():
             nonlocal pending_limit_candidates
@@ -1401,6 +1402,15 @@ class UsageLimitWatcher:
                         credits_has = credits.get("has_credits")
                         credits_balance = credits.get("balance")
                         credits_empty = credits_has is False or credits_balance == "0"
+                    if primary_reset:
+                        latest_primary_reset_context = {
+                            "primary_reset": primary_reset,
+                            "primary_used_percent": primary_used,
+                            "secondary_used_percent": secondary_used,
+                            "credits_has": credits_has,
+                            "credits_balance": credits_balance,
+                            "limit_id": limit_id,
+                        }
                     current_state = {
                         "primary_active": self.is_limit_fully_used(primary_used) and primary_reset,
                         "primary_reset": primary_reset,
@@ -1497,6 +1507,37 @@ class UsageLimitWatcher:
                             )
                             if candidate:
                                 candidates.append(candidate)
+
+                    if (
+                        limit_id == "premium"
+                        and credits_empty
+                        and not primary_reset
+                        and not secondary_reset
+                        and not current_state["primary_active"]
+                        and not current_state["secondary_active"]
+                        and latest_primary_reset_context
+                    ):
+                        retry_at = datetime.fromtimestamp(
+                            int(latest_primary_reset_context["primary_reset"]),
+                            tz=ZoneInfo("UTC"),
+                        ).astimezone(self.local_tz)
+                        candidate = self.build_rollout_candidate(
+                            thread_info=thread_info,
+                            event_dt=event_dt,
+                            retry_at=retry_at,
+                            line_no=line_no,
+                            text=text,
+                            retry_source="inferred.previous_primary_reset_at",
+                            reason="rollout premium credits exhausted inferred from previous primary reset",
+                            limit_kind="rollout_premium_credits_exhausted",
+                            primary_used=latest_primary_reset_context.get("primary_used_percent"),
+                            secondary_used=latest_primary_reset_context.get("secondary_used_percent"),
+                            credits_has=credits_has,
+                            credits_balance=credits_balance,
+                        )
+                        if candidate:
+                            candidate["transient_rollout_limit"] = False
+                            pending_limit_candidates.append(candidate)
 
                     previous_state = current_state
             flush_pending_limit_candidates()
