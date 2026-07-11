@@ -27,6 +27,16 @@ PREWARM_EFFORT = "low"
 PREWARM_PROMPT = "Just say Hi"
 PREWARM_LATE_WINDOW = timedelta(minutes=5)
 PREWARM_TIMEOUT_SECONDS = 300
+PREWARM_WORKSPACE_NAME = "prewarm-workspace"
+RESUME_MODES = {"interactive", "silent"}
+PROBE_LIMIT_MARKERS = (
+    "You've hit your usage limit",
+    "The usage limit has been reached",
+    '"type":"usage_limit_reached"',
+    '"status_code":429',
+    'X-Codex-Primary-Used-Percent":"100"',
+    'X-Codex-Secondary-Used-Percent":"100"',
+)
 
 
 @dataclass
@@ -195,19 +205,48 @@ class UsageLimitWatcher:
             unique[normalized] = True
         return sorted(unique.keys())
 
+    def normalize_resume_mode(self, value):
+        normalized = str(value or "interactive").strip().lower()
+        if normalized not in RESUME_MODES:
+            raise ValueError("config.resume.mode must be interactive or silent")
+        return normalized
+
     def load_runtime_config(self):
         if not self.config_path.exists():
-            return {"workat": []}
+            return {"workat": [], "resume_mode": "interactive"}
         try:
             raw = json.loads(self.config_path.read_text(encoding="utf-8"))
             if not isinstance(raw, dict):
                 raise ValueError("config.json must contain a JSON object")
+            resume = raw.get("resume")
+            if resume is not None and not isinstance(resume, dict):
+                raise ValueError("config.resume must be an object")
             return {
                 "workat": self.normalize_workat_values(raw.get("workat", [])),
+                "resume_mode": self.normalize_resume_mode((resume or {}).get("mode")),
             }
         except Exception as exc:
             self.log_config_warning_once("failed to load runtime config", exc)
-            return {"workat": []}
+            return {"workat": [], "resume_mode": "interactive"}
+
+    def prewarm_workspace_dir(self):
+        return (self.tmp_dir / PREWARM_WORKSPACE_NAME).resolve()
+
+    def is_probe_workspace_cwd(self, cwd: Optional[str]):
+        if not cwd:
+            return False
+        try:
+            return Path(cwd).expanduser().resolve() == self.prewarm_workspace_dir()
+        except (OSError, RuntimeError, ValueError):
+            return False
+
+    def thread_info_is_probe_session(self, thread_info: Optional[dict]):
+        if not thread_info:
+            return False
+        return self.is_probe_workspace_cwd(thread_info.get("cwd"))
+
+    def current_resume_mode(self):
+        return self.load_runtime_config().get("resume_mode", "interactive")
 
     def connect(self, path: Path):
         uri = f"file:{path}?mode=ro"
@@ -567,9 +606,10 @@ class UsageLimitWatcher:
             return {}
 
         desired_jobs = {}
-        for day_offset in (0, 1):
-            work_day = now.date() + timedelta(days=day_offset)
-            for workat in workat_values:
+        for workat in workat_values:
+            upcoming_jobs = []
+            for day_offset in (0, 1):
+                work_day = now.date() + timedelta(days=day_offset)
                 hour, minute, normalized = self.parse_workat_text(workat)
                 workat_at = datetime(
                     work_day.year,
@@ -583,7 +623,11 @@ class UsageLimitWatcher:
                 run_deadline_at = datetime.fromisoformat(job["run_deadline_at"])
                 if run_deadline_at <= now:
                     continue
-                desired_jobs[job["job_key"]] = job
+                upcoming_jobs.append(job)
+            if not upcoming_jobs:
+                continue
+            next_job = min(upcoming_jobs, key=lambda item: item["scheduled_run_at"])
+            desired_jobs[next_job["job_key"]] = next_job
         return desired_jobs
 
     def reconcile_prewarm_jobs(self, desired_jobs_by_key: dict, now: datetime):
@@ -664,10 +708,115 @@ class UsageLimitWatcher:
             return text
         return text[: limit - 3] + "..."
 
+    def run_probe_command(self):
+        script_path = str((self.base_dir / "scripts" / "run_workat_prewarm.sh").resolve())
+        return subprocess.run(
+            [script_path],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=PREWARM_TIMEOUT_SECONDS,
+        )
+
+    def probe_result_is_limit(self, stdout: Optional[str], stderr: Optional[str]):
+        combined = "\n".join(part for part in (stdout, stderr) if part)
+        if not combined:
+            return False
+        if self.is_usage_limit_text(combined):
+            return True
+        return any(marker in combined for marker in PROBE_LIMIT_MARKERS)
+
+    def maybe_release_pending_jobs_via_probe(self, now: datetime):
+        future_jobs = []
+        for job in self.state["pending_jobs"]:
+            if job.get("status") != "pending":
+                continue
+            scheduled_run_at_text = job.get("scheduled_run_at")
+            if not scheduled_run_at_text:
+                continue
+            try:
+                scheduled_run_at = datetime.fromisoformat(scheduled_run_at_text)
+            except ValueError:
+                continue
+            if scheduled_run_at <= now:
+                return False
+            future_jobs.append(job)
+        if not future_jobs:
+            return False
+
+        try:
+            result = self.run_probe_command()
+        except subprocess.TimeoutExpired:
+            self.log("availability probe timed out; keep waiting for scheduled resume window", console=False)
+            return False
+
+        if result.returncode != 0:
+            if self.probe_result_is_limit(result.stdout, result.stderr):
+                return False
+            self.log(
+                "availability probe failed unexpectedly: "
+                f"{self.summarize_stderr(result.stderr) or self.summarize_stderr(result.stdout) or 'unknown error'}",
+                console=False,
+            )
+            return False
+
+        for job in future_jobs:
+            job["scheduled_run_at"] = now.isoformat()
+            job["updated_at"] = now.isoformat()
+            job["released_by_probe_at"] = now.isoformat()
+        self.save_state()
+        self.record_cycle_event(
+            "probe_released_resume",
+            f"availability probe succeeded; released {len(future_jobs)} pending session(s) immediately",
+        )
+        return True
+
+    def launch_resume_job(self, job: dict):
+        session_id = job["session_id"]
+        cwd = job.get("cwd") or ""
+        mode = self.current_resume_mode()
+        try:
+            if mode == "silent":
+                script_path = str((self.base_dir / "scripts" / "run_silent_resume.sh").resolve())
+                log_path = self.logs_dir / f"silent-resume-{session_id}.log"
+                with log_path.open("a", encoding="utf-8") as handle:
+                    subprocess.Popen(
+                        ["bash", script_path, session_id, cwd],
+                        stdout=handle,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                return {
+                    "ok": True,
+                    "mode": "silent",
+                    "stderr": "",
+                    "log_path": str(log_path),
+                }
+
+            command = [
+                sys.executable,
+                str((self.base_dir / "scripts" / "open_terminal_and_resume.py").resolve()),
+                session_id,
+                cwd,
+            ]
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+            return {
+                "ok": result.returncode == 0,
+                "mode": "interactive",
+                "stderr": result.stderr.strip(),
+                "log_path": None,
+            }
+        except OSError as exc:
+            return {
+                "ok": False,
+                "mode": mode,
+                "stderr": str(exc),
+                "log_path": None,
+            }
+
     def trigger_due_prewarm_jobs(self, now: Optional[datetime] = None, suppress_for_resume: bool = False):
         now = now or datetime.now().astimezone()
         updated = False
-        script_path = str((self.base_dir / "scripts" / "run_workat_prewarm.sh").resolve())
         for job in self.state["prewarm_jobs"]:
             if job.get("status") != "pending":
                 continue
@@ -699,13 +848,7 @@ class UsageLimitWatcher:
                 self.log(f"expired prewarm job {job.get('job_key')}: suppressed by auto resume priority", console=False)
                 continue
             try:
-                result = subprocess.run(
-                    [script_path],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=PREWARM_TIMEOUT_SECONDS,
-                )
+                result = self.run_probe_command()
             except subprocess.TimeoutExpired as exc:
                 job["status"] = "failed"
                 job["status_reason"] = "command_timed_out"
@@ -1340,6 +1483,8 @@ class UsageLimitWatcher:
         return payload.get("type") in {"task_complete", "task_started"}
 
     def collect_rollout_candidates_for_thread(self, thread_info: dict):
+        if self.thread_info_is_probe_session(thread_info):
+            return []
         rollout_path = thread_info.get("rollout_path")
         if not rollout_path:
             return []
@@ -1568,6 +1713,8 @@ class UsageLimitWatcher:
         candidates = []
         for thread_info in threads:
             if not thread_info:
+                continue
+            if self.thread_info_is_probe_session(thread_info):
                 continue
             thread_candidates = self.collect_rollout_candidates_for_thread(thread_info)
             for candidate in thread_candidates:
@@ -1875,6 +2022,8 @@ class UsageLimitWatcher:
             if not retry_at:
                 continue
             thread_info = self.thread_exists(session_id)
+            if self.thread_info_is_probe_session(thread_info):
+                continue
             event_dt = datetime.fromtimestamp(row.ts, tz=ZoneInfo("UTC")).astimezone(self.local_tz)
             message = row.feedback_log_body[:500]
             payload_info = self.extract_usage_limit_payload(row.feedback_log_body) or {}
@@ -1930,6 +2079,8 @@ class UsageLimitWatcher:
                 continue
             event_dt = datetime.fromtimestamp(row.ts, tz=ZoneInfo("UTC")).astimezone(self.local_tz)
             thread_info = self.thread_exists(recovered_session_id)
+            if self.thread_info_is_probe_session(thread_info):
+                continue
             dedupe_key = (row.id, recovered_session_id)
             if dedupe_key in seen:
                 continue
@@ -2165,34 +2316,32 @@ class UsageLimitWatcher:
                     f"cancelled pending session {job['session_id']}: resumed normally",
                 )
                 continue
-            command = [
-                sys.executable,
-                str((self.base_dir / "scripts" / "open_terminal_and_resume.py").resolve()),
-                job["session_id"],
-                job.get("cwd") or "",
-            ]
             summary["attempted"] += 1
-            result = subprocess.run(command, capture_output=True, text=True, check=False)
+            launch_result = self.launch_resume_job(job)
             triggered_entry = dict(job)
             triggered_entry["triggered_at"] = now.isoformat()
-            if result.returncode == 0:
+            triggered_entry["resume_mode"] = launch_result["mode"]
+            if launch_result.get("log_path"):
+                triggered_entry["log_path"] = launch_result["log_path"]
+            if launch_result["ok"]:
                 job["status"] = "triggered"
                 triggered_entry["status"] = "triggered"
                 summary["triggered"] += 1
-                self.record_cycle_event("resume_triggered", f"triggered terminal resume for session {job['session_id']}")
+                action_text = "silent resume" if launch_result["mode"] == "silent" else "terminal resume"
+                self.record_cycle_event("resume_triggered", f"triggered {action_text} for session {job['session_id']}")
             else:
                 job["status"] = "failed"
                 triggered_entry["status"] = "failed"
-                triggered_entry["stderr"] = result.stderr.strip()
+                triggered_entry["stderr"] = launch_result["stderr"]
                 summary["failed"] += 1
                 self.log(
-                    f"failed to trigger terminal resume for session {job['session_id']}: "
-                    f"{result.stderr.strip()}",
+                    f"failed to trigger {launch_result['mode']} resume for session {job['session_id']}: "
+                    f"{launch_result['stderr']}",
                     console=False,
                 )
                 self.record_cycle_event(
                     "resume_failed",
-                    f"failed to trigger terminal resume for session {job['session_id']}",
+                    f"failed to trigger {launch_result['mode']} resume for session {job['session_id']}",
                 )
             self.state["triggered_jobs"].append(triggered_entry)
             updated = True
@@ -2229,6 +2378,7 @@ class UsageLimitWatcher:
             allow_absent_prune=allow_absent_prune,
             prune_reasons_by_session=prune_reasons_by_session,
         )
+        self.maybe_release_pending_jobs_via_probe(now)
         resume_summary = self.trigger_due_jobs()
         desired_prewarm_jobs = self.build_desired_prewarm_jobs(now=now)
         if desired_prewarm_jobs:
@@ -2251,17 +2401,12 @@ class UsageLimitWatcher:
         self.state["last_detected_scheduled_run_at"] = result["scheduled_run_at"].isoformat()
         self.state["last_detected_cwd"] = cwd
         self.save_state()
-        command = [
-            sys.executable,
-            str((self.base_dir / "scripts" / "open_terminal_and_resume.py").resolve()),
-            session_id,
-            cwd,
-        ]
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
-        if result.returncode == 0:
-            self.log(f"force triggered terminal resume for session {session_id} in cwd {cwd}")
+        launch_result = self.launch_resume_job({"session_id": session_id, "cwd": cwd})
+        if launch_result["ok"]:
+            action_text = "silent resume" if launch_result["mode"] == "silent" else "terminal resume"
+            self.log(f"force triggered {action_text} for session {session_id} in cwd {cwd}")
             return 0
-        self.log(f"force trigger failed for session {session_id}: {result.stderr.strip()}")
+        self.log(f"force trigger failed for session {session_id}: {launch_result['stderr']}")
         return 1
 
     def serialize_candidate(self, candidate: Optional[dict]):

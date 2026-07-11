@@ -76,20 +76,19 @@ def seed_logs(path: Path):
     )
 
 
-def write_config(base_dir: Path, workat: list[str]):
+def write_config(base_dir: Path, workat: list[str], resume_mode: str | None = None):
+    payload = {
+        "proxy": {
+            "http": "",
+            "https": "",
+            "all": "",
+        },
+        "workat": workat,
+    }
+    if resume_mode is not None:
+        payload["resume"] = {"mode": resume_mode}
     (base_dir / "config.json").write_text(
-        json.dumps(
-            {
-                "proxy": {
-                    "http": "",
-                    "https": "",
-                    "all": "",
-                },
-                "workat": workat,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
+        json.dumps(payload, ensure_ascii=False, indent=2)
         + "\n",
         encoding="utf-8",
     )
@@ -146,6 +145,71 @@ def test_run_once_updates_state_and_triggers_due_jobs(module, monkeypatch, base_
     assert watcher.state["last_detected_session_id"] is not None
     assert watcher.state["triggered_jobs"]
     assert calls
+
+
+def test_trigger_due_jobs_uses_silent_mode_when_configured(module, monkeypatch, base_dir, codex_home):
+    write_config(base_dir, [], resume_mode="silent")
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    watcher = module.UsageLimitWatcher(base_dir, cleanup_on_init=False)
+    watcher.state["pending_jobs"] = [
+        {
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "retry_at": "2026-06-25T08:05:00+08:00",
+            "scheduled_run_at": "2026-06-25T08:15:00+08:00",
+            "error_log_id": "limit-1",
+            "status": "pending",
+            "cwd": "/workspace/sample-app",
+        }
+    ]
+
+    class FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = datetime(2026, 6, 25, 8, 30, 0, tzinfo=watcher.local_tz)
+            return current if tz else current.replace(tzinfo=None)
+
+        @classmethod
+        def fromtimestamp(cls, ts, tz=None):
+            return datetime.fromtimestamp(ts, tz=tz)
+
+        @classmethod
+        def fromisoformat(cls, value):
+            return datetime.fromisoformat(value)
+
+        @classmethod
+        def strptime(cls, date_string, fmt):
+            return datetime.strptime(date_string, fmt)
+
+    monkeypatch.setattr(module, "datetime", FakeDateTime)
+
+    launches = []
+
+    def fake_popen(command, stdout, stderr, start_new_session):
+        launches.append(
+            {
+                "command": command,
+                "start_new_session": start_new_session,
+                "log_path": stdout.name,
+            }
+        )
+
+        class Proc:
+            pid = 123
+
+        return Proc()
+
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
+
+    summary = watcher.trigger_due_jobs()
+
+    assert summary["attempted"] == 1
+    assert summary["triggered"] == 1
+    assert watcher.state["pending_jobs"][0]["status"] == "triggered"
+    assert watcher.state["triggered_jobs"][-1]["resume_mode"] == "silent"
+    assert launches[0]["command"][:2] == ["bash", str((base_dir / "scripts" / "run_silent_resume.sh").resolve())]
+    assert launches[0]["command"][2:] == ["11111111-1111-4111-8111-111111111111", "/workspace/sample-app"]
+    assert launches[0]["start_new_session"] is True
+    assert launches[0]["log_path"].endswith("silent-resume-11111111-1111-4111-8111-111111111111.log")
 
 
 def test_force_latest_success_and_failure(module, monkeypatch, base_dir, codex_home):
@@ -533,6 +597,13 @@ def test_run_once_only_cancels_resumed_pending_session(module, monkeypatch, base
         lambda session_id, after_dt: session_id == "11111111-1111-4111-8111-111111111111",
     )
 
+    class ProbeLimited:
+        returncode = 1
+        stdout = ""
+        stderr = "You've hit your usage limit"
+
+    monkeypatch.setattr(watcher, "run_probe_command", lambda: ProbeLimited())
+
     assert watcher.run_once() == 0
 
     resumed_jobs = [
@@ -609,17 +680,15 @@ def test_run_once_keeps_future_pending_job_when_candidates_temporarily_missing(m
     monkeypatch.setattr(watcher, "inspect_latest_error", lambda: None)
     monkeypatch.setattr(watcher, "build_desired_pending_jobs", lambda now=None: ({}, None, [], True, {}))
 
-    calls = []
+    class ProbeLimited:
+        returncode = 1
+        stdout = ""
+        stderr = "You've hit your usage limit"
 
-    def fake_run(command, capture_output, text, check, timeout=None):
-        calls.append(command)
-        raise AssertionError("future pending job should not trigger subprocess")
-
-    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(watcher, "run_probe_command", lambda: ProbeLimited())
 
     assert watcher.run_once() == 0
     assert watcher.state["pending_jobs"][0]["status"] == "pending"
-    assert calls == []
 
 
 def test_run_once_schedules_pending_job_from_rollout_premium_credits_candidate_when_logs_absent(
@@ -723,13 +792,12 @@ def test_run_once_schedules_pending_job_from_rollout_premium_credits_candidate_w
 
     monkeypatch.setattr(module, "datetime", FakeDateTime)
 
-    calls = []
+    class ProbeLimited:
+        returncode = 1
+        stdout = ""
+        stderr = "You've hit your usage limit"
 
-    def fake_run(command, capture_output, text, check, timeout=None):
-        calls.append(command)
-        raise AssertionError("future premium rollout candidate should not trigger subprocess")
-
-    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(watcher, "run_probe_command", lambda: ProbeLimited())
 
     assert watcher.run_once() == 0
     assert len(watcher.state["pending_jobs"]) == 1
@@ -737,7 +805,6 @@ def test_run_once_schedules_pending_job_from_rollout_premium_credits_candidate_w
     assert job["status"] == "pending"
     assert job["origin_source"] == "rollout"
     assert job["origin_reason"] == "rollout premium credits exhausted inferred from previous primary reset"
-    assert calls == []
 
 
 def test_run_once_suppresses_due_prewarm_when_resume_runs(module, monkeypatch, base_dir, codex_home):

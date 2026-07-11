@@ -34,11 +34,14 @@ def test_load_config_returns_defaults_when_missing(module, tmp_path):
             "all": "",
         },
         "workat": [],
+        "resume": {
+            "mode": "interactive",
+        },
     }
 
 
 def test_parse_sections_defaults_to_proxy_and_workat(module):
-    assert module.parse_sections([]) == ["proxy", "workat"]
+    assert module.parse_sections([]) == ["proxy", "workat", "resume"]
 
 
 def test_parse_sections_rejects_removed_model_section(module):
@@ -54,6 +57,7 @@ def test_main_updates_proxy_section_with_all_proxy(module, monkeypatch, tmp_path
         "http://127.0.0.1:1087",
         "socks5://127.0.0.1:1080",
         "10:30,14:00",
+        "silent",
     ])
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
 
@@ -67,6 +71,9 @@ def test_main_updates_proxy_section_with_all_proxy(module, monkeypatch, tmp_path
             "all": "socks5://127.0.0.1:1080",
         },
         "workat": ["10:30", "14:00"],
+        "resume": {
+            "mode": "silent",
+        },
     }
 
 
@@ -82,6 +89,7 @@ def test_main_reads_current_values_and_echoes_proxy_prompts(module, monkeypatch,
                 },
                 "workat": ["14:00", "10:30"],
                 "resume": {
+                    "mode": "interactive",
                     "model": "legacy-value",
                     "effort": "legacy-value",
                 },
@@ -93,7 +101,7 @@ def test_main_reads_current_values_and_echoes_proxy_prompts(module, monkeypatch,
         encoding="utf-8",
     )
     monkeypatch.setattr(module, "get_config_path", lambda: config_path)
-    answers = iter(["", "", "", ""])
+    answers = iter(["", "", "", "", ""])
 
     def fake_input(prompt=""):
         print(prompt, end="")
@@ -108,6 +116,7 @@ def test_main_reads_current_values_and_echoes_proxy_prompts(module, monkeypatch,
     assert "HTTPS proxy [http://127.0.0.1:1087]" in output
     assert "ALL_PROXY [socks5://127.0.0.1:1080]" in output
     assert "Workat times (HH:MM, comma-separated) [10:30,14:00]" in output
+    assert "Resume mode (interactive/silent) [interactive]" in output
     data = json.loads(config_path.read_text(encoding="utf-8"))
     assert data == {
         "proxy": {
@@ -117,6 +126,7 @@ def test_main_reads_current_values_and_echoes_proxy_prompts(module, monkeypatch,
         },
         "workat": ["10:30", "14:00"],
         "resume": {
+            "mode": "interactive",
             "model": "legacy-value",
             "effort": "legacy-value",
         },
@@ -177,3 +187,15 @@ def test_emit_shell_runtime_sets_and_clears_all_proxy(module):
     assert "unset http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY" in output
     assert "export http_proxy=http://127.0.0.1:1087" in output
     assert "export ALL_PROXY=socks5://127.0.0.1:1080" in output
+
+
+def test_main_updates_resume_section(module, monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    monkeypatch.setattr(module, "get_config_path", lambda: config_path)
+    answers = iter(["silent"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    assert module.main(["resume"]) == 0
+
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    assert data["resume"]["mode"] == "silent"

@@ -10,7 +10,7 @@ D ?=
 N ?= 30
 F ?=
 
-.PHONY: today usage recent run status debug clean chmod test config proxy workat
+.PHONY: today usage recent run status debug clean chmod test config proxy workat resume
 
 today: usage
 
@@ -69,6 +69,14 @@ proxy:
 	fi
 
 workat:
+	@if [ -n "$(filter config,$(MAKECMDGOALS))" ]; then \
+		:; \
+	else \
+		echo "usage: make config $@"; \
+		exit 1; \
+	fi
+
+resume:
 	@if [ -n "$(filter config,$(MAKECMDGOALS))" ]; then \
 		:; \
 	else \

@@ -8,8 +8,9 @@ import sys
 from pathlib import Path
 
 
-VALID_SECTIONS = {"proxy", "workat"}
+VALID_SECTIONS = {"proxy", "workat", "resume"}
 WORKAT_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+VALID_RESUME_MODES = {"interactive", "silent"}
 
 
 def get_config_path() -> Path:
@@ -24,6 +25,9 @@ def default_config() -> dict:
             "all": "",
         },
         "workat": [],
+        "resume": {
+            "mode": "interactive",
+        },
     }
 
 
@@ -59,6 +63,13 @@ def load_config(path: Path) -> dict:
     if "workat" in raw:
         config["workat"] = normalize_workat_list(raw.get("workat"))
 
+    resume = raw.get("resume")
+    if resume is not None and not isinstance(resume, dict):
+        raise ValueError("config.resume must be an object")
+    if isinstance(resume, dict):
+        config["resume"].update(resume)
+        config["resume"]["mode"] = normalize_resume_mode(resume.get("mode", config["resume"]["mode"]))
+
     return config
 
 
@@ -68,7 +79,7 @@ def save_config(path: Path, config: dict) -> None:
 
 def parse_sections(argv: list[str]) -> list[str]:
     if not argv:
-        return ["proxy", "workat"]
+        return ["proxy", "workat", "resume"]
 
     sections = []
     for item in argv:
@@ -94,6 +105,13 @@ def prompt_proxy_section(config: dict) -> None:
     current_proxy["http"] = prompt_text("HTTP proxy", current_proxy["http"])
     current_proxy["https"] = prompt_text("HTTPS proxy", current_proxy["https"])
     current_proxy["all"] = prompt_text("ALL_PROXY", current_proxy["all"])
+
+
+def normalize_resume_mode(value) -> str:
+    normalized = normalize_text(value).lower() or "interactive"
+    if normalized not in VALID_RESUME_MODES:
+        raise ValueError("resume mode must be interactive or silent")
+    return normalized
 
 
 def parse_workat_text(value: str) -> tuple[int, str]:
@@ -145,6 +163,24 @@ def prompt_workat_section(config: dict) -> None:
             print("Invalid workat format. Use HH:MM,HH:MM (example: 10:30,14:00).")
 
 
+def prompt_resume_section(config: dict) -> None:
+    current_mode = normalize_resume_mode(config.get("resume", {}).get("mode"))
+    print("Configuring resume")
+    while True:
+        raw = input(f"Resume mode (interactive/silent) [{current_mode}]: ").strip()
+        if raw == "":
+            config["resume"]["mode"] = current_mode
+            return
+        if raw == "-":
+            config["resume"]["mode"] = "interactive"
+            return
+        try:
+            config["resume"]["mode"] = normalize_resume_mode(raw)
+            return
+        except ValueError:
+            print("Invalid resume mode. Use interactive or silent.")
+
+
 def emit_shell_runtime(config: dict) -> str:
     lines = [
         "unset http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY",
@@ -170,7 +206,7 @@ def emit_shell_runtime(config: dict) -> str:
 
 
 def usage() -> str:
-    return "usage: configure_config.py [proxy] [workat] | --emit-shell-runtime"
+    return "usage: configure_config.py [proxy] [workat] [resume] | --emit-shell-runtime"
 
 
 def run_interactive(argv: list[str]) -> int:
@@ -183,6 +219,8 @@ def run_interactive(argv: list[str]) -> int:
             prompt_proxy_section(config)
         elif section == "workat":
             prompt_workat_section(config)
+        elif section == "resume":
+            prompt_resume_section(config)
 
     save_config(path, config)
     print(f"Saved config to {path}")

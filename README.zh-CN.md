@@ -56,7 +56,7 @@
     ```bash
     make config
     ```
-    该命令会以交互方式把终端代理和可选的 `workat` 时间表写入 `config.json`。代理包括 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY`。`workat` 支持一个或多个 `HH:MM` 时间点，例如 `10:30,14:00`。
+    该命令会以交互方式把终端代理、可选的 `workat` 时间表以及 resume 模式写入 `config.json`。代理包括 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY`。`workat` 支持一个或多个 `HH:MM` 时间点，例如 `10:30,14:00`。resume 模式支持 `interactive` 和 `silent`。
 
 4.  **启动监控**:
     ```bash
@@ -70,9 +70,10 @@
 
 | 命令 | 描述 |
 |---|---|
-| `make config` | 交互式配置 `config.json` 中的代理和 `workat`。 |
+| `make config` | 交互式配置 `config.json` 中的代理、`workat` 和 resume 模式。 |
 | `make config proxy` | 配置 `config.json` 中的 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY`。 |
 | `make config workat` | 使用 `HH:MM` 格式配置 `config.json` 中一个或多个每日 `workat` 时间点。 |
+| `make config resume` | 配置 auto resume 使用交互式终端还是静默后台模式。 |
 | `make run` | **(最重要)** 启动后台监控进程，持续监测用量限制并自动为您恢复会话。控制台输出会刻意保持精简，详细诊断继续写入 `tmp/logs/watcher.log`。 |
 | `make today` | 显示您今天的 token 使用量、活跃时间及预估开销的详细报告。 |
 | `make usage` | 显示指定某一天的同样内容的报告。(例如: `make usage D=2026-07-03`) |
@@ -91,6 +92,9 @@
 -   `make config workat`
     > 仅更新 `workat` 时间表，例如 `10:30,14:00`。
 
+-   `make config resume`
+    > 在 `interactive` 终端模式和 `silent` 非交互模式之间切换 auto resume。
+
 -   `make today`
     > 获取您今天的用量摘要。
 
@@ -107,7 +111,9 @@
 
 如果某个已调度的会话后来收到了新的正常 AI 消息，watcher 会在下一次轮询时自动取消这个 pending schedule，而不是等到计划触发时间才跳过。
 
-如果配置了 `workat`，`make run` 还会在每个 `workat - 4 小时` 的时间点静默执行一次预热探针。该探针固定使用非交互 `codex exec`、模型 `gpt-5.4-mini`、`low` 推理强度以及提示词 `Just say Hi`，以最小 token 成本刷新滚动窗口，并且不会弹出终端打扰用户。
+如果配置了 `workat`，`make run` 会为每个配置时间只保留一个最近即将到来的 `workat - 4 小时` 静默预热探针。该探针固定使用非交互 `codex exec`、模型 `gpt-5.4-mini`、`low` 推理强度以及提示词 `Just say Hi`，以最小 token 成本刷新滚动窗口，并且不会弹出终端打扰用户。
+
+如果当前存在 pending resume，watcher 在每次轮询时还会复用同一套探针提前检测额度是否已经恢复。探针自己遇到的 limit error 会被忽略，不会反过来积累新的 auto resume 任务。
 
 当 `make run` 运行正常且本轮没有用户需要关注的变化时，控制台只会输出一行简短摘要。如果需要查看完整内部轨迹，请检查 `tmp/logs/watcher.log`；`tmp/state.json` 仍然是 pending / triggered 任务的最终状态来源。
 

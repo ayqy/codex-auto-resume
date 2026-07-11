@@ -102,7 +102,7 @@ def write_rollout(path: Path, entries: list[dict]) -> None:
     )
 
 
-def write_config(base_dir: Path, workat: list[str] | None):
+def write_config(base_dir: Path, workat: list[str] | None, resume_mode: str | None = None):
     payload = {
         "proxy": {
             "http": "",
@@ -112,6 +112,8 @@ def write_config(base_dir: Path, workat: list[str] | None):
     }
     if workat is not None:
         payload["workat"] = workat
+    if resume_mode is not None:
+        payload["resume"] = {"mode": resume_mode}
     write_json(base_dir / "config.json", payload)
 
 
@@ -678,7 +680,7 @@ def test_build_desired_prewarm_jobs_skips_when_workat_not_configured(module, mon
     assert desired_jobs == {}
 
 
-def test_build_desired_prewarm_jobs_generates_today_and_tomorrow(module, monkeypatch, base_dir, codex_home):
+def test_build_desired_prewarm_jobs_keeps_only_next_upcoming_job_per_workat(module, monkeypatch, base_dir, codex_home):
     write_config(base_dir, ["14:00", "10:30"])
     watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
     now = datetime(2026, 7, 9, 6, 0, 0, tzinfo=watcher.local_tz)
@@ -688,8 +690,6 @@ def test_build_desired_prewarm_jobs_generates_today_and_tomorrow(module, monkeyp
     assert sorted(desired_jobs) == [
         "2026-07-09|10:30",
         "2026-07-09|14:00",
-        "2026-07-10|10:30",
-        "2026-07-10|14:00",
     ]
     assert desired_jobs["2026-07-09|10:30"]["scheduled_run_at"] == "2026-07-09T06:30:00+08:00"
     assert desired_jobs["2026-07-09|10:30"]["expected_reset_at"] == "2026-07-09T11:30:00+08:00"
@@ -801,3 +801,128 @@ def test_compute_sleep_seconds_prefers_nearest_prewarm_job(module, monkeypatch, 
     ]
 
     assert watcher.compute_sleep_seconds(now=now) == 42.0
+
+
+def test_collect_log_candidates_ignores_probe_workspace_session(module, monkeypatch, base_dir, codex_home):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    session_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    rollout_path = codex_home / "sessions" / "2026" / "07" / "09" / f"rollout-2026-07-09T00-00-00-{session_id}.jsonl"
+    write_rollout(
+        rollout_path,
+        [
+            {
+                "timestamp": "2026-07-09T00:00:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "session_id": session_id,
+                    "id": session_id,
+                    "cwd": str(base_dir / "tmp" / "prewarm-workspace"),
+                    "model_provider": "openai",
+                },
+            }
+        ],
+    )
+    row = module.LogRow(
+        id=1,
+        ts=int(datetime(2026, 7, 9, 0, 0, tzinfo=module.ZoneInfo("UTC")).timestamp()),
+        level="INFO",
+        thread_id=session_id,
+        process_uuid="pid:test:probe",
+        feedback_log_body=(
+            "run_turn: Turn error: You've hit your usage limit. Upgrade to Pro "
+            "or try again at 10:05 AM."
+        ),
+    )
+
+    candidates = watcher.collect_log_candidates_from_rows([row], preferred_session_id=session_id)
+
+    assert candidates == []
+
+
+def test_collect_rollout_candidates_for_thread_ignores_probe_workspace_session(module, monkeypatch, base_dir, codex_home):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    session_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    rollout_path = codex_home / "sessions" / "2026" / "07" / "09" / f"rollout-2026-07-09T00-00-00-{session_id}.jsonl"
+    write_rollout(
+        rollout_path,
+        [
+            {
+                "timestamp": "2026-07-09T00:00:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "session_id": session_id,
+                    "id": session_id,
+                    "cwd": str(base_dir / "tmp" / "prewarm-workspace"),
+                    "model_provider": "openai",
+                },
+            },
+            {
+                "timestamp": "2026-07-09T00:30:00.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "limit_id": "codex",
+                        "primary": {"used_percent": 100.0, "resets_at": 1783551900},
+                        "secondary": {"used_percent": 0.0, "resets_at": 1784156700},
+                        "credits": {"has_credits": False, "balance": "0"},
+                    },
+                },
+            },
+        ],
+    )
+    thread_info = watcher.thread_exists(session_id)
+
+    candidates = watcher.collect_rollout_candidates_for_thread(thread_info)
+
+    assert candidates == []
+
+
+def test_maybe_release_pending_jobs_via_probe_releases_future_jobs_after_success(module, monkeypatch, base_dir, codex_home):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    now = datetime(2026, 7, 9, 8, 0, 0, tzinfo=watcher.local_tz)
+    watcher.state["pending_jobs"] = [
+        {
+            "session_id": "future-session",
+            "scheduled_run_at": (now + timedelta(hours=1)).isoformat(),
+            "status": "pending",
+        }
+    ]
+
+    class Result:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    monkeypatch.setattr(watcher, "run_probe_command", lambda: Result())
+
+    changed = watcher.maybe_release_pending_jobs_via_probe(now)
+
+    assert changed is True
+    assert watcher.state["pending_jobs"][0]["scheduled_run_at"] == now.isoformat()
+    assert watcher.state["pending_jobs"][0]["released_by_probe_at"] == now.isoformat()
+
+
+def test_maybe_release_pending_jobs_via_probe_ignores_limit_error(module, monkeypatch, base_dir, codex_home):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    now = datetime(2026, 7, 9, 8, 0, 0, tzinfo=watcher.local_tz)
+    scheduled_run_at = (now + timedelta(hours=1)).isoformat()
+    watcher.state["pending_jobs"] = [
+        {
+            "session_id": "future-session",
+            "scheduled_run_at": scheduled_run_at,
+            "status": "pending",
+        }
+    ]
+
+    class Result:
+        returncode = 1
+        stdout = ""
+        stderr = "You've hit your usage limit"
+
+    monkeypatch.setattr(watcher, "run_probe_command", lambda: Result())
+
+    changed = watcher.maybe_release_pending_jobs_via_probe(now)
+
+    assert changed is False
+    assert watcher.state["pending_jobs"][0]["scheduled_run_at"] == scheduled_run_at

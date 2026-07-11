@@ -15,7 +15,8 @@ log_info "starting workat prewarm probe"
 exec codex exec \
   -m "gpt-5.4-mini" \
   -c "model_reasoning_effort=low" \
-  -a "never" \
+  -c 'approval_policy="never"' \
+  --dangerously-bypass-hook-trust \
   --ephemeral \
   --ignore-rules \
   --skip-git-repo-check \

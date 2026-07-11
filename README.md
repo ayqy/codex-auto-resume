@@ -56,7 +56,7 @@ Your focus is shattered. You have to remember to come back in an hour to resume 
     ```bash
     make config
     ```
-    This interactively writes your terminal proxy settings and optional `workat` schedule to `config.json`. Proxy settings include `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`. `workat` accepts one or more `HH:MM` values such as `10:30,14:00`.
+    This interactively writes your terminal proxy settings, optional `workat` schedule, and resume mode to `config.json`. Proxy settings include `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`. `workat` accepts one or more `HH:MM` values such as `10:30,14:00`. Resume mode can be `interactive` or `silent`.
 
 4.  **Start the watcher**:
     ```bash
@@ -70,9 +70,10 @@ Your focus is shattered. You have to remember to come back in an hour to resume 
 
 | Command      | Description                                                                          |
 |--------------|--------------------------------------------------------------------------------------|
-| `make config`| Interactively configure both proxy and `workat` values stored in `config.json`. |
+| `make config`| Interactively configure proxy, `workat`, and resume mode in `config.json`. |
 | `make config proxy`| Configure the `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` values in `config.json`. |
 | `make config workat`| Configure one or more daily `workat` values in `config.json` using `HH:MM` format. |
+| `make config resume`| Configure whether auto-resume uses an interactive terminal or silent background mode. |
 | `make run`   | **(Most important)** Starts the background watcher to monitor for usage limits and resume your session automatically. Console output is intentionally concise; detailed diagnostics continue to be written to `tmp/logs/watcher.log`. |
 | `make today` | Shows a detailed report of your token usage, active time, and estimated costs for today. |
 | `make usage` | Shows the same report for a specific day. (e.g., `make usage D=2026-07-03`) |
@@ -91,6 +92,9 @@ Your focus is shattered. You have to remember to come back in an hour to resume 
 -   `make config workat`
     > Update only the `workat` schedule, for example `10:30,14:00`.
 
+-   `make config resume`
+    > Switch auto-resume between `interactive` terminal mode and `silent` non-interactive mode.
+
 -   `make today`
     > Get a summary of your usage for today.
 
@@ -107,7 +111,9 @@ Auto-resume now restores the original session model and reasoning effort from th
 
 If a scheduled session later receives a normal AI reply, the watcher cancels that pending resume on the next polling cycle instead of waiting until the scheduled trigger time.
 
-If `workat` is configured, `make run` also schedules a silent prewarm probe at `workat - 4 hours` for each configured time. The probe runs non-interactively with `codex exec`, fixed model `gpt-5.4-mini`, fixed `low` effort, and prompt `Just say Hi`, so it refreshes the rolling window with minimal token cost and without opening a terminal window.
+If `workat` is configured, `make run` schedules one upcoming silent prewarm probe per configured time at `workat - 4 hours`. The probe runs non-interactively with `codex exec`, fixed model `gpt-5.4-mini`, fixed `low` effort, and prompt `Just say Hi`, so it refreshes the rolling window with minimal token cost and without opening a terminal window.
+
+If pending resumes exist, each polling cycle also reuses that same probe to check whether usage has already recovered early. Limit errors returned by the probe itself are ignored, so probe sessions do not accumulate new auto-resume jobs.
 
 When `make run` is healthy and there are no user-visible changes, it prints a single short summary line for that cycle. If you need the full internal trace, inspect `tmp/logs/watcher.log`; `tmp/state.json` remains the source of truth for pending and triggered jobs.
 
