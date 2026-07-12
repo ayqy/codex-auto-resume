@@ -118,87 +118,136 @@ def write_config(base_dir: Path, workat: list[str] | None, resume_mode: str | No
 
 
 def test_build_desired_pending_jobs_handles_global_override(module, monkeypatch, base_dir, codex_home):
-    seed_logs(codex_home / "logs_2.sqlite")
     watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
-    now = datetime(2026, 6, 26, 12, 9, 0, tzinfo=watcher.local_tz)
+    now = datetime(2026, 7, 12, 7, 0, 0, tzinfo=watcher.local_tz)
+
+    hard_stop = watcher.normalize_candidate_metadata(
+        {
+            "source": "rollout",
+            "priority": 2,
+            "signal_strength": "rollout",
+            "event_dt": datetime(2026, 7, 12, 6, 34, 55, tzinfo=watcher.local_tz),
+            "error_id": "rollout:hard-stop-session:1:rollout_premium_credits_exhausted",
+            "session_id": "hard-stop-session",
+            "retry_at": datetime(2026, 7, 18, 14, 48, 57, tzinfo=watcher.local_tz),
+            "scheduled_run_at": datetime(2026, 7, 18, 14, 58, 57, tzinfo=watcher.local_tz),
+            "thread_info": watcher.default_thread_info("hard-stop-session"),
+            "message": "premium hard stop",
+            "message_preview": "premium hard stop",
+            "retry_source": "inferred.previous_secondary_reset_at",
+            "reason": "rollout premium hard stop inferred from previous secondary reset",
+            "limit_kind": "rollout_premium_credits_exhausted",
+            "limit_id": "premium",
+            "primary_used_percent": 100.0,
+            "secondary_used_percent": 100.0,
+            "credits_has": False,
+            "credits_balance": "0",
+            "terminal_task_complete_without_last_agent_message": True,
+            "hard_stop_global_window": True,
+        }
+    )
+    session_limit = watcher.normalize_candidate_metadata(
+        {
+            "source": "logs",
+            "priority": 1,
+            "signal_strength": "strong",
+            "event_dt": datetime(2026, 7, 12, 6, 50, 55, tzinfo=watcher.local_tz),
+            "error_id": "later-session-limit",
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "retry_at": datetime(2026, 7, 12, 11, 10, 28, tzinfo=watcher.local_tz),
+            "scheduled_run_at": datetime(2026, 7, 12, 11, 20, 28, tzinfo=watcher.local_tz),
+            "thread_info": watcher.default_thread_info("11111111-1111-4111-8111-111111111111"),
+            "message": "5h limit",
+            "message_preview": "5h limit",
+            "retry_source": "message",
+            "reason": "explicit usage limit turn error",
+            "limit_kind": "log_turn_error",
+            "primary_used_percent": 100.0,
+            "secondary_used_percent": 31.0,
+            "credits_has": False,
+            "credits_balance": "0",
+        }
+    )
+    monkeypatch.setattr(
+        watcher,
+        "collect_confirmed_candidates",
+        lambda days=14, log_limit=5000, rollout_limit_threads=400: ([hard_stop, session_limit], True),
+    )
 
     desired_jobs, global_candidate, active_candidates, logs_available, prune_reasons = watcher.build_desired_pending_jobs(
         now=now, days=30
     )
 
     assert logs_available is True
-    assert len(active_candidates) >= 1
+    assert len(active_candidates) == 2
     assert global_candidate is not None
     assert prune_reasons == {}
     assert global_candidate["limit_scope"] == "global_window"
-    assert "22222222-2222-4222-8222-222222222222" in desired_jobs
-    job = desired_jobs["22222222-2222-4222-8222-222222222222"]
+    job = desired_jobs["11111111-1111-4111-8111-111111111111"]
     assert job["governing_limit_scope"] == "global_window"
-    assert job["governing_session_id"] == "22222222-2222-4222-8222-222222222222"
+    assert job["governing_session_id"] == "hard-stop-session"
+    assert job["scheduled_run_at"] == "2026-07-18T14:58:57+08:00"
 
 
-def test_build_desired_pending_jobs_discards_invalidated_global_candidate(module, monkeypatch, base_dir, codex_home):
+def test_build_desired_pending_jobs_preserves_hard_stop_global_candidate_against_newer_same_session_limit(
+    module, monkeypatch, base_dir, codex_home
+):
     watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
-    now = datetime(2026, 7, 10, 3, 0, 0, tzinfo=watcher.local_tz)
+    now = datetime(2026, 7, 12, 8, 0, 0, tzinfo=watcher.local_tz)
 
-    def make_candidate(
-        session_id: str,
-        error_id: str,
-        event_dt: datetime,
-        retry_at: datetime,
-        retry_source: str,
-        limit_kind: str,
-        primary_used: float,
-        secondary_used: float,
-    ):
-        return watcher.normalize_candidate_metadata(
-            {
-                "source": "rollout",
-                "priority": 2,
-                "signal_strength": "rollout",
-                "event_dt": event_dt,
-                "error_id": error_id,
-                "session_id": session_id,
-                "retry_at": retry_at,
-                "scheduled_run_at": retry_at + timedelta(minutes=10),
-                "thread_info": watcher.default_thread_info(session_id),
-                "message": "limit",
-                "message_preview": "limit",
-                "retry_source": retry_source,
-                "reason": "usage limit",
-                "limit_kind": limit_kind,
-                "primary_used_percent": primary_used,
-                "secondary_used_percent": secondary_used,
-                "credits_has": False,
-                "credits_balance": "0",
-            }
-        )
-
-    stale_global = make_candidate(
-        session_id="stale-global-session",
-        error_id="stale-global-error",
-        event_dt=datetime(2026, 7, 9, 6, 54, 37, tzinfo=watcher.local_tz),
-        retry_at=datetime(2026, 7, 13, 7, 56, 32, tzinfo=watcher.local_tz),
-        retry_source="credits.secondary.resets_at",
-        limit_kind="rollout_secondary_credits_exhausted",
-        primary_used=52.0,
-        secondary_used=100.0,
+    hard_stop = watcher.normalize_candidate_metadata(
+        {
+            "source": "rollout",
+            "priority": 2,
+            "signal_strength": "rollout",
+            "event_dt": datetime(2026, 7, 12, 6, 34, 55, tzinfo=watcher.local_tz),
+            "error_id": "rollout:same-session:hard-stop",
+            "session_id": "same-session",
+            "retry_at": datetime(2026, 7, 18, 14, 48, 57, tzinfo=watcher.local_tz),
+            "scheduled_run_at": datetime(2026, 7, 18, 14, 58, 57, tzinfo=watcher.local_tz),
+            "thread_info": watcher.default_thread_info("same-session"),
+            "message": "premium hard stop",
+            "message_preview": "premium hard stop",
+            "retry_source": "inferred.previous_secondary_reset_at",
+            "reason": "rollout premium hard stop inferred from previous secondary reset",
+            "limit_kind": "rollout_premium_credits_exhausted",
+            "limit_id": "premium",
+            "primary_used_percent": 100.0,
+            "secondary_used_percent": 100.0,
+            "credits_has": False,
+            "credits_balance": "0",
+            "terminal_task_complete_without_last_agent_message": True,
+            "hard_stop_global_window": True,
+        }
     )
-    newer_session_limit = make_candidate(
-        session_id="fresh-session",
-        error_id="fresh-session-error",
-        event_dt=datetime(2026, 7, 10, 2, 55, 0, tzinfo=watcher.local_tz),
-        retry_at=datetime(2026, 7, 10, 3, 15, 56, tzinfo=watcher.local_tz),
-        retry_source="credits.primary.resets_at",
-        limit_kind="rollout_primary_credits_exhausted",
-        primary_used=100.0,
-        secondary_used=42.0,
+    newer_session_limit = watcher.normalize_candidate_metadata(
+        {
+            "source": "logs",
+            "priority": 1,
+            "signal_strength": "strong",
+            "event_dt": datetime(2026, 7, 12, 7, 51, 45, tzinfo=watcher.local_tz),
+            "error_id": "same-session-5h",
+            "session_id": "same-session",
+            "retry_at": datetime(2026, 7, 12, 11, 10, 28, tzinfo=watcher.local_tz),
+            "scheduled_run_at": datetime(2026, 7, 12, 11, 20, 28, tzinfo=watcher.local_tz),
+            "thread_info": watcher.default_thread_info("same-session"),
+            "message": "5h limit",
+            "message_preview": "5h limit",
+            "retry_source": "message",
+            "reason": "explicit usage limit turn error",
+            "limit_kind": "log_turn_error",
+            "limit_id": "codex",
+            "primary_used_percent": 100.0,
+            "secondary_used_percent": 31.0,
+            "credits_has": False,
+            "credits_balance": "0",
+        }
     )
 
     monkeypatch.setattr(
         watcher,
         "collect_confirmed_candidates",
-        lambda days=14, log_limit=5000, rollout_limit_threads=400: ([stale_global, newer_session_limit], True),
+        lambda days=14, log_limit=5000, rollout_limit_threads=400: ([hard_stop, newer_session_limit], True),
     )
 
     desired_jobs, global_candidate, active_candidates, logs_available, prune_reasons = watcher.build_desired_pending_jobs(
@@ -206,21 +255,24 @@ def test_build_desired_pending_jobs_discards_invalidated_global_candidate(module
     )
 
     assert logs_available is True
-    assert global_candidate is None
-    assert len(active_candidates) == 1
+    assert global_candidate is not None
+    assert len(active_candidates) == 2
     assert prune_reasons == {}
-    assert set(desired_jobs) == {"fresh-session"}
-    assert desired_jobs["fresh-session"]["governing_limit_scope"] == "session_window"
+    assert set(desired_jobs) == {"same-session"}
+    job = desired_jobs["same-session"]
+    assert job["origin_error_id"] == "same-session-5h"
+    assert job["governing_error_id"] == "rollout:same-session:hard-stop"
+    assert job["governing_limit_scope"] == "global_window"
+    assert job["scheduled_run_at"] == "2026-07-18T14:58:57+08:00"
 
 
 def test_reconcile_pending_jobs_marks_replaced_and_preserves_future_pending_without_prune_reason(
     module, monkeypatch, base_dir, codex_home
 ):
-    seed_logs(codex_home / "logs_2.sqlite")
     watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
     now = datetime(2026, 6, 26, 12, 9, 0, tzinfo=watcher.local_tz)
     old_job = {
-        "session_id": "22222222-2222-4222-8222-222222222222",
+        "session_id": "replace-me",
         "retry_at": "2026-06-26T11:30:17+08:00",
         "scheduled_run_at": "2026-06-26T11:40:17+08:00",
         "error_log_id": "old-error",
@@ -230,10 +282,37 @@ def test_reconcile_pending_jobs_marks_replaced_and_preserves_future_pending_with
         "session_id": "expired-session",
         "retry_at": "2026-07-03T10:05:00+08:00",
         "scheduled_run_at": "2026-07-03T10:15:00+08:00",
-        "error_log_id": "expired-error",
-        "status": "pending",
-    }
+            "error_log_id": "expired-error",
+            "status": "pending",
+        }
     watcher.state["pending_jobs"] = [old_job, expired_job]
+    candidate = watcher.normalize_candidate_metadata(
+        {
+            "source": "rollout",
+            "priority": 2,
+            "signal_strength": "rollout",
+            "event_dt": datetime(2026, 6, 26, 12, 0, 0, tzinfo=watcher.local_tz),
+            "error_id": "replacement-error",
+            "session_id": "replace-me",
+            "retry_at": datetime(2026, 6, 26, 12, 20, 0, tzinfo=watcher.local_tz),
+            "scheduled_run_at": datetime(2026, 6, 26, 12, 30, 0, tzinfo=watcher.local_tz),
+            "thread_info": watcher.default_thread_info("replace-me"),
+            "message": "replacement limit",
+            "message_preview": "replacement limit",
+            "retry_source": "credits.primary.resets_at",
+            "reason": "usage limit",
+            "limit_kind": "rollout_primary_credits_exhausted",
+            "primary_used_percent": 100.0,
+            "secondary_used_percent": 31.0,
+            "credits_has": False,
+            "credits_balance": "0",
+        }
+    )
+    monkeypatch.setattr(
+        watcher,
+        "collect_confirmed_candidates",
+        lambda days=14, log_limit=5000, rollout_limit_threads=400: ([candidate], True),
+    )
     desired_jobs, _, _, _, prune_reasons = watcher.build_desired_pending_jobs(now=now, days=30)
 
     watcher.reconcile_pending_jobs(
@@ -245,8 +324,16 @@ def test_reconcile_pending_jobs_marks_replaced_and_preserves_future_pending_with
 
     statuses = {job["session_id"]: job["status"] for job in watcher.state["pending_jobs"]}
     assert statuses["expired-session"] == "pending"
-    assert any(job["status"] == "replaced" for job in watcher.state["pending_jobs"] if job["session_id"] == "22222222-2222-4222-8222-222222222222")
-    assert any(job["status"] == "pending" and job["error_log_id"] != "old-error" for job in watcher.state["pending_jobs"] if job["session_id"] == "22222222-2222-4222-8222-222222222222")
+    assert any(
+        job["status"] == "replaced"
+        for job in watcher.state["pending_jobs"]
+        if job["session_id"] == "replace-me"
+    )
+    assert any(
+        job["status"] == "pending" and job["error_log_id"] != "old-error"
+        for job in watcher.state["pending_jobs"]
+        if job["session_id"] == "replace-me"
+    )
 
 
 def test_choose_session_candidate_prefers_latest_event_over_later_scheduled_run_at(module, monkeypatch, base_dir, codex_home):
@@ -403,7 +490,56 @@ def test_collect_rollout_candidates_for_thread_keeps_terminal_limit_without_foll
     assert candidates[0]["reason"] == "rollout primary usage limit reached"
 
 
-def test_collect_rollout_candidates_for_thread_detects_terminal_premium_credits_exhausted_from_previous_primary_reset(
+def test_collect_rollout_candidates_for_thread_ignores_secondary_warning_without_hard_stop(
+    module, monkeypatch, base_dir, codex_home
+):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    session_id = "secondary-warning-session"
+    rollout_path = (
+        codex_home / "sessions" / "2026" / "07" / "10" / f"rollout-2026-07-10T20-03-02-{session_id}.jsonl"
+    )
+    write_rollout(
+        rollout_path,
+        [
+            {
+                "timestamp": "2026-07-10T12:03:02.125Z",
+                "type": "session_meta",
+                "payload": {
+                    "session_id": session_id,
+                    "cwd": "/workspace/secondary-warning",
+                    "title": "Secondary warning session",
+                    "model_provider": "openai",
+                },
+            },
+            {
+                "timestamp": "2026-07-10T12:31:44.365Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "limit_id": "codex",
+                        "primary": {"used_percent": 68.0, "window_minutes": 300, "resets_at": 1783702749},
+                        "secondary": {"used_percent": 100.0, "window_minutes": 10080, "resets_at": 1784239488},
+                        "credits": {"has_credits": False, "unlimited": False, "balance": "0"},
+                        "individual_limit": None,
+                        "plan_type": "plus",
+                        "rate_limit_reached_type": None,
+                    },
+                },
+            },
+            {
+                "timestamp": "2026-07-10T12:37:40.347Z",
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "turn-1", "last_agent_message": None},
+            },
+        ],
+    )
+    thread_info = watcher.parse_rollout_metadata(rollout_path, session_id=session_id)
+
+    assert watcher.collect_rollout_candidates_for_thread(thread_info) == []
+
+
+def test_collect_rollout_candidates_for_thread_detects_terminal_premium_credits_exhausted_from_previous_secondary_reset(
     module, monkeypatch, base_dir, codex_home
 ):
     watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
@@ -431,9 +567,9 @@ def test_collect_rollout_candidates_for_thread_detects_terminal_premium_credits_
                     "type": "token_count",
                     "rate_limits": {
                         "limit_id": "codex",
-                        "primary": {"used_percent": 80.0, "window_minutes": 300, "resets_at": 1783702749},
-                        "secondary": {"used_percent": 44.0, "window_minutes": 10080, "resets_at": 1784239488},
-                        "credits": None,
+                        "primary": {"used_percent": 100.0, "window_minutes": 300, "resets_at": 1783702749},
+                        "secondary": {"used_percent": 100.0, "window_minutes": 10080, "resets_at": 1784239488},
+                        "credits": {"has_credits": False, "unlimited": False, "balance": "0"},
                         "individual_limit": None,
                         "plan_type": "plus",
                         "rate_limit_reached_type": None,
@@ -471,12 +607,12 @@ def test_collect_rollout_candidates_for_thread_detects_terminal_premium_credits_
     candidate = candidates[0]
     assert candidate["source"] == "rollout"
     assert candidate["limit_kind"] == "rollout_premium_credits_exhausted"
-    assert candidate["retry_source"] == "inferred.previous_primary_reset_at"
-    assert candidate["reason"] == "rollout premium credits exhausted inferred from previous primary reset"
-    assert candidate["candidate_family"] == "session_credits_exhausted"
-    assert candidate["limit_scope"] == "session_window"
-    assert candidate["retry_at"].isoformat() == "2026-07-11T00:59:09+08:00"
-    assert candidate["scheduled_run_at"].isoformat() == "2026-07-11T01:09:09+08:00"
+    assert candidate["retry_source"] == "inferred.previous_secondary_reset_at"
+    assert candidate["reason"] == "rollout premium hard stop inferred from previous secondary reset"
+    assert candidate["candidate_family"] == "global_window_limit"
+    assert candidate["limit_scope"] == "global_window"
+    assert candidate["retry_at"].isoformat() == "2026-07-17T06:04:48+08:00"
+    assert candidate["scheduled_run_at"].isoformat() == "2026-07-17T06:14:48+08:00"
 
 
 def test_collect_rollout_candidates_for_thread_skips_transient_premium_credits_exhausted_when_normal_agent_message_follows(
@@ -507,9 +643,9 @@ def test_collect_rollout_candidates_for_thread_skips_transient_premium_credits_e
                     "type": "token_count",
                     "rate_limits": {
                         "limit_id": "codex",
-                        "primary": {"used_percent": 80.0, "window_minutes": 300, "resets_at": 1783702749},
-                        "secondary": {"used_percent": 44.0, "window_minutes": 10080, "resets_at": 1784239488},
-                        "credits": None,
+                        "primary": {"used_percent": 100.0, "window_minutes": 300, "resets_at": 1783702749},
+                        "secondary": {"used_percent": 100.0, "window_minutes": 10080, "resets_at": 1784239488},
+                        "credits": {"has_credits": False, "unlimited": False, "balance": "0"},
                         "individual_limit": None,
                         "plan_type": "plus",
                         "rate_limit_reached_type": None,
@@ -878,15 +1014,22 @@ def test_collect_rollout_candidates_for_thread_ignores_probe_workspace_session(m
     assert candidates == []
 
 
-def test_maybe_release_pending_jobs_via_probe_releases_future_jobs_after_success(module, monkeypatch, base_dir, codex_home):
+def test_maybe_release_pending_jobs_via_probe_releases_all_pending_jobs_after_success(
+    module, monkeypatch, base_dir, codex_home
+):
     watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
     now = datetime(2026, 7, 9, 8, 0, 0, tzinfo=watcher.local_tz)
     watcher.state["pending_jobs"] = [
         {
+            "session_id": "due-session",
+            "scheduled_run_at": (now - timedelta(minutes=5)).isoformat(),
+            "status": "pending",
+        },
+        {
             "session_id": "future-session",
             "scheduled_run_at": (now + timedelta(hours=1)).isoformat(),
             "status": "pending",
-        }
+        },
     ]
 
     class Result:
@@ -899,8 +1042,8 @@ def test_maybe_release_pending_jobs_via_probe_releases_future_jobs_after_success
     changed = watcher.maybe_release_pending_jobs_via_probe(now)
 
     assert changed is True
-    assert watcher.state["pending_jobs"][0]["scheduled_run_at"] == now.isoformat()
-    assert watcher.state["pending_jobs"][0]["released_by_probe_at"] == now.isoformat()
+    assert all(job["scheduled_run_at"] == now.isoformat() for job in watcher.state["pending_jobs"])
+    assert all(job["released_by_probe_at"] == now.isoformat() for job in watcher.state["pending_jobs"])
 
 
 def test_maybe_release_pending_jobs_via_probe_ignores_limit_error(module, monkeypatch, base_dir, codex_home):

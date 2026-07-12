@@ -317,6 +317,45 @@ class UsageLimitWatcher:
         except (TypeError, ValueError):
             return False
 
+    def pick_first_not_none(self, *values):
+        for value in values:
+            if value is not None:
+                return value
+        return None
+
+    def normalize_boolish(self, value):
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered == "true":
+                return True
+            if lowered == "false":
+                return False
+        return value
+
+    def candidate_credits_empty(self, candidate: Optional[dict]):
+        if not candidate:
+            return False
+        credits_has = self.normalize_boolish(candidate.get("credits_has"))
+        credits_balance = candidate.get("credits_balance")
+        if isinstance(credits_balance, str):
+            credits_balance = credits_balance.strip()
+        return credits_has is False or credits_balance == "0"
+
+    def candidate_is_verified_global_window(self, candidate: Optional[dict]):
+        if not candidate:
+            return False
+        if candidate.get("hard_stop_global_window") is True:
+            return True
+        if candidate.get("limit_kind") != "rollout_premium_credits_exhausted":
+            return False
+        if candidate.get("retry_source") != "inferred.previous_secondary_reset_at":
+            return False
+        if candidate.get("limit_id") != "premium":
+            return False
+        if candidate.get("terminal_task_complete_without_last_agent_message") is not True:
+            return False
+        return self.candidate_credits_empty(candidate)
+
     def candidate_scope_rank(self, candidate: Optional[dict]):
         if not candidate:
             return 0
@@ -373,6 +412,8 @@ class UsageLimitWatcher:
         return scheduled_run_at <= now
 
     def find_global_candidate_invalidator(self, global_candidate: dict, candidates):
+        if self.candidate_is_verified_global_window(global_candidate):
+            return None
         global_event_dt = global_candidate.get("event_dt")
         global_retry_at = global_candidate.get("retry_at")
         if not global_event_dt or not global_retry_at:
@@ -407,16 +448,12 @@ class UsageLimitWatcher:
     def normalize_candidate_metadata(self, candidate: dict):
         limit_kind = candidate.get("limit_kind") or ""
         retry_source = candidate.get("retry_source") or ""
-        secondary_used = candidate.get("secondary_used_percent")
-        global_scope = (
-            "secondary" in limit_kind
-            or "secondary" in retry_source
-            or self.is_limit_fully_used(secondary_used)
-        )
-        if "credits_exhausted" in limit_kind or retry_source.startswith("credits."):
-            family = "secondary_credits_exhausted" if global_scope else "session_credits_exhausted"
-        elif global_scope:
+        global_scope = self.candidate_is_verified_global_window(candidate)
+        candidate["hard_stop_global_window"] = bool(candidate.get("hard_stop_global_window") or global_scope)
+        if global_scope:
             family = "global_window_limit"
+        elif "credits_exhausted" in limit_kind or retry_source.startswith("credits."):
+            family = "session_credits_exhausted"
         else:
             family = "session_window_limit"
         candidate["limit_scope"] = "global_window" if global_scope else "session_window"
@@ -727,21 +764,8 @@ class UsageLimitWatcher:
         return any(marker in combined for marker in PROBE_LIMIT_MARKERS)
 
     def maybe_release_pending_jobs_via_probe(self, now: datetime):
-        future_jobs = []
-        for job in self.state["pending_jobs"]:
-            if job.get("status") != "pending":
-                continue
-            scheduled_run_at_text = job.get("scheduled_run_at")
-            if not scheduled_run_at_text:
-                continue
-            try:
-                scheduled_run_at = datetime.fromisoformat(scheduled_run_at_text)
-            except ValueError:
-                continue
-            if scheduled_run_at <= now:
-                return False
-            future_jobs.append(job)
-        if not future_jobs:
+        pending_jobs = [job for job in self.state["pending_jobs"] if job.get("status") == "pending"]
+        if not pending_jobs:
             return False
 
         try:
@@ -760,14 +784,14 @@ class UsageLimitWatcher:
             )
             return False
 
-        for job in future_jobs:
+        for job in pending_jobs:
             job["scheduled_run_at"] = now.isoformat()
             job["updated_at"] = now.isoformat()
             job["released_by_probe_at"] = now.isoformat()
         self.save_state()
         self.record_cycle_event(
             "probe_released_resume",
-            f"availability probe succeeded; released {len(future_jobs)} pending session(s) immediately",
+            f"availability probe succeeded; released {len(pending_jobs)} pending session(s) immediately",
         )
         return True
 
@@ -1184,30 +1208,19 @@ class UsageLimitWatcher:
         if not isinstance(payload, dict):
             return None, None
 
-        rate_limits = payload.get("rate_limits")
-        if isinstance(rate_limits, dict):
-            secondary = rate_limits.get("secondary")
-            if isinstance(secondary, dict) and secondary.get("resets_at") and self.is_limit_fully_used(secondary.get("used_percent")):
-                return int(secondary["resets_at"]), "rate_limits.secondary.resets_at"
-
-        headers = payload.get("headers")
-        if isinstance(headers, dict):
-            secondary_used = headers.get("X-Codex-Secondary-Used-Percent")
-            secondary_reset = headers.get("X-Codex-Secondary-Reset-At")
-            if secondary_reset and self.is_limit_fully_used(secondary_used):
-                return int(secondary_reset), "headers.secondary_reset_at"
-
         error = payload.get("error")
         if isinstance(error, dict):
             resets_at = error.get("resets_at")
             if resets_at:
                 return int(resets_at), "error.resets_at"
 
+        headers = payload.get("headers")
         if isinstance(headers, dict):
             primary_reset = headers.get("X-Codex-Primary-Reset-At")
             if primary_reset:
                 return int(primary_reset), "headers.primary_reset_at"
 
+        rate_limits = payload.get("rate_limits")
         if isinstance(rate_limits, dict):
             primary = rate_limits.get("primary")
             if isinstance(primary, dict) and primary.get("resets_at"):
@@ -1229,16 +1242,31 @@ class UsageLimitWatcher:
         secondary = rate_limits.get("secondary") if isinstance(rate_limits.get("secondary"), dict) else {}
         credits = rate_limits.get("credits") if isinstance(rate_limits.get("credits"), dict) else {}
         return {
+            "limit_id": self.pick_first_not_none(rate_limits.get("limit_id"), headers.get("X-Codex-Active-Limit")),
             "payload_type": payload.get("type"),
             "status_code": payload.get("status_code"),
             "error_type": error.get("type"),
             "error_resets_at": error.get("resets_at"),
-            "primary_reset_at": headers.get("X-Codex-Primary-Reset-At") or primary.get("resets_at"),
-            "secondary_reset_at": headers.get("X-Codex-Secondary-Reset-At") or secondary.get("resets_at"),
-            "primary_used_percent": primary.get("used_percent") or headers.get("X-Codex-Primary-Used-Percent"),
-            "secondary_used_percent": secondary.get("used_percent") or headers.get("X-Codex-Secondary-Used-Percent"),
-            "credits_has": credits.get("has_credits") or headers.get("X-Codex-Credits-Has-Credits"),
-            "credits_balance": credits.get("balance") or headers.get("X-Codex-Credits-Balance"),
+            "primary_reset_at": self.pick_first_not_none(headers.get("X-Codex-Primary-Reset-At"), primary.get("resets_at")),
+            "secondary_reset_at": self.pick_first_not_none(
+                headers.get("X-Codex-Secondary-Reset-At"),
+                secondary.get("resets_at"),
+            ),
+            "primary_used_percent": self.pick_first_not_none(
+                primary.get("used_percent"),
+                headers.get("X-Codex-Primary-Used-Percent"),
+            ),
+            "secondary_used_percent": self.pick_first_not_none(
+                secondary.get("used_percent"),
+                headers.get("X-Codex-Secondary-Used-Percent"),
+            ),
+            "credits_has": self.normalize_boolish(
+                self.pick_first_not_none(credits.get("has_credits"), headers.get("X-Codex-Credits-Has-Credits"))
+            ),
+            "credits_balance": self.pick_first_not_none(
+                credits.get("balance"),
+                headers.get("X-Codex-Credits-Balance"),
+            ),
         }
 
     def parse_retry_time_from_message(self, text: str, event_dt: datetime):
@@ -1447,6 +1475,7 @@ class UsageLimitWatcher:
         secondary_used: Optional[float],
         credits_has: Optional[bool],
         credits_balance: Optional[str],
+        extra_fields: Optional[dict] = None,
     ):
         session_id = thread_info.get("id")
         if not session_id:
@@ -1472,6 +1501,8 @@ class UsageLimitWatcher:
             "credits_has": credits_has,
             "credits_balance": credits_balance,
         }
+        if extra_fields:
+            candidate.update(extra_fields)
         return self.normalize_candidate_metadata(candidate)
 
     def rollout_entry_is_task_boundary(self, obj: dict):
@@ -1481,6 +1512,15 @@ class UsageLimitWatcher:
         if obj.get("type") != "event_msg":
             return False
         return payload.get("type") in {"task_complete", "task_started"}
+
+    def rollout_entry_is_terminal_task_complete_without_last_agent_message(self, obj: dict):
+        payload = obj.get("payload", {})
+        if not isinstance(payload, dict):
+            return False
+        if obj.get("type") != "event_msg" or payload.get("type") != "task_complete":
+            return False
+        last_agent_message = payload.get("last_agent_message")
+        return last_agent_message is None
 
     def collect_rollout_candidates_for_thread(self, thread_info: dict):
         if self.thread_info_is_probe_session(thread_info):
@@ -1494,7 +1534,7 @@ class UsageLimitWatcher:
 
         candidates = []
         pending_limit_candidates = []
-        latest_primary_reset_context = None
+        latest_limit_context = None
 
         def flush_pending_limit_candidates():
             nonlocal pending_limit_candidates
@@ -1502,6 +1542,8 @@ class UsageLimitWatcher:
                 candidates.extend(
                     candidate
                     for candidate in pending_limit_candidates
+                    if not candidate.get("premium_terminal_candidate")
+                    or candidate.get("terminal_task_complete_without_last_agent_message")
                     if not candidate.get("transient_rollout_limit")
                 )
             pending_limit_candidates = []
@@ -1525,6 +1567,13 @@ class UsageLimitWatcher:
                     if self.rollout_entry_has_normal_agent_message(obj):
                         for candidate in pending_limit_candidates:
                             candidate["transient_rollout_limit"] = True
+                    if self.rollout_entry_is_terminal_task_complete_without_last_agent_message(obj):
+                        for candidate in pending_limit_candidates:
+                            if not candidate.get("premium_terminal_candidate"):
+                                continue
+                            candidate["terminal_task_complete_without_last_agent_message"] = True
+                            candidate["hard_stop_global_window"] = True
+                            self.normalize_candidate_metadata(candidate)
                     if self.rollout_entry_is_task_boundary(obj):
                         flush_pending_limit_candidates()
                     text = line
@@ -1547,9 +1596,10 @@ class UsageLimitWatcher:
                         credits_has = credits.get("has_credits")
                         credits_balance = credits.get("balance")
                         credits_empty = credits_has is False or credits_balance == "0"
-                    if primary_reset:
-                        latest_primary_reset_context = {
+                    if primary_reset or secondary_reset:
+                        latest_limit_context = {
                             "primary_reset": primary_reset,
+                            "secondary_reset": secondary_reset,
                             "primary_used_percent": primary_used,
                             "secondary_used_percent": secondary_used,
                             "credits_has": credits_has,
@@ -1590,28 +1640,11 @@ class UsageLimitWatcher:
                             secondary_used=secondary_used,
                             credits_has=credits_has,
                             credits_balance=credits_balance,
-                        )
-                        if candidate:
-                            candidate["transient_rollout_limit"] = False
-                            pending_limit_candidates.append(candidate)
-
-                    if current_state["secondary_active"] and not previous_state["secondary_active"]:
-                        retry_at = datetime.fromtimestamp(int(secondary_reset), tz=ZoneInfo("UTC")).astimezone(
-                            self.local_tz
-                        )
-                        candidate = self.build_rollout_candidate(
-                            thread_info=thread_info,
-                            event_dt=event_dt,
-                            retry_at=retry_at,
-                            line_no=line_no,
-                            text=text,
-                            retry_source="rate_limits.secondary.resets_at",
-                            reason="rollout secondary usage limit reached",
-                            limit_kind="rollout_secondary_limit",
-                            primary_used=primary_used,
-                            secondary_used=secondary_used,
-                            credits_has=credits_has,
-                            credits_balance=credits_balance,
+                            extra_fields={
+                                "limit_id": limit_id,
+                                "primary_reset_at": primary_reset,
+                                "secondary_reset_at": secondary_reset,
+                            },
                         )
                         if candidate:
                             candidate["transient_rollout_limit"] = False
@@ -1622,12 +1655,7 @@ class UsageLimitWatcher:
                         retry_source = None
                         limit_kind = None
                         reason = None
-                        if current_state["secondary_active"] and secondary_reset:
-                            reset_ts = secondary_reset
-                            retry_source = "credits.secondary.resets_at"
-                            limit_kind = "rollout_secondary_credits_exhausted"
-                            reason = "rollout credits exhausted while secondary limit is active"
-                        elif current_state["primary_active"] and primary_reset:
+                        if current_state["primary_active"] and primary_reset:
                             reset_ts = primary_reset
                             retry_source = "credits.primary.resets_at"
                             limit_kind = "rollout_primary_credits_exhausted"
@@ -1649,9 +1677,15 @@ class UsageLimitWatcher:
                                 secondary_used=secondary_used,
                                 credits_has=credits_has,
                                 credits_balance=credits_balance,
+                                extra_fields={
+                                    "limit_id": limit_id,
+                                    "primary_reset_at": primary_reset,
+                                    "secondary_reset_at": secondary_reset,
+                                },
                             )
                             if candidate:
-                                candidates.append(candidate)
+                                candidate["transient_rollout_limit"] = False
+                                pending_limit_candidates.append(candidate)
 
                     if (
                         limit_id == "premium"
@@ -1660,10 +1694,12 @@ class UsageLimitWatcher:
                         and not secondary_reset
                         and not current_state["primary_active"]
                         and not current_state["secondary_active"]
-                        and latest_primary_reset_context
+                        and latest_limit_context
+                        and latest_limit_context.get("secondary_reset")
+                        and self.is_limit_fully_used(latest_limit_context.get("secondary_used_percent"))
                     ):
                         retry_at = datetime.fromtimestamp(
-                            int(latest_primary_reset_context["primary_reset"]),
+                            int(latest_limit_context["secondary_reset"]),
                             tz=ZoneInfo("UTC"),
                         ).astimezone(self.local_tz)
                         candidate = self.build_rollout_candidate(
@@ -1672,15 +1708,24 @@ class UsageLimitWatcher:
                             retry_at=retry_at,
                             line_no=line_no,
                             text=text,
-                            retry_source="inferred.previous_primary_reset_at",
-                            reason="rollout premium credits exhausted inferred from previous primary reset",
+                            retry_source="inferred.previous_secondary_reset_at",
+                            reason="rollout premium hard stop inferred from previous secondary reset",
                             limit_kind="rollout_premium_credits_exhausted",
-                            primary_used=latest_primary_reset_context.get("primary_used_percent"),
-                            secondary_used=latest_primary_reset_context.get("secondary_used_percent"),
+                            primary_used=latest_limit_context.get("primary_used_percent"),
+                            secondary_used=latest_limit_context.get("secondary_used_percent"),
                             credits_has=credits_has,
                             credits_balance=credits_balance,
+                            extra_fields={
+                                "limit_id": limit_id,
+                                "primary_reset_at": None,
+                                "secondary_reset_at": None,
+                                "premium_terminal_candidate": True,
+                                "terminal_task_complete_without_last_agent_message": False,
+                            },
                         )
                         if candidate:
+                            for pending_candidate in pending_limit_candidates:
+                                pending_candidate["transient_rollout_limit"] = True
                             candidate["transient_rollout_limit"] = False
                             pending_limit_candidates.append(candidate)
 
@@ -2043,6 +2088,7 @@ class UsageLimitWatcher:
                 "reason": classification["reason"],
                 "recovery_reason": recovery_reason,
                 "process_uuid": row.process_uuid,
+                "limit_id": payload_info.get("limit_id"),
                 "error_type": payload_info.get("error_type"),
                 "status_code": payload_info.get("status_code"),
                 "error_resets_at": payload_info.get("error_resets_at"),
@@ -2099,6 +2145,7 @@ class UsageLimitWatcher:
                 "reason": classification["reason"],
                 "recovery_reason": recovery_reason,
                 "process_uuid": row.process_uuid,
+                "limit_id": payload_info.get("limit_id"),
                 "error_type": payload_info.get("error_type"),
                 "status_code": payload_info.get("status_code"),
                 "error_resets_at": payload_info.get("error_resets_at"),

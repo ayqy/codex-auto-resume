@@ -132,10 +132,11 @@ def test_run_once_updates_state_and_triggers_due_jobs(module, monkeypatch, base_
     class Result:
         returncode = 0
         stderr = ""
+        stdout = ""
 
     calls = []
 
-    def fake_run(command, capture_output, text, check):
+    def fake_run(command, capture_output, text, check, timeout=None):
         calls.append(command)
         return Result()
 
@@ -725,13 +726,13 @@ def test_run_once_schedules_pending_job_from_rollout_premium_credits_candidate_w
                             "type": "token_count",
                             "rate_limits": {
                                 "limit_id": "codex",
-                                "primary": {"used_percent": 80.0, "window_minutes": 300, "resets_at": 1783702749},
+                                "primary": {"used_percent": 100.0, "window_minutes": 300, "resets_at": 1783702749},
                                 "secondary": {
-                                    "used_percent": 44.0,
+                                    "used_percent": 100.0,
                                     "window_minutes": 10080,
                                     "resets_at": 1784239488,
                                 },
-                                "credits": None,
+                                "credits": {"has_credits": False, "unlimited": False, "balance": "0"},
                                 "individual_limit": None,
                                 "plan_type": "plus",
                                 "rate_limit_reached_type": None,
@@ -804,7 +805,65 @@ def test_run_once_schedules_pending_job_from_rollout_premium_credits_candidate_w
     job = watcher.state["pending_jobs"][0]
     assert job["status"] == "pending"
     assert job["origin_source"] == "rollout"
-    assert job["origin_reason"] == "rollout premium credits exhausted inferred from previous primary reset"
+    assert job["origin_reason"] == "rollout premium hard stop inferred from previous secondary reset"
+    assert job["governing_limit_scope"] == "global_window"
+    assert job["scheduled_run_at"] == "2026-07-17T06:14:48+08:00"
+
+
+def test_run_once_probe_success_flushes_pending_before_prewarm(module, monkeypatch, base_dir, codex_home):
+    write_config(base_dir, ["10:30"])
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    watcher = module.UsageLimitWatcher(base_dir, cleanup_on_init=False)
+    now = datetime(2026, 7, 9, 6, 31, 0, tzinfo=watcher.local_tz)
+    watcher.state["pending_jobs"] = [
+        {
+            "session_id": "probe-release-session",
+            "retry_at": "2026-07-09T07:20:00+08:00",
+            "scheduled_run_at": "2026-07-09T07:30:00+08:00",
+            "error_log_id": "future-limit",
+            "status": "pending",
+            "cwd": "/workspace/sample-app",
+        }
+    ]
+
+    class FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now if tz else now.replace(tzinfo=None)
+
+        @classmethod
+        def fromtimestamp(cls, ts, tz=None):
+            return datetime.fromtimestamp(ts, tz=tz)
+
+        @classmethod
+        def fromisoformat(cls, value):
+            return datetime.fromisoformat(value)
+
+        @classmethod
+        def strptime(cls, date_string, fmt):
+            return datetime.strptime(date_string, fmt)
+
+    monkeypatch.setattr(module, "datetime", FakeDateTime)
+    monkeypatch.setattr(watcher, "inspect_latest_error", lambda: None)
+    monkeypatch.setattr(watcher, "build_desired_pending_jobs", lambda now=None: ({}, None, [], True, {}))
+
+    class ProbeReady:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    monkeypatch.setattr(watcher, "run_probe_command", lambda: ProbeReady())
+    monkeypatch.setattr(
+        watcher,
+        "launch_resume_job",
+        lambda job: {"ok": True, "stderr": "", "mode": "interactive", "log_path": None},
+    )
+
+    assert watcher.run_once() == 0
+    assert watcher.state["pending_jobs"][0]["status"] == "triggered"
+    assert watcher.state["pending_jobs"][0]["released_by_probe_at"] == now.isoformat()
+    assert watcher.state["prewarm_jobs"][0]["status"] == "expired"
+    assert watcher.state["prewarm_jobs"][0]["status_reason"] == "suppressed_by_resume_priority"
 
 
 def test_run_once_suppresses_due_prewarm_when_resume_runs(module, monkeypatch, base_dir, codex_home):
@@ -868,7 +927,8 @@ def test_run_once_suppresses_due_prewarm_when_resume_runs(module, monkeypatch, b
 
     assert watcher.run_once() == 0
     assert resume_calls
-    assert prewarm_calls == []
+    assert len(prewarm_calls) == 1
+    assert str(prewarm_calls[0][0]).endswith("run_workat_prewarm.sh")
     assert watcher.state["prewarm_jobs"]
     assert watcher.state["prewarm_jobs"][0]["status"] == "expired"
     assert watcher.state["prewarm_jobs"][0]["status_reason"] == "suppressed_by_resume_priority"
