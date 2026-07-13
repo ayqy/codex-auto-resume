@@ -75,6 +75,7 @@ Your focus is shattered. You have to remember to come back in an hour to resume 
 | `make config workat`| Configure one or more daily `workat` values in `config.json` using `HH:MM` format. |
 | `make config resume`| Configure whether auto-resume uses an interactive terminal or silent background mode. |
 | `make run`   | **(Most important)** Starts the background watcher to monitor for usage limits and resume your session automatically. Console output is intentionally concise; detailed diagnostics continue to be written to `tmp/logs/watcher.log`. |
+| `make check` | Runs the same silent availability probe once on demand, so you can manually check whether usage has recovered. |
 | `make today` | Shows a detailed report of your token usage, active time, and estimated costs for today. |
 | `make usage` | Shows the same report for a specific day. (e.g., `make usage D=2026-07-03`) |
 | `make recent`| Shows usage stats for the last 30 days. (e.g., `make recent N=7` for the last 7 days) |
@@ -104,6 +105,9 @@ Your focus is shattered. You have to remember to come back in an hour to resume 
 -   `make recent N=7`
     > See your usage statistics for the last 7 days.
 
+-   `make check`
+    > Run the same silent probe manually once to test whether usage is available again.
+
 -   `make today F=/tmp/codex-today.txt`
     > Save today's detailed report to a specific file.
 
@@ -114,6 +118,8 @@ If a scheduled session later receives a normal AI reply, the watcher cancels tha
 If `workat` is configured, `make run` schedules one upcoming silent prewarm probe per configured time at `workat - 4 hours`. The probe runs non-interactively with `codex exec`, fixed model `gpt-5.4-mini`, fixed `low` effort, and prompt `Just say Hi`, so it refreshes the rolling window with minimal token cost and without opening a terminal window.
 
 If pending resumes exist, each polling cycle also reuses that same probe to check whether usage has already recovered early. Limit errors returned by the probe itself are ignored, so probe sessions do not accumulate new auto-resume jobs.
+
+You can also run that probe manually at any time with `make check`.
 
 When `make run` is healthy and there are no user-visible changes, it prints a single short summary line for that cycle. If you need the full internal trace, inspect `tmp/logs/watcher.log`; `tmp/state.json` remains the source of truth for pending and triggered jobs.
 

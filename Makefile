@@ -10,7 +10,7 @@ D ?=
 N ?= 30
 F ?=
 
-.PHONY: today usage recent run status debug clean chmod test config proxy workat resume
+.PHONY: today usage recent run check status debug clean chmod test config proxy workat resume
 
 today: usage
 
@@ -38,6 +38,10 @@ recent:
 run:
 	@mkdir -p "$(LOG_DIR)"
 	@$(PYTHON) "$(APP_DIR)/scripts/watch_usage_limit.py"
+
+check:
+	@mkdir -p "$(LOG_DIR)"
+	@"$(APP_DIR)/scripts/run_workat_prewarm.sh"
 
 config:
 	@$(PYTHON) "$(APP_DIR)/scripts/configure_config.py" $(filter-out $@,$(MAKECMDGOALS))
