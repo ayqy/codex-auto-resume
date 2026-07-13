@@ -177,6 +177,26 @@ def test_debug_force_latest_calls_force_latest(module, monkeypatch, codex_home):
     assert calls == ["force_latest"]
 
 
+def test_debug_limit_history_reports_effective_30_day_cap(module, monkeypatch, base_dir, codex_home, capsys):
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    watcher = module.UsageLimitWatcher(base_dir, cleanup_on_init=False)
+    monkeypatch.setattr(watcher, "collect_log_candidates", lambda days=7, limit=5000: [])
+    monkeypatch.setattr(watcher, "collect_rollout_candidates", lambda days=7, limit_threads=400: [])
+    monkeypatch.setattr(watcher, "collect_recovered_structured_limit_events", lambda days=7, limit=5000: [])
+    monkeypatch.setattr(watcher, "collect_suspected_limit_matches", lambda days=7, limit=5000: [])
+    monkeypatch.setattr(
+        watcher,
+        "build_desired_pending_jobs",
+        lambda now=None, days=14, confirmed_candidates=None, logs_available=None: ({}, None, [], True, {}),
+    )
+
+    assert watcher.debug_limit_history(days=365) == 0
+    output = capsys.readouterr().out
+
+    assert "requested=365" in output
+    assert "effective=30" in output
+
+
 def test_sample_parse_logic_is_covered_as_unit_test(module, monkeypatch, base_dir, codex_home):
     watcher = module.UsageLimitWatcher(base_dir, cleanup_on_init=False)
     row = module.LogRow(

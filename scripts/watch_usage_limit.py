@@ -30,6 +30,8 @@ PREWARM_TIMEOUT_SECONDS = 300
 PREWARM_WORKSPACE_NAME = "prewarm-workspace"
 RESUME_MODES = {"interactive", "silent"}
 DEFAULT_RESUME_MODE = "silent"
+MAX_SCAN_LOOKBACK_DAYS = 30
+LOG_SCAN_BATCH_SIZE = 5000
 PROBE_LIMIT_MARKERS = (
     "You've hit your usage limit",
     "The usage limit has been reached",
@@ -67,6 +69,8 @@ class UsageLimitWatcher:
         self.poll_interval = 1800
         self.rollout_index_cache = None
         self.rollout_index_built_at = 0.0
+        self.rollout_metadata_cache = {}
+        self.thread_cache_dirty = False
         self.state_db_warning_contexts = set()
         self.config_warning_contexts = set()
         self.cycle_report = None
@@ -112,6 +116,7 @@ class UsageLimitWatcher:
         os.close(tmp_fd)
         Path(tmp_name).write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp_name, self.state_path)
+        self.thread_cache_dirty = False
 
     def log(self, message: str, *, console: bool = True):
         ts = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
@@ -212,6 +217,16 @@ class UsageLimitWatcher:
         if normalized not in RESUME_MODES:
             raise ValueError("config.resume.mode must be interactive or silent")
         return normalized
+
+    def effective_scan_days(self, days: int) -> int:
+        try:
+            normalized = int(days)
+        except (TypeError, ValueError):
+            normalized = MAX_SCAN_LOOKBACK_DAYS
+        return max(0, min(MAX_SCAN_LOOKBACK_DAYS, normalized))
+
+    def build_since_dt(self, days: int) -> datetime:
+        return datetime.now(tz=self.local_tz) - timedelta(days=self.effective_scan_days(days))
 
     def load_runtime_config(self):
         if not self.config_path.exists():
@@ -525,18 +540,29 @@ class UsageLimitWatcher:
         merged = self.merge_thread_info(existing, thread_info)
         if not merged:
             return
-        merged["last_verified_at"] = datetime.now().astimezone().isoformat()
-        if existing == merged:
+        existing_compare = dict(existing)
+        existing_compare.pop("last_verified_at", None)
+        merged_compare = dict(merged)
+        merged_compare.pop("last_verified_at", None)
+        if existing_compare == merged_compare:
             return
+        merged["last_verified_at"] = datetime.now().astimezone().isoformat()
         self.state["thread_cache"][session_id] = merged
+        self.thread_cache_dirty = True
         if persist:
-            self.save_state()
+            self.flush_thread_cache()
 
     def get_cached_thread_info(self, session_id: str):
         info = self.state.get("thread_cache", {}).get(session_id)
         if not info:
             return None
         return self.merge_thread_info(self.default_thread_info(session_id), info)
+
+    def flush_thread_cache(self):
+        if not self.thread_cache_dirty:
+            return False
+        self.save_state()
+        return True
 
     def build_job_error_key(self, job: dict):
         retry_at_text = job.get("origin_retry_at") or job.get("retry_at")
@@ -591,8 +617,12 @@ class UsageLimitWatcher:
             if changed:
                 self.state["pending_jobs"] = cleaned_jobs
                 self.save_state()
+        confirmed_candidates, logs_available = self.collect_confirmed_candidates(days=14)
         desired_jobs_by_session, _, _, allow_absent_prune, prune_reasons_by_session = self.build_desired_pending_jobs(
-            now=now
+            now=now,
+            days=14,
+            confirmed_candidates=confirmed_candidates,
+            logs_available=logs_available,
         )
         self.reconcile_pending_jobs(
             desired_jobs_by_session,
@@ -602,6 +632,7 @@ class UsageLimitWatcher:
         )
         desired_prewarm_jobs = self.build_desired_prewarm_jobs(now=now)
         self.reconcile_prewarm_jobs(desired_prewarm_jobs, now)
+        self.flush_thread_cache()
         self.emit_cycle_report(now)
 
     def build_prewarm_job(self, workat: str, workat_at: datetime, now: datetime):
@@ -911,66 +942,134 @@ class UsageLimitWatcher:
         return updated
 
     def fetch_recent_logs(self):
-        return self.fetch_logs_matching(limit=400)
+        since_ts = int(self.build_since_dt(MAX_SCAN_LOOKBACK_DAYS).astimezone(ZoneInfo("UTC")).timestamp())
+        return self.fetch_logs_matching(limit=400, since_ts=since_ts)
+
+    def log_body_may_contain_limit_signal(self, text: str):
+        if not isinstance(text, str) or not text:
+            return False
+        return (
+            "You've hit your usage limit" in text
+            or "The usage limit has been reached" in text
+            or '"type":"usage_limit_reached"' in text
+            or '"status_code":429' in text
+            or 'X-Codex-Primary-Used-Percent":"100"' in text
+            or MODEL_CAPACITY_TEXT in text
+        )
+
+    def find_min_log_id_for_since_ts(self, conn, since_ts: Optional[int], session_id: Optional[str] = None):
+        if since_ts is None:
+            return None
+        query = """
+            select id
+            from logs
+            where ts >= ?
+        """
+        params = [since_ts]
+        if session_id:
+            query += "\n and thread_id = ?"
+            params.append(session_id)
+        query += "\n order by ts asc, id asc\n limit 1"
+        row = conn.execute(query, tuple(params)).fetchone()
+        if not row:
+            return None
+        return row["id"]
 
     def fetch_logs_matching(self, limit: int = 400, session_id: Optional[str] = None, since_ts: Optional[int] = None):
-        query = """
-            select id, ts, level, thread_id, process_uuid, feedback_log_body
-            from logs
-            where feedback_log_body is not null
-              and (
-                feedback_log_body like '%run_turn: Turn error: You''ve hit your usage limit%'
-                or feedback_log_body like '%startup_prewarm.resolve: startup websocket prewarm setup failed: You''ve hit your usage limit%'
-                or feedback_log_body like '%You''ve hit your usage limit. Upgrade to Pro%'
-                or feedback_log_body like '%"type":"usage_limit_reached"%'
-                or feedback_log_body like '%"status_code":429%'
-                or feedback_log_body like '%X-Codex-Primary-Used-Percent":"100"%'
-                or feedback_log_body like '%Selected model is at capacity. Please try a different model.%'
-              )
-        """
-        clauses = []
-        params = []
-        if session_id:
-            clauses.append("thread_id = ?")
-            params.append(session_id)
-        if since_ts is not None:
-            clauses.append("ts >= ?")
-            params.append(since_ts)
-        if clauses:
-            query += "\n and " + "\n and ".join(clauses)
-        query += "\n order by id desc\n limit ?"
-        params.append(limit)
+        if limit <= 0:
+            return []
+        batch_size = LOG_SCAN_BATCH_SIZE
+        matched = []
         with self.connect(self.logs_db) as conn:
-            rows = conn.execute(query, tuple(params)).fetchall()
-        return [
-            LogRow(
-                id=row["id"],
-                ts=row["ts"],
-                level=row["level"],
-                thread_id=row["thread_id"],
-                process_uuid=row["process_uuid"],
-                feedback_log_body=row["feedback_log_body"],
-            )
-            for row in rows
-        ]
+            min_id = self.find_min_log_id_for_since_ts(conn, since_ts, session_id=session_id)
+            if since_ts is not None and min_id is None:
+                return []
+            max_id = None
+            while len(matched) < limit:
+                query = """
+                    select id, ts, level, thread_id, process_uuid, feedback_log_body
+                    from logs
+                    where feedback_log_body is not null
+                """
+                params = []
+                if session_id:
+                    query += "\n and thread_id = ?"
+                    params.append(session_id)
+                if since_ts is not None:
+                    query += "\n and ts >= ?"
+                    params.append(since_ts)
+                if max_id is not None:
+                    query += "\n and id <= ?"
+                    params.append(max_id)
+                if min_id is not None:
+                    query += "\n and id >= ?"
+                    params.append(min_id)
+                query += "\n order by id desc\n limit ?"
+                params.append(batch_size)
+                rows = conn.execute(query, tuple(params)).fetchall()
+                if not rows:
+                    break
+                for row in rows:
+                    if self.log_body_may_contain_limit_signal(row["feedback_log_body"]):
+                        matched.append(
+                            LogRow(
+                                id=row["id"],
+                                ts=row["ts"],
+                                level=row["level"],
+                                thread_id=row["thread_id"],
+                                process_uuid=row["process_uuid"],
+                                feedback_log_body=row["feedback_log_body"],
+                            )
+                        )
+                        if len(matched) >= limit:
+                            break
+                last_id = rows[-1]["id"]
+                if min_id is not None and last_id <= min_id:
+                    break
+                max_id = last_id - 1
+                if max_id is not None and max_id < 0:
+                    break
+        return matched[:limit]
 
     def fetch_session_logs(self, session_id: str, limit: int = 200):
         return self.fetch_logs_matching(limit=limit, session_id=session_id)
 
     def fetch_recent_threads_from_state_db(self, limit: int = 20):
+        return self.fetch_recent_threads_from_state_db_since(self.build_since_dt(MAX_SCAN_LOOKBACK_DAYS), limit)
+
+    def fetch_recent_threads_from_state_db_since(self, since_dt: datetime, limit: int = 20):
+        since_ts = int(since_dt.astimezone(ZoneInfo("UTC")).timestamp())
         query = """
             select id, rollout_path, title, cwd, model_provider, created_at, updated_at
             from threads
-            order by updated_at desc
+            where coalesce(updated_at, created_at, 0) >= ?
+            order by coalesce(updated_at, created_at, 0) desc
             limit ?
         """
         try:
             with self.connect(self.state_db) as conn:
-                rows = conn.execute(query, (limit,)).fetchall()
+                rows = conn.execute(query, (since_ts, limit)).fetchall()
         except sqlite3.Error as exc:
             self.log_state_db_fallback("检查rollout时无法访问数据库", exc)
             return []
         return [self.thread_info_from_state_row(row) for row in rows]
+
+    def fetch_threads_from_state_db_by_ids(self, thread_ids: list[str]):
+        if not thread_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in thread_ids)
+        query = f"""
+            select id, rollout_path, title, cwd, model_provider, created_at, updated_at
+            from threads
+            where id in ({placeholders})
+        """
+        try:
+            with self.connect(self.state_db) as conn:
+                rows = conn.execute(query, tuple(thread_ids)).fetchall()
+        except sqlite3.Error as exc:
+            self.log_state_db_fallback("检查日志时无法访问数据库 (thread batch lookup)", exc)
+            return {}
+        return {row["id"]: self.thread_info_from_state_row(row) for row in rows}
 
     def fetch_thread_from_state_db(self, thread_id: str):
         query = """
@@ -990,7 +1089,6 @@ class UsageLimitWatcher:
 
     def thread_info_from_state_row(self, row):
         thread_info = dict(row)
-        thread_info["cwd"] = self.resolve_cwd_from_rollout(thread_info.get("rollout_path")) or thread_info.get("cwd")
         thread_info["source"] = "state_db"
         return thread_info
 
@@ -1340,6 +1438,10 @@ class UsageLimitWatcher:
         if not path.exists():
             return None
         stat = path.stat()
+        cache_key = (str(path), stat.st_mtime, stat.st_size)
+        cached = self.rollout_metadata_cache.get(cache_key)
+        if cached:
+            return dict(cached)
         session_id = session_id or self.derive_session_id_from_rollout_path(str(path))
         info = {
             "id": session_id,
@@ -1381,7 +1483,9 @@ class UsageLimitWatcher:
                     if info["cwd"] and info["title"] and info["model_provider"]:
                         break
         except Exception:
+            self.rollout_metadata_cache[cache_key] = dict(info)
             return info
+        self.rollout_metadata_cache[cache_key] = dict(info)
         return info
 
     def scan_rollout_index(self, force: bool = False):
@@ -1431,39 +1535,50 @@ class UsageLimitWatcher:
             return None
         info = self.parse_rollout_metadata(Path(record["rollout_path"]), session_id=session_id)
         if info:
-            self.cache_thread_info(info)
+            self.cache_thread_info(info, persist=False)
         return info
 
     def thread_exists(self, thread_id: str):
         minimal = self.default_thread_info(thread_id)
         cached = self.get_cached_thread_info(thread_id)
-        rollout = self.get_thread_from_rollout(thread_id)
         state_db = self.fetch_thread_from_state_db(thread_id)
-        merged = self.merge_thread_info(minimal, state_db, cached, rollout)
+        merged = self.merge_thread_info(minimal, cached, state_db)
         if self.has_meaningful_thread_info(merged):
-            self.cache_thread_info(merged)
+            self.cache_thread_info(merged, persist=False)
+            return merged
+        rollout = self.get_thread_from_rollout(thread_id)
+        merged = self.merge_thread_info(minimal, cached, state_db, rollout)
+        if self.has_meaningful_thread_info(merged):
+            self.cache_thread_info(merged, persist=False)
             return merged
         self.log(f"using minimal thread metadata for session {thread_id}", console=False)
         return merged
 
     def fetch_recent_threads(self, limit: int = 20):
         threads = {}
+        threshold = self.build_since_dt(MAX_SCAN_LOOKBACK_DAYS)
 
-        for record in self.scan_rollout_index()["recent"][:limit]:
-            info = self.parse_rollout_metadata(Path(record["rollout_path"]), session_id=record["session_id"])
-            if not info:
-                continue
-            self.cache_thread_info(info, persist=False)
-            threads[record["session_id"]] = info
+        for state_info in self.fetch_recent_threads_from_state_db_since(threshold, limit=limit):
+            threads[state_info["id"]] = self.merge_thread_info(threads.get(state_info["id"]), state_info)
 
-        for state_info in self.fetch_recent_threads_from_state_db(limit=limit):
-            merged = self.merge_thread_info(threads.get(state_info["id"]), state_info)
-            if state_info.get("cwd") and threads.get(state_info["id"], {}).get("cwd") is None:
-                merged["cwd"] = state_info["cwd"]
-            threads[state_info["id"]] = merged
+        threshold_ts = threshold.timestamp()
+        if len(threads) < limit:
+            for record in self.scan_rollout_index()["recent"]:
+                if record["mtime"] < threshold_ts:
+                    break
+                existing = threads.get(record["session_id"])
+                if existing and existing.get("rollout_path") and existing.get("cwd") and existing.get("title") and existing.get("model_provider"):
+                    continue
+                info = self.parse_rollout_metadata(Path(record["rollout_path"]), session_id=record["session_id"])
+                if not info:
+                    continue
+                merged = self.merge_thread_info(existing, info)
+                self.cache_thread_info(merged, persist=False)
+                threads[record["session_id"]] = merged
+                if len(threads) >= limit:
+                    break
 
-        if self.state.get("thread_cache"):
-            self.save_state()
+        self.flush_thread_cache()
 
         return sorted(
             threads.values(),
@@ -1752,25 +1867,62 @@ class UsageLimitWatcher:
         return candidates
 
     def collect_rollout_candidates(self, days: int = 7, limit_threads: Optional[int] = None, session_id: Optional[str] = None):
-        threshold = datetime.now().astimezone() - timedelta(days=days)
+        effective_days = self.effective_scan_days(days)
+        threshold = self.build_since_dt(effective_days)
         if session_id:
             threads = [self.thread_exists(session_id)]
         else:
             thread_limit = limit_threads if limit_threads is not None else 200
             threshold_ts = threshold.timestamp()
-            threads = []
-            for record in self.scan_rollout_index()["recent"]:
-                if record["mtime"] < threshold_ts:
-                    break
-                info = self.parse_rollout_metadata(Path(record["rollout_path"]), session_id=record["session_id"])
-                if not info:
-                    continue
-                self.cache_thread_info(info, persist=False)
-                threads.append(info)
-                if len(threads) >= thread_limit:
-                    break
-            if self.state.get("thread_cache"):
-                self.save_state()
+            threads_by_id = {}
+            state_threads = self.fetch_recent_threads_from_state_db_since(threshold, limit=thread_limit)
+            for state_info in state_threads:
+                threads_by_id[state_info["id"]] = self.merge_thread_info(
+                    self.get_cached_thread_info(state_info["id"]),
+                    state_info,
+                )
+
+            needs_rollout_records = not state_threads
+            if not needs_rollout_records:
+                for thread_info in threads_by_id.values():
+                    if not (
+                        thread_info.get("rollout_path")
+                        and thread_info.get("cwd")
+                        and thread_info.get("title")
+                        and thread_info.get("model_provider")
+                    ):
+                        needs_rollout_records = True
+                        break
+
+            if needs_rollout_records:
+                state_rows_by_id = self.fetch_threads_from_state_db_by_ids(list(threads_by_id.keys()))
+                for record in self.scan_rollout_index()["recent"]:
+                    if record["mtime"] < threshold_ts:
+                        break
+                    existing = threads_by_id.get(record["session_id"])
+                    merged = self.merge_thread_info(existing, state_rows_by_id.get(record["session_id"]))
+                    if existing and merged and merged.get("rollout_path") and merged.get("cwd") and merged.get("title") and merged.get("model_provider"):
+                        continue
+                    info = self.parse_rollout_metadata(Path(record["rollout_path"]), session_id=record["session_id"])
+                    if not info:
+                        continue
+                    merged = self.merge_thread_info(merged, info)
+                    self.cache_thread_info(merged, persist=False)
+                    threads_by_id[record["session_id"]] = merged
+                    if len(threads_by_id) >= thread_limit:
+                        complete = all(
+                            item.get("rollout_path") and item.get("cwd") and item.get("title") and item.get("model_provider")
+                            for item in threads_by_id.values()
+                        )
+                        if complete:
+                            break
+
+            threads = sorted(
+                threads_by_id.values(),
+                key=lambda item: item.get("updated_at") or item.get("created_at") or 0,
+                reverse=True,
+            )[:thread_limit]
+            self.flush_thread_cache()
         candidates = []
         for thread_info in threads:
             if not thread_info:
@@ -1795,14 +1947,15 @@ class UsageLimitWatcher:
         return f"{session_id}|{retry_at.isoformat()}|{error_id}"
 
     def collect_confirmed_candidates(self, days: int = 14, log_limit: int = 5000, rollout_limit_threads: int = 400):
+        effective_days = self.effective_scan_days(days)
         logs_available = True
         try:
-            log_candidates = self.collect_log_candidates(days=days, limit=log_limit)
+            log_candidates = self.collect_log_candidates(days=effective_days, limit=log_limit)
         except sqlite3.Error as exc:
             self.log(f"检查日志时无法访问数据库: {exc}", console=False)
             log_candidates = []
             logs_available = False
-        rollout_candidates = self.collect_rollout_candidates(days=days, limit_threads=rollout_limit_threads)
+        rollout_candidates = self.collect_rollout_candidates(days=effective_days, limit_threads=rollout_limit_threads)
         candidates = self.dedupe_candidates(log_candidates + rollout_candidates)
         return candidates, logs_available
 
@@ -1878,9 +2031,19 @@ class UsageLimitWatcher:
         )
         return all(current.get(key) == desired.get(key) for key in keys)
 
-    def build_desired_pending_jobs(self, now: Optional[datetime] = None, days: int = 14):
+    def build_desired_pending_jobs(
+        self,
+        now: Optional[datetime] = None,
+        days: int = 14,
+        confirmed_candidates=None,
+        logs_available: Optional[bool] = None,
+    ):
         now = now or datetime.now().astimezone()
-        candidates, logs_available = self.collect_confirmed_candidates(days=days)
+        effective_days = self.effective_scan_days(days)
+        if confirmed_candidates is None or logs_available is None:
+            candidates, logs_available = self.collect_confirmed_candidates(days=effective_days)
+        else:
+            candidates = list(confirmed_candidates)
         candidates = self.discard_invalidated_global_candidates(candidates)
         active_candidates = []
         latest_per_session = {}
@@ -2060,7 +2223,7 @@ class UsageLimitWatcher:
         return max(candidates, key=self.sort_key_for_max)
 
     def collect_log_candidates(self, days: int = 7, session_id: Optional[str] = None, limit: int = 2000):
-        since_dt = datetime.now(tz=self.local_tz) - timedelta(days=days)
+        since_dt = self.build_since_dt(days)
         since_ts = int(since_dt.astimezone(ZoneInfo("UTC")).timestamp())
         rows = self.fetch_logs_matching(limit=limit, session_id=session_id, since_ts=since_ts)
         return self.collect_log_candidates_from_rows(rows, preferred_session_id=session_id)
@@ -2119,7 +2282,7 @@ class UsageLimitWatcher:
         return candidates
 
     def collect_recovered_structured_limit_events(self, days: int = 7, limit: int = 5000):
-        since_dt = datetime.now(tz=self.local_tz) - timedelta(days=days)
+        since_dt = self.build_since_dt(days)
         since_ts = int(since_dt.astimezone(ZoneInfo("UTC")).timestamp())
         rows = self.fetch_logs_matching(limit=limit, since_ts=since_ts)
         events = []
@@ -2192,7 +2355,7 @@ class UsageLimitWatcher:
         return list(deduped.values())
 
     def collect_suspected_limit_matches(self, days: int = 7, limit: int = 5000):
-        since_dt = datetime.now(tz=self.local_tz) - timedelta(days=days)
+        since_dt = self.build_since_dt(days)
         since_ts = int(since_dt.astimezone(ZoneInfo("UTC")).timestamp())
         rows = self.fetch_logs_matching(limit=limit, since_ts=since_ts)
         grouped = {}
@@ -2252,8 +2415,11 @@ class UsageLimitWatcher:
         results = sorted(grouped.values(), key=lambda item: item["last_event_dt"], reverse=True)
         return results
 
-    def inspect_latest_error(self):
-        candidates, _ = self.collect_confirmed_candidates(days=14)
+    def inspect_latest_error(self, confirmed_candidates=None):
+        if confirmed_candidates is None:
+            candidates, _ = self.collect_confirmed_candidates(days=14)
+        else:
+            candidates = list(confirmed_candidates)
         if not candidates:
             self.log("no usage limit error found in recent logs or rollouts", console=False)
             return None
@@ -2415,7 +2581,8 @@ class UsageLimitWatcher:
     def run_once(self):
         now = datetime.now().astimezone()
         self.begin_cycle_report(now)
-        latest_result = self.inspect_latest_error()
+        confirmed_candidates, logs_available = self.collect_confirmed_candidates(days=14)
+        latest_result = self.inspect_latest_error(confirmed_candidates=confirmed_candidates)
         if latest_result:
             self.state["last_detected_error"] = latest_result["message"]
             self.state["last_detected_session_id"] = latest_result["session_id"]
@@ -2425,7 +2592,12 @@ class UsageLimitWatcher:
             self.save_state()
 
         desired_jobs_by_session, global_governing_candidate, active_candidates, allow_absent_prune, prune_reasons_by_session = (
-            self.build_desired_pending_jobs(now=now)
+            self.build_desired_pending_jobs(
+                now=now,
+                days=14,
+                confirmed_candidates=confirmed_candidates,
+                logs_available=logs_available,
+            )
         )
         if latest_result and not active_candidates:
             self.log("detected retry time is already in the past; mark as expired and skip scheduling", console=False)
@@ -2448,6 +2620,7 @@ class UsageLimitWatcher:
             self.log(f"reconciling prewarm jobs count={len(desired_prewarm_jobs)}", console=False)
         self.reconcile_prewarm_jobs(desired_prewarm_jobs, now)
         self.trigger_due_prewarm_jobs(now=now, suppress_for_resume=resume_summary["attempted"] > 0)
+        self.flush_thread_cache()
         self.emit_cycle_report(now)
         return 0
 
@@ -2542,16 +2715,25 @@ class UsageLimitWatcher:
         return "\n".join(lines)
 
     def debug_limit_history(self, days: int = 7):
-        log_candidates = self.collect_log_candidates(days=days, limit=5000)
-        rollout_candidates = self.collect_rollout_candidates(days=days, limit_threads=400)
-        recovered_structured_events = self.collect_recovered_structured_limit_events(days=days, limit=5000)
+        effective_days = self.effective_scan_days(days)
+        log_candidates = self.collect_log_candidates(days=effective_days, limit=5000)
+        rollout_candidates = self.collect_rollout_candidates(days=effective_days, limit_threads=400)
+        recovered_structured_events = self.collect_recovered_structured_limit_events(days=effective_days, limit=5000)
         candidates = self.dedupe_candidates(log_candidates + rollout_candidates)
         candidates.sort(key=self.sort_key_for_retry_desc, reverse=True)
         all_limit_events = sorted(log_candidates + rollout_candidates, key=self.sort_key_for_retry_desc, reverse=True)
-        suspected_matches = self.collect_suspected_limit_matches(days=days, limit=5000)
+        suspected_matches = self.collect_suspected_limit_matches(days=effective_days, limit=5000)
+        desired_jobs = list(
+            self.build_desired_pending_jobs(
+                now=datetime.now().astimezone(),
+                days=effective_days,
+                confirmed_candidates=candidates,
+                logs_available=True,
+            )[0].values()
+        )
 
         sections = [
-            f"Usage Limit Debug 近 {days} 天",
+            f"Usage Limit Debug 近 {effective_days} 天 (requested={days}, effective={effective_days})",
             (
                 "汇总: "
                 f"all_limit_events={len(all_limit_events)} | "
@@ -2562,7 +2744,7 @@ class UsageLimitWatcher:
             ),
             self.render_debug_section(
                 "Desired Pending Jobs",
-                list(self.build_desired_pending_jobs(now=datetime.now().astimezone(), days=days)[0].values()),
+                desired_jobs,
                 lambda job, index: (
                     f"{index}. session={job.get('session_id')} | scheduled={job.get('scheduled_run_at')} | "
                     f"origin_retry={job.get('origin_retry_at')} | scope={job.get('limit_scope')} | "
@@ -2578,14 +2760,15 @@ class UsageLimitWatcher:
             ),
             self.render_debug_section("Suspected Matches", suspected_matches, self.format_suspected_match_brief),
         ]
+        self.flush_thread_cache()
         print("\n\n".join(sections))
         return 0
 
     def debug_session(self, session_id: str):
         thread_info = self.thread_exists(session_id)
         rollout_record = self.get_rollout_record(session_id)
-        rollout_candidates = self.collect_rollout_candidates(days=30, session_id=session_id)
-        log_candidates = self.collect_log_candidates(days=30, session_id=session_id, limit=1000)
+        rollout_candidates = self.collect_rollout_candidates(days=MAX_SCAN_LOOKBACK_DAYS, session_id=session_id)
+        log_candidates = self.collect_log_candidates(days=MAX_SCAN_LOOKBACK_DAYS, session_id=session_id, limit=1000)
         rollout_candidate = max(rollout_candidates, key=self.sort_key_for_max) if rollout_candidates else None
         log_candidate = max(log_candidates, key=self.sort_key_for_max) if log_candidates else None
         output = {
@@ -2602,6 +2785,7 @@ class UsageLimitWatcher:
             "all_log_candidates": [self.serialize_candidate(item) for item in sorted(log_candidates, key=self.sort_key_for_retry_desc, reverse=True)],
             "all_rollout_candidates": [self.serialize_candidate(item) for item in sorted(rollout_candidates, key=self.sort_key_for_retry_desc, reverse=True)],
         }
+        self.flush_thread_cache()
         print(json.dumps(self.serialize_user_value(output), ensure_ascii=False, indent=2))
         return 0
 

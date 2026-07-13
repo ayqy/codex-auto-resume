@@ -331,7 +331,7 @@ def test_force_latest_success_and_failure(module, monkeypatch, base_dir, codex_h
 def test_force_latest_no_candidate_returns_one(module, monkeypatch, base_dir, codex_home):
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     watcher = module.UsageLimitWatcher(base_dir, cleanup_on_init=False)
-    monkeypatch.setattr(watcher, "inspect_latest_error", lambda: None)
+    monkeypatch.setattr(watcher, "inspect_latest_error", lambda confirmed_candidates=None: None)
 
     assert watcher.force_latest() == 1
 
@@ -381,8 +381,12 @@ def test_run_once_executes_prewarm_jobs_without_usage_limit_events(module, monke
             return datetime.strptime(date_string, fmt)
 
     monkeypatch.setattr(module, "datetime", FakeDateTime)
-    monkeypatch.setattr(watcher, "inspect_latest_error", lambda: None)
-    monkeypatch.setattr(watcher, "build_desired_pending_jobs", lambda now=None: ({}, None, [], True, {}))
+    monkeypatch.setattr(watcher, "inspect_latest_error", lambda confirmed_candidates=None: None)
+    monkeypatch.setattr(
+        watcher,
+        "build_desired_pending_jobs",
+        lambda now=None, days=14, confirmed_candidates=None, logs_available=None: ({}, None, [], True, {}),
+    )
 
     class Result:
         returncode = 0
@@ -525,7 +529,7 @@ def test_run_once_cancels_future_pending_job_when_session_already_resumed(module
             return datetime.strptime(date_string, fmt)
 
     monkeypatch.setattr(module, "datetime", FakeDateTime)
-    monkeypatch.setattr(watcher, "inspect_latest_error", lambda: None)
+    monkeypatch.setattr(watcher, "inspect_latest_error", lambda confirmed_candidates=None: None)
 
     candidate = watcher.normalize_candidate_metadata(
         {
@@ -614,7 +618,7 @@ def test_run_once_only_cancels_resumed_pending_session(module, monkeypatch, base
             return datetime.strptime(date_string, fmt)
 
     monkeypatch.setattr(module, "datetime", FakeDateTime)
-    monkeypatch.setattr(watcher, "inspect_latest_error", lambda: None)
+    monkeypatch.setattr(watcher, "inspect_latest_error", lambda confirmed_candidates=None: None)
 
     session_one = watcher.normalize_candidate_metadata(
         {
@@ -699,8 +703,12 @@ def test_run_once_without_user_visible_changes_prints_single_summary_line(
 ):
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     watcher = module.UsageLimitWatcher(base_dir, cleanup_on_init=False)
-    monkeypatch.setattr(watcher, "inspect_latest_error", lambda: None)
-    monkeypatch.setattr(watcher, "build_desired_pending_jobs", lambda now=None: ({}, None, [], True, {}))
+    monkeypatch.setattr(watcher, "inspect_latest_error", lambda confirmed_candidates=None: None)
+    monkeypatch.setattr(
+        watcher,
+        "build_desired_pending_jobs",
+        lambda now=None, days=14, confirmed_candidates=None, logs_available=None: ({}, None, [], True, {}),
+    )
 
     assert watcher.run_once() == 0
 
@@ -710,6 +718,37 @@ def test_run_once_without_user_visible_changes_prints_single_summary_line(
     assert "selected latest usage limit candidate" not in output_lines[0]
     assert "reconciling pending jobs" not in output_lines[0]
     assert "updated pending job metadata" not in output_lines[0]
+
+
+def test_run_once_reuses_single_confirmed_candidate_snapshot(module, monkeypatch, base_dir, codex_home):
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    watcher = module.UsageLimitWatcher(base_dir, cleanup_on_init=False)
+    snapshot = []
+    calls = []
+    observed = {}
+
+    def fake_collect(days=14, log_limit=5000, rollout_limit_threads=400):
+        calls.append((days, log_limit, rollout_limit_threads))
+        return snapshot, True
+
+    def fake_inspect(confirmed_candidates=None):
+        observed["inspect"] = confirmed_candidates
+        return None
+
+    def fake_build(now=None, days=14, confirmed_candidates=None, logs_available=None):
+        observed["build"] = confirmed_candidates
+        observed["logs_available"] = logs_available
+        return ({}, None, [], True, {})
+
+    monkeypatch.setattr(watcher, "collect_confirmed_candidates", fake_collect)
+    monkeypatch.setattr(watcher, "inspect_latest_error", fake_inspect)
+    monkeypatch.setattr(watcher, "build_desired_pending_jobs", fake_build)
+
+    assert watcher.run_once() == 0
+    assert calls == [(14, 5000, 400)]
+    assert observed["inspect"] is snapshot
+    assert observed["build"] is snapshot
+    assert observed["logs_available"] is True
 
 
 def test_run_once_keeps_future_pending_job_when_candidates_temporarily_missing(module, monkeypatch, base_dir, codex_home):
@@ -751,8 +790,12 @@ def test_run_once_keeps_future_pending_job_when_candidates_temporarily_missing(m
             return datetime.strptime(date_string, fmt)
 
     monkeypatch.setattr(module, "datetime", FakeDateTime)
-    monkeypatch.setattr(watcher, "inspect_latest_error", lambda: None)
-    monkeypatch.setattr(watcher, "build_desired_pending_jobs", lambda now=None: ({}, None, [], True, {}))
+    monkeypatch.setattr(watcher, "inspect_latest_error", lambda confirmed_candidates=None: None)
+    monkeypatch.setattr(
+        watcher,
+        "build_desired_pending_jobs",
+        lambda now=None, days=14, confirmed_candidates=None, logs_available=None: ({}, None, [], True, {}),
+    )
 
     class ProbeLimited:
         returncode = 1
@@ -973,8 +1016,12 @@ def test_run_once_probe_success_flushes_pending_before_prewarm(module, monkeypat
             return datetime.strptime(date_string, fmt)
 
     monkeypatch.setattr(module, "datetime", FakeDateTime)
-    monkeypatch.setattr(watcher, "inspect_latest_error", lambda: None)
-    monkeypatch.setattr(watcher, "build_desired_pending_jobs", lambda now=None: ({}, None, [], True, {}))
+    monkeypatch.setattr(watcher, "inspect_latest_error", lambda confirmed_candidates=None: None)
+    monkeypatch.setattr(
+        watcher,
+        "build_desired_pending_jobs",
+        lambda now=None, days=14, confirmed_candidates=None, logs_available=None: ({}, None, [], True, {}),
+    )
 
     class ProbeReady:
         returncode = 0
@@ -1035,8 +1082,12 @@ def test_run_once_suppresses_due_prewarm_when_resume_runs(module, monkeypatch, b
             return datetime.strptime(date_string, fmt)
 
     monkeypatch.setattr(module, "datetime", FakeDateTime)
-    monkeypatch.setattr(watcher, "inspect_latest_error", lambda: None)
-    monkeypatch.setattr(watcher, "build_desired_pending_jobs", lambda now=None: ({}, None, [], True, {}))
+    monkeypatch.setattr(watcher, "inspect_latest_error", lambda confirmed_candidates=None: None)
+    monkeypatch.setattr(
+        watcher,
+        "build_desired_pending_jobs",
+        lambda now=None, days=14, confirmed_candidates=None, logs_available=None: ({}, None, [], True, {}),
+    )
 
     class Result:
         returncode = 0

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -115,6 +116,31 @@ def write_config(base_dir: Path, workat: list[str] | None, resume_mode: str | No
     if resume_mode is not None:
         payload["resume"] = {"mode": resume_mode}
     write_json(base_dir / "config.json", payload)
+
+
+def insert_thread_row(
+    path: Path,
+    *,
+    session_id: str,
+    rollout_path: str | None,
+    title: str | None,
+    cwd: str | None,
+    model_provider: str | None,
+    created_at: int,
+    updated_at: int,
+):
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            """
+            insert or replace into threads (id, rollout_path, title, cwd, model_provider, created_at, updated_at)
+            values (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (session_id, rollout_path, title, cwd, model_provider, created_at, updated_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def test_build_desired_pending_jobs_handles_global_override(module, monkeypatch, base_dir, codex_home):
@@ -785,6 +811,102 @@ def test_compute_sleep_seconds_for_due_and_future_jobs(module, monkeypatch, base
     assert watcher.compute_sleep_seconds(now=now) == 1.0
 
 
+def test_collect_log_candidates_caps_days_to_30(module, monkeypatch, base_dir, codex_home):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    now = datetime(2026, 7, 13, 12, 0, 0, tzinfo=watcher.local_tz)
+    captured = {}
+
+    class FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now if tz else now.replace(tzinfo=None)
+
+        @classmethod
+        def fromtimestamp(cls, ts, tz=None):
+            return datetime.fromtimestamp(ts, tz=tz)
+
+        @classmethod
+        def fromisoformat(cls, value):
+            return datetime.fromisoformat(value)
+
+        @classmethod
+        def strptime(cls, date_string, fmt):
+            return datetime.strptime(date_string, fmt)
+
+    def fake_fetch(limit=400, session_id=None, since_ts=None):
+        captured["since_ts"] = since_ts
+        return []
+
+    monkeypatch.setattr(module, "datetime", FakeDateTime)
+    monkeypatch.setattr(watcher, "fetch_logs_matching", fake_fetch)
+
+    assert watcher.collect_log_candidates(days=365) == []
+    expected = int((now - timedelta(days=30)).astimezone(module.ZoneInfo("UTC")).timestamp())
+    assert captured["since_ts"] == expected
+
+
+def test_fetch_logs_matching_keeps_exact_desc_order_with_batched_scan(module, monkeypatch, base_dir, codex_home):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    create_logs_db(
+        codex_home / "logs_2.sqlite",
+        [
+            {
+                "id": 1,
+                "ts": 1,
+                "level": "INFO",
+                "thread_id": "s-1",
+                "process_uuid": "p-1",
+                "feedback_log_body": "normal log",
+            },
+            {
+                "id": 2,
+                "ts": 2,
+                "level": "INFO",
+                "thread_id": "s-2",
+                "process_uuid": "p-2",
+                "feedback_log_body": "run_turn: Turn error: You've hit your usage limit",
+            },
+            {
+                "id": 3,
+                "ts": 3,
+                "level": "INFO",
+                "thread_id": "s-3",
+                "process_uuid": "p-3",
+                "feedback_log_body": "still normal",
+            },
+            {
+                "id": 4,
+                "ts": 4,
+                "level": "INFO",
+                "thread_id": "s-4",
+                "process_uuid": "p-4",
+                "feedback_log_body": 'Received message {"type":"error","error":{"type":"usage_limit_reached"},"status_code":429}',
+            },
+            {
+                "id": 5,
+                "ts": 5,
+                "level": "INFO",
+                "thread_id": "s-5",
+                "process_uuid": "p-5",
+                "feedback_log_body": "not a limit",
+            },
+            {
+                "id": 6,
+                "ts": 6,
+                "level": "INFO",
+                "thread_id": "s-6",
+                "process_uuid": "p-6",
+                "feedback_log_body": "run_turn: Turn error: Selected model is at capacity. Please try a different model.",
+            },
+        ],
+    )
+    monkeypatch.setattr(module, "LOG_SCAN_BATCH_SIZE", 2)
+
+    rows = watcher.fetch_logs_matching(limit=3, since_ts=0)
+
+    assert [row.id for row in rows] == [6, 4, 2]
+
+
 def test_collect_confirmed_candidates_falls_back_when_logs_db_unavailable(module, monkeypatch, base_dir, codex_home):
     watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
     broken_logs = codex_home / "logs_2.sqlite"
@@ -796,6 +918,33 @@ def test_collect_confirmed_candidates_falls_back_when_logs_db_unavailable(module
     assert any(candidate["source"] == "rollout" for candidate in candidates)
 
 
+def test_cleanup_state_reuses_single_confirmed_candidate_snapshot(module, monkeypatch, base_dir, codex_home):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    snapshot = []
+    calls = []
+    observed = {}
+
+    def fake_collect(days=14, log_limit=5000, rollout_limit_threads=400):
+        calls.append((days, log_limit, rollout_limit_threads))
+        return snapshot, True
+
+    def fake_build(now=None, days=14, confirmed_candidates=None, logs_available=None):
+        observed["confirmed_candidates"] = confirmed_candidates
+        observed["logs_available"] = logs_available
+        return ({}, None, [], True, {})
+
+    monkeypatch.setattr(watcher, "collect_confirmed_candidates", fake_collect)
+    monkeypatch.setattr(watcher, "build_desired_pending_jobs", fake_build)
+    monkeypatch.setattr(watcher, "reconcile_pending_jobs", lambda *args, **kwargs: False)
+    monkeypatch.setattr(watcher, "reconcile_prewarm_jobs", lambda *args, **kwargs: False)
+
+    watcher.cleanup_state()
+
+    assert calls == [(14, 5000, 400)]
+    assert observed["confirmed_candidates"] is snapshot
+    assert observed["logs_available"] is True
+
+
 def test_thread_exists_state_db_fallback_is_file_only(module, monkeypatch, base_dir, codex_home, capsys):
     watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
     watcher.state_db.write_text("not a sqlite db", encoding="utf-8")
@@ -805,6 +954,68 @@ def test_thread_exists_state_db_fallback_is_file_only(module, monkeypatch, base_
     assert capsys.readouterr().out == ""
     assert thread_info["id"] == "11111111-1111-4111-8111-111111111111"
     assert "fallback to rollout/cache" in watcher.log_path.read_text(encoding="utf-8")
+
+
+def test_thread_exists_prefers_state_db_before_rollout_parse(module, monkeypatch, base_dir, codex_home):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    session_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    insert_thread_row(
+        watcher.state_db,
+        session_id=session_id,
+        rollout_path="/tmp/rollout.jsonl",
+        title="From State DB",
+        cwd="/workspace/from-state-db",
+        model_provider="openai",
+        created_at=1783123200,
+        updated_at=1783126800,
+    )
+    monkeypatch.setattr(
+        watcher,
+        "parse_rollout_metadata",
+        lambda path, session_id=None: (_ for _ in ()).throw(AssertionError("rollout parse should not run")),
+    )
+
+    thread_info = watcher.thread_exists(session_id)
+
+    assert thread_info["id"] == session_id
+    assert thread_info["title"] == "From State DB"
+    assert thread_info["cwd"] == "/workspace/from-state-db"
+    assert thread_info["model_provider"] == "openai"
+
+
+def test_cache_thread_info_does_not_persist_when_only_last_verified_at_changes(module, monkeypatch, base_dir, codex_home):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    session_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+    watcher.state["thread_cache"][session_id] = {
+        "id": session_id,
+        "rollout_path": "/tmp/rollout.jsonl",
+        "title": "Cached Thread",
+        "cwd": "/workspace/cached-thread",
+        "model_provider": "openai",
+        "created_at": 1783123200,
+        "updated_at": 1783126800,
+        "source": "state_db",
+        "last_verified_at": "2026-07-13T10:00:00+08:00",
+    }
+    save_calls = []
+    monkeypatch.setattr(watcher, "save_state", lambda state=None: save_calls.append(state))
+
+    watcher.cache_thread_info(
+        {
+            "id": session_id,
+            "rollout_path": "/tmp/rollout.jsonl",
+            "title": "Cached Thread",
+            "cwd": "/workspace/cached-thread",
+            "model_provider": "openai",
+            "created_at": 1783123200,
+            "updated_at": 1783126800,
+            "source": "state_db",
+        }
+    )
+
+    assert save_calls == []
+    assert watcher.thread_cache_dirty is False
+    assert watcher.state["thread_cache"][session_id]["last_verified_at"] == "2026-07-13T10:00:00+08:00"
 
 
 def test_build_desired_prewarm_jobs_skips_when_workat_not_configured(module, monkeypatch, base_dir, codex_home):
@@ -937,6 +1148,62 @@ def test_compute_sleep_seconds_prefers_nearest_prewarm_job(module, monkeypatch, 
     ]
 
     assert watcher.compute_sleep_seconds(now=now) == 42.0
+
+
+def test_collect_rollout_candidates_prefers_recent_state_db_records_before_filesystem_scan(
+    module, monkeypatch, base_dir, codex_home
+):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    now = datetime(2026, 7, 13, 12, 0, 0, tzinfo=watcher.local_tz)
+    session_id = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+    rollout_path = codex_home / "sessions" / "2026" / "07" / "13" / f"rollout-2026-07-13T00-00-00-{session_id}.jsonl"
+    rollout_path.parent.mkdir(parents=True, exist_ok=True)
+    rollout_path.write_text("", encoding="utf-8")
+    insert_thread_row(
+        watcher.state_db,
+        session_id=session_id,
+        rollout_path=str(rollout_path),
+        title="Recent Session",
+        cwd="/workspace/recent-session",
+        model_provider="openai",
+        created_at=int((now - timedelta(hours=2)).astimezone(module.ZoneInfo("UTC")).timestamp()),
+        updated_at=int((now - timedelta(hours=1)).astimezone(module.ZoneInfo("UTC")).timestamp()),
+    )
+    seen = []
+
+    class FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now if tz else now.replace(tzinfo=None)
+
+        @classmethod
+        def fromtimestamp(cls, ts, tz=None):
+            return datetime.fromtimestamp(ts, tz=tz)
+
+        @classmethod
+        def fromisoformat(cls, value):
+            return datetime.fromisoformat(value)
+
+        @classmethod
+        def strptime(cls, date_string, fmt):
+            return datetime.strptime(date_string, fmt)
+
+    def fake_collect(thread_info):
+        seen.append(thread_info)
+        return []
+
+    monkeypatch.setattr(module, "datetime", FakeDateTime)
+    monkeypatch.setattr(
+        watcher,
+        "scan_rollout_index",
+        lambda force=False: (_ for _ in ()).throw(AssertionError("filesystem scan should not run")),
+    )
+    monkeypatch.setattr(watcher, "collect_rollout_candidates_for_thread", fake_collect)
+
+    assert watcher.collect_rollout_candidates(days=7) == []
+    assert len(seen) == 1
+    assert seen[0]["id"] == session_id
+    assert seen[0]["cwd"] == "/workspace/recent-session"
 
 
 def test_collect_log_candidates_ignores_probe_workspace_session(module, monkeypatch, base_dir, codex_home):
