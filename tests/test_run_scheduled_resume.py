@@ -55,13 +55,32 @@ Path(os.environ["CAPTURE_PATH"]).write_text(json.dumps({
         "CODEX_RESUME_EFFORT": os.environ.get("CODEX_RESUME_EFFORT"),
     },
 }, ensure_ascii=False, indent=2), encoding="utf-8")
+sys.exit(int(os.environ.get("FAKE_CODEX_EXIT_CODE", "0")))
 """,
         encoding="utf-8",
     )
     codex_path.chmod(0o755)
 
 
-def run_resume_script(app_dir: Path, tmp_path: Path):
+def make_fake_post_resume_shell(shell_path: Path) -> None:
+    shell_path.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+Path(os.environ["POST_SHELL_CAPTURE_PATH"]).write_text(json.dumps({
+    "argv": sys.argv[1:],
+    "cwd": os.getcwd(),
+}, ensure_ascii=False, indent=2), encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
+    shell_path.chmod(0o755)
+
+
+def run_resume_script(app_dir: Path, tmp_path: Path, fake_codex_exit_code: int = 0, capture_post_shell: bool = False):
     capture_path = tmp_path / "capture.json"
     home_dir = tmp_path / "home"
     home_dir.mkdir(exist_ok=True)
@@ -81,7 +100,15 @@ def run_resume_script(app_dir: Path, tmp_path: Path):
     env["CODEX_HOME"] = str(codex_home)
     env["SHELL"] = "/bin/bash"
     env["CAPTURE_PATH"] = str(capture_path)
+    env["FAKE_CODEX_EXIT_CODE"] = str(fake_codex_exit_code)
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    post_shell_capture_path = None
+    if capture_post_shell:
+        post_shell_capture_path = tmp_path / "post-shell.json"
+        post_shell_path = tmp_path / "post-shell"
+        make_fake_post_resume_shell(post_shell_path)
+        env["CODEX_AUTO_RESUME_INTERACTIVE_SHELL"] = str(post_shell_path)
+        env["POST_SHELL_CAPTURE_PATH"] = str(post_shell_capture_path)
 
     result = subprocess.run(
         [str(app_dir / "scripts" / "run_scheduled_resume.sh"), SESSION_ID, str(workspace)],
@@ -91,7 +118,10 @@ def run_resume_script(app_dir: Path, tmp_path: Path):
         env=env,
     )
     assert result.returncode == 0, result.stderr
-    return json.loads(capture_path.read_text(encoding="utf-8")), codex_home
+    post_shell = None
+    if post_shell_capture_path is not None:
+        post_shell = json.loads(post_shell_capture_path.read_text(encoding="utf-8"))
+    return json.loads(capture_path.read_text(encoding="utf-8")), codex_home, workspace, post_shell
 
 
 def test_run_scheduled_resume_uses_proxy_and_session_model_values(tmp_path):
@@ -135,7 +165,7 @@ def test_run_scheduled_resume_uses_proxy_and_session_model_values(tmp_path):
         ],
     )
 
-    data, _ = run_resume_script(app_dir, tmp_path)
+    data, _, workspace, _ = run_resume_script(app_dir, tmp_path)
 
     assert data["argv"] == [
         "resume",
@@ -147,6 +177,7 @@ def test_run_scheduled_resume_uses_proxy_and_session_model_values(tmp_path):
         SESSION_ID,
         "continue",
     ]
+    assert data["cwd"] == str(workspace)
     assert data["env"]["http_proxy"] == "http://127.0.0.1:1087"
     assert data["env"]["HTTP_PROXY"] == "http://127.0.0.1:1087"
     assert data["env"]["https_proxy"] == "http://127.0.0.1:1087"
@@ -160,7 +191,7 @@ def test_run_scheduled_resume_uses_proxy_and_session_model_values(tmp_path):
 def test_run_scheduled_resume_falls_back_to_defaults_without_config_or_session(tmp_path):
     app_dir = build_app(tmp_path)
 
-    data, _ = run_resume_script(app_dir, tmp_path)
+    data, _, workspace, _ = run_resume_script(app_dir, tmp_path)
 
     assert data["argv"] == [
         "resume",
@@ -172,6 +203,7 @@ def test_run_scheduled_resume_falls_back_to_defaults_without_config_or_session(t
         SESSION_ID,
         "continue",
     ]
+    assert data["cwd"] == str(workspace)
     assert data["env"]["http_proxy"] is None
     assert data["env"]["HTTP_PROXY"] is None
     assert data["env"]["https_proxy"] is None
@@ -204,7 +236,7 @@ def test_run_scheduled_resume_ignores_invalid_config_and_uses_session_model(tmp_
         ],
     )
 
-    data, _ = run_resume_script(app_dir, tmp_path)
+    data, _, workspace, _ = run_resume_script(app_dir, tmp_path)
 
     assert data["argv"] == [
         "resume",
@@ -216,6 +248,7 @@ def test_run_scheduled_resume_ignores_invalid_config_and_uses_session_model(tmp_
         SESSION_ID,
         "continue",
     ]
+    assert data["cwd"] == str(workspace)
     assert data["env"]["http_proxy"] is None
     assert data["env"]["HTTP_PROXY"] is None
     assert data["env"]["https_proxy"] is None
@@ -224,3 +257,19 @@ def test_run_scheduled_resume_ignores_invalid_config_and_uses_session_model(tmp_
     assert data["env"]["ALL_PROXY"] is None
     assert data["env"]["CODEX_RESUME_MODEL"] == "gpt-5.4-mini"
     assert data["env"]["CODEX_RESUME_EFFORT"] == "medium"
+
+
+def test_run_scheduled_resume_returns_to_original_cwd_after_interrupt(tmp_path):
+    app_dir = build_app(tmp_path)
+
+    data, _, workspace, post_shell = run_resume_script(
+        app_dir,
+        tmp_path,
+        fake_codex_exit_code=130,
+        capture_post_shell=True,
+    )
+
+    assert data["cwd"] == str(workspace)
+    assert post_shell is not None
+    assert post_shell["cwd"] == str(workspace)
+    assert post_shell["argv"] == ["-il"]

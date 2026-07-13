@@ -85,7 +85,7 @@ def run_resume_script(app_dir: Path, tmp_path: Path):
         env=env,
     )
     assert result.returncode == 0, result.stderr
-    return json.loads(capture_path.read_text(encoding="utf-8"))
+    return json.loads(capture_path.read_text(encoding="utf-8")), workspace
 
 
 def test_run_silent_resume_uses_non_interactive_exec_resume_and_proxy(tmp_path):
@@ -127,7 +127,7 @@ def test_run_silent_resume_uses_non_interactive_exec_resume_and_proxy(tmp_path):
         ],
     )
 
-    data = run_resume_script(app_dir, tmp_path)
+    data, workspace = run_resume_script(app_dir, tmp_path)
 
     assert data["argv"] == [
         "exec",
@@ -138,11 +138,13 @@ def test_run_silent_resume_uses_non_interactive_exec_resume_and_proxy(tmp_path):
         "model_reasoning_effort=medium",
         "-c",
         'approval_policy="never"',
+        "--dangerously-bypass-approvals-and-sandbox",
         "--dangerously-bypass-hook-trust",
         "--skip-git-repo-check",
         SESSION_ID,
         "continue",
     ]
+    assert data["cwd"] == str(workspace)
     assert data["env"]["HTTP_PROXY"] == "http://127.0.0.1:1087"
     assert data["env"]["HTTPS_PROXY"] == "http://127.0.0.1:1087"
     assert data["env"]["ALL_PROXY"] == "socks5://127.0.0.1:1080"

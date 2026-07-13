@@ -25,6 +25,7 @@ codex exec resume \
   -m "$CODEX_RESUME_MODEL" \
   -c "model_reasoning_effort=$CODEX_RESUME_EFFORT" \
   -c 'approval_policy="never"' \
+  --dangerously-bypass-approvals-and-sandbox \
   --dangerously-bypass-hook-trust \
   --skip-git-repo-check \
   "$CODEX_RESUME_SESSION_ID" \
