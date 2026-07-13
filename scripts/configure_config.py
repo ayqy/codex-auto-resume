@@ -11,6 +11,7 @@ from pathlib import Path
 VALID_SECTIONS = {"proxy", "workat", "resume"}
 WORKAT_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 VALID_RESUME_MODES = {"interactive", "silent"}
+DEFAULT_RESUME_MODE = "silent"
 
 
 def get_config_path() -> Path:
@@ -26,7 +27,7 @@ def default_config() -> dict:
         },
         "workat": [],
         "resume": {
-            "mode": "interactive",
+            "mode": DEFAULT_RESUME_MODE,
         },
     }
 
@@ -108,7 +109,7 @@ def prompt_proxy_section(config: dict) -> None:
 
 
 def normalize_resume_mode(value) -> str:
-    normalized = normalize_text(value).lower() or "interactive"
+    normalized = normalize_text(value).lower() or DEFAULT_RESUME_MODE
     if normalized not in VALID_RESUME_MODES:
         raise ValueError("resume mode must be interactive or silent")
     return normalized
@@ -172,7 +173,7 @@ def prompt_resume_section(config: dict) -> None:
             config["resume"]["mode"] = current_mode
             return
         if raw == "-":
-            config["resume"]["mode"] = "interactive"
+            config["resume"]["mode"] = DEFAULT_RESUME_MODE
             return
         try:
             config["resume"]["mode"] = normalize_resume_mode(raw)

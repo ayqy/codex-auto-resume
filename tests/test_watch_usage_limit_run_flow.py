@@ -129,23 +129,96 @@ def test_run_once_updates_state_and_triggers_due_jobs(module, monkeypatch, base_
 
     monkeypatch.setattr(module, "datetime", FakeDateTime)
 
-    class Result:
+    launches = []
+
+    def fake_popen(command, stdout, stderr, start_new_session):
+        launches.append(
+            {
+                "command": command,
+                "start_new_session": start_new_session,
+                "log_path": stdout.name,
+            }
+        )
+
+        class Proc:
+            pid = 123
+
+        return Proc()
+
+    class ProbeReady:
         returncode = 0
+        stdout = "ok"
         stderr = ""
-        stdout = ""
 
-    calls = []
-
-    def fake_run(command, capture_output, text, check, timeout=None):
-        calls.append(command)
-        return Result()
-
-    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(watcher, "run_probe_command", lambda: ProbeReady())
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
 
     assert watcher.run_once() == 0
     assert watcher.state["last_detected_session_id"] is not None
     assert watcher.state["triggered_jobs"]
-    assert calls
+    assert watcher.state["triggered_jobs"][-1]["resume_mode"] == "silent"
+    assert launches
+    assert launches[0]["command"][:2] == ["bash", str((base_dir / "scripts" / "run_silent_resume.sh").resolve())]
+
+
+def test_trigger_due_jobs_defaults_to_silent_mode_without_config(module, monkeypatch, base_dir, codex_home):
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    watcher = module.UsageLimitWatcher(base_dir, cleanup_on_init=False)
+    watcher.state["pending_jobs"] = [
+        {
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "retry_at": "2026-06-25T08:05:00+08:00",
+            "scheduled_run_at": "2026-06-25T08:15:00+08:00",
+            "error_log_id": "limit-1",
+            "status": "pending",
+            "cwd": "/workspace/sample-app",
+        }
+    ]
+
+    class FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = datetime(2026, 6, 25, 8, 30, 0, tzinfo=watcher.local_tz)
+            return current if tz else current.replace(tzinfo=None)
+
+        @classmethod
+        def fromtimestamp(cls, ts, tz=None):
+            return datetime.fromtimestamp(ts, tz=tz)
+
+        @classmethod
+        def fromisoformat(cls, value):
+            return datetime.fromisoformat(value)
+
+        @classmethod
+        def strptime(cls, date_string, fmt):
+            return datetime.strptime(date_string, fmt)
+
+    monkeypatch.setattr(module, "datetime", FakeDateTime)
+
+    launches = []
+
+    def fake_popen(command, stdout, stderr, start_new_session):
+        launches.append(
+            {
+                "command": command,
+                "start_new_session": start_new_session,
+                "log_path": stdout.name,
+            }
+        )
+
+        class Proc:
+            pid = 123
+
+        return Proc()
+
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
+
+    summary = watcher.trigger_due_jobs()
+
+    assert summary["attempted"] == 1
+    assert summary["triggered"] == 1
+    assert watcher.state["triggered_jobs"][-1]["resume_mode"] == "silent"
+    assert launches[0]["command"][:2] == ["bash", str((base_dir / "scripts" / "run_silent_resume.sh").resolve())]
 
 
 def test_trigger_due_jobs_uses_silent_mode_when_configured(module, monkeypatch, base_dir, codex_home):
@@ -240,18 +313,18 @@ def test_force_latest_success_and_failure(module, monkeypatch, base_dir, codex_h
     )
     monkeypatch.setattr(watcher, "inspect_latest_error", lambda: candidate)
 
-    class Success:
-        returncode = 0
-        stderr = ""
-
-    monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: Success())
+    monkeypatch.setattr(
+        watcher,
+        "launch_resume_job",
+        lambda job: {"ok": True, "stderr": "", "mode": "silent", "log_path": None},
+    )
     assert watcher.force_latest() == 0
 
-    class Failure:
-        returncode = 1
-        stderr = "boom"
-
-    monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: Failure())
+    monkeypatch.setattr(
+        watcher,
+        "launch_resume_job",
+        lambda job: {"ok": False, "stderr": "boom", "mode": "silent", "log_path": None},
+    )
     assert watcher.force_latest() == 1
 
 
@@ -913,22 +986,28 @@ def test_run_once_suppresses_due_prewarm_when_resume_runs(module, monkeypatch, b
         returncode = 0
         stderr = ""
 
-    resume_calls = []
-    prewarm_calls = []
+    resume_launches = []
 
-    def fake_run(command, capture_output, text, check, timeout=None):
-        if len(command) >= 2 and str(command[1]).endswith("open_terminal_and_resume.py"):
-            resume_calls.append(command)
-            return Result()
-        prewarm_calls.append(command)
-        return Result()
+    def fake_popen(command, stdout, stderr, start_new_session):
+        resume_launches.append(
+            {
+                "command": command,
+                "start_new_session": start_new_session,
+                "log_path": stdout.name,
+            }
+        )
 
-    monkeypatch.setattr(module.subprocess, "run", fake_run)
+        class Proc:
+            pid = 123
+
+        return Proc()
+
+    monkeypatch.setattr(watcher, "run_probe_command", lambda: Result())
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
 
     assert watcher.run_once() == 0
-    assert resume_calls
-    assert len(prewarm_calls) == 1
-    assert str(prewarm_calls[0][0]).endswith("run_workat_prewarm.sh")
+    assert len(resume_launches) == 1
+    assert resume_launches[0]["command"][:2] == ["bash", str((base_dir / "scripts" / "run_silent_resume.sh").resolve())]
     assert watcher.state["prewarm_jobs"]
     assert watcher.state["prewarm_jobs"][0]["status"] == "expired"
     assert watcher.state["prewarm_jobs"][0]["status_reason"] == "suppressed_by_resume_priority"

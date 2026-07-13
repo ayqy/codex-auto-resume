@@ -56,7 +56,7 @@
     ```bash
     make config
     ```
-    该命令会以交互方式把终端代理、可选的 `workat` 时间表以及 resume 模式写入 `config.json`。代理包括 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY`。`workat` 支持一个或多个 `HH:MM` 时间点，例如 `10:30,14:00`。resume 模式支持 `interactive` 和 `silent`。
+    该命令会以交互方式把终端代理、可选的 `workat` 时间表以及 resume 模式写入 `config.json`。代理包括 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY`。`workat` 支持一个或多个 `HH:MM` 时间点，例如 `10:30,14:00`。resume 模式支持 `interactive` 和 `silent`，默认值是 `silent`。
 
 4.  **启动监控**:
     ```bash
@@ -70,10 +70,10 @@
 
 | 命令 | 描述 |
 |---|---|
-| `make config` | 交互式配置 `config.json` 中的代理、`workat` 和 resume 模式。 |
+| `make config` | 交互式配置 `config.json` 中的代理、`workat` 和 resume 模式，默认 resume 模式为 `silent`。 |
 | `make config proxy` | 配置 `config.json` 中的 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY`。 |
 | `make config workat` | 使用 `HH:MM` 格式配置 `config.json` 中一个或多个每日 `workat` 时间点。 |
-| `make config resume` | 配置 auto resume 使用交互式终端还是静默后台模式。 |
+| `make config resume` | 配置 auto resume 使用交互式终端还是静默后台模式，默认值为 `silent`。 |
 | `make run` | **(最重要)** 启动后台监控进程，持续监测用量限制并自动为您恢复会话。控制台输出会刻意保持精简，详细诊断继续写入 `tmp/logs/watcher.log`。 |
 | `make check` | 按需手动执行一次同样的静默可用性探针，用来检查额度是否已经恢复。 |
 | `make today` | 显示您今天的 token 使用量、活跃时间及预估开销的详细报告。 |
@@ -94,7 +94,7 @@
     > 仅更新 `workat` 时间表，例如 `10:30,14:00`。
 
 -   `make config resume`
-    > 在 `interactive` 终端模式和 `silent` 非交互模式之间切换 auto resume。
+    > 在 `interactive` 终端模式和 `silent` 非交互模式之间切换 auto resume，默认值为 `silent`。
 
 -   `make today`
     > 获取您今天的用量摘要。

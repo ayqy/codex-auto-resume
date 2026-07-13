@@ -35,7 +35,7 @@ def test_load_config_returns_defaults_when_missing(module, tmp_path):
         },
         "workat": [],
         "resume": {
-            "mode": "interactive",
+            "mode": "silent",
         },
     }
 
@@ -89,7 +89,7 @@ def test_main_reads_current_values_and_echoes_proxy_prompts(module, monkeypatch,
                 },
                 "workat": ["14:00", "10:30"],
                 "resume": {
-                    "mode": "interactive",
+                    "mode": "silent",
                     "model": "legacy-value",
                     "effort": "legacy-value",
                 },
@@ -116,7 +116,7 @@ def test_main_reads_current_values_and_echoes_proxy_prompts(module, monkeypatch,
     assert "HTTPS proxy [http://127.0.0.1:1087]" in output
     assert "ALL_PROXY [socks5://127.0.0.1:1080]" in output
     assert "Workat times (HH:MM, comma-separated) [10:30,14:00]" in output
-    assert "Resume mode (interactive/silent) [interactive]" in output
+    assert "Resume mode (interactive/silent) [silent]" in output
     data = json.loads(config_path.read_text(encoding="utf-8"))
     assert data == {
         "proxy": {
@@ -126,11 +126,42 @@ def test_main_reads_current_values_and_echoes_proxy_prompts(module, monkeypatch,
         },
         "workat": ["10:30", "14:00"],
         "resume": {
-            "mode": "interactive",
+            "mode": "silent",
             "model": "legacy-value",
             "effort": "legacy-value",
         },
     }
+
+
+def test_main_resume_dash_resets_to_default_silent(module, monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "proxy": {
+                    "http": "",
+                    "https": "",
+                    "all": "",
+                },
+                "workat": [],
+                "resume": {
+                    "mode": "interactive",
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(module, "get_config_path", lambda: config_path)
+    answers = iter(["-"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    assert module.main(["resume"]) == 0
+
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    assert data["resume"]["mode"] == "silent"
 
 
 def test_main_updates_workat_section_sorts_and_dedupes(module, monkeypatch, tmp_path):

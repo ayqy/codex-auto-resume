@@ -56,7 +56,7 @@ Your focus is shattered. You have to remember to come back in an hour to resume 
     ```bash
     make config
     ```
-    This interactively writes your terminal proxy settings, optional `workat` schedule, and resume mode to `config.json`. Proxy settings include `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`. `workat` accepts one or more `HH:MM` values such as `10:30,14:00`. Resume mode can be `interactive` or `silent`.
+    This interactively writes your terminal proxy settings, optional `workat` schedule, and resume mode to `config.json`. Proxy settings include `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`. `workat` accepts one or more `HH:MM` values such as `10:30,14:00`. Resume mode can be `interactive` or `silent`, and the default is `silent`.
 
 4.  **Start the watcher**:
     ```bash
@@ -70,10 +70,10 @@ Your focus is shattered. You have to remember to come back in an hour to resume 
 
 | Command      | Description                                                                          |
 |--------------|--------------------------------------------------------------------------------------|
-| `make config`| Interactively configure proxy, `workat`, and resume mode in `config.json`. |
+| `make config`| Interactively configure proxy, `workat`, and resume mode in `config.json` (default resume mode: `silent`). |
 | `make config proxy`| Configure the `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` values in `config.json`. |
 | `make config workat`| Configure one or more daily `workat` values in `config.json` using `HH:MM` format. |
-| `make config resume`| Configure whether auto-resume uses an interactive terminal or silent background mode. |
+| `make config resume`| Configure whether auto-resume uses an interactive terminal or silent background mode. The default is `silent`. |
 | `make run`   | **(Most important)** Starts the background watcher to monitor for usage limits and resume your session automatically. Console output is intentionally concise; detailed diagnostics continue to be written to `tmp/logs/watcher.log`. |
 | `make check` | Runs the same silent availability probe once on demand, so you can manually check whether usage has recovered. |
 | `make today` | Shows a detailed report of your token usage, active time, and estimated costs for today. |
@@ -94,7 +94,7 @@ Your focus is shattered. You have to remember to come back in an hour to resume 
     > Update only the `workat` schedule, for example `10:30,14:00`.
 
 -   `make config resume`
-    > Switch auto-resume between `interactive` terminal mode and `silent` non-interactive mode.
+    > Switch auto-resume between `interactive` terminal mode and `silent` non-interactive mode. The default is `silent`.
 
 -   `make today`
     > Get a summary of your usage for today.

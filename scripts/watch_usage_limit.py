@@ -29,6 +29,7 @@ PREWARM_LATE_WINDOW = timedelta(minutes=5)
 PREWARM_TIMEOUT_SECONDS = 300
 PREWARM_WORKSPACE_NAME = "prewarm-workspace"
 RESUME_MODES = {"interactive", "silent"}
+DEFAULT_RESUME_MODE = "silent"
 PROBE_LIMIT_MARKERS = (
     "You've hit your usage limit",
     "The usage limit has been reached",
@@ -206,14 +207,14 @@ class UsageLimitWatcher:
         return sorted(unique.keys())
 
     def normalize_resume_mode(self, value):
-        normalized = str(value or "interactive").strip().lower()
+        normalized = str(value or DEFAULT_RESUME_MODE).strip().lower()
         if normalized not in RESUME_MODES:
             raise ValueError("config.resume.mode must be interactive or silent")
         return normalized
 
     def load_runtime_config(self):
         if not self.config_path.exists():
-            return {"workat": [], "resume_mode": "interactive"}
+            return {"workat": [], "resume_mode": DEFAULT_RESUME_MODE}
         try:
             raw = json.loads(self.config_path.read_text(encoding="utf-8"))
             if not isinstance(raw, dict):
@@ -227,7 +228,7 @@ class UsageLimitWatcher:
             }
         except Exception as exc:
             self.log_config_warning_once("failed to load runtime config", exc)
-            return {"workat": [], "resume_mode": "interactive"}
+            return {"workat": [], "resume_mode": DEFAULT_RESUME_MODE}
 
     def prewarm_workspace_dir(self):
         return (self.tmp_dir / PREWARM_WORKSPACE_NAME).resolve()
@@ -246,7 +247,7 @@ class UsageLimitWatcher:
         return self.is_probe_workspace_cwd(thread_info.get("cwd"))
 
     def current_resume_mode(self):
-        return self.load_runtime_config().get("resume_mode", "interactive")
+        return self.load_runtime_config().get("resume_mode", DEFAULT_RESUME_MODE)
 
     def connect(self, path: Path):
         uri = f"file:{path}?mode=ro"
