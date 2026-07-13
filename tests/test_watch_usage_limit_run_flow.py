@@ -765,6 +765,62 @@ def test_run_once_keeps_future_pending_job_when_candidates_temporarily_missing(m
     assert watcher.state["pending_jobs"][0]["status"] == "pending"
 
 
+def test_run_once_schedules_pending_job_from_model_capacity_error(module, monkeypatch, base_dir, codex_home):
+    create_logs_db(
+        codex_home / "logs_2.sqlite",
+        [
+            {
+                "id": 3001,
+                "ts": int(datetime(2026, 7, 13, 1, 54, 51, tzinfo=module.ZoneInfo("UTC")).timestamp()),
+                "level": "INFO",
+                "thread_id": "22222222-2222-4222-8222-222222222222",
+                "process_uuid": "pid:test:capacity",
+                "feedback_log_body": (
+                    "session_loop{thread_id=22222222-2222-4222-8222-222222222222}: "
+                    "run_turn: Turn error: Selected model is at capacity. Please try a different model."
+                ),
+            }
+        ],
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    watcher = module.UsageLimitWatcher(base_dir, cleanup_on_init=False)
+    now = datetime(2026, 7, 13, 9, 58, 0, tzinfo=watcher.local_tz)
+
+    class FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now if tz else now.replace(tzinfo=None)
+
+        @classmethod
+        def fromtimestamp(cls, ts, tz=None):
+            return datetime.fromtimestamp(ts, tz=tz)
+
+        @classmethod
+        def fromisoformat(cls, value):
+            return datetime.fromisoformat(value)
+
+        @classmethod
+        def strptime(cls, date_string, fmt):
+            return datetime.strptime(date_string, fmt)
+
+    monkeypatch.setattr(module, "datetime", FakeDateTime)
+
+    class ProbeLimited:
+        returncode = 1
+        stdout = ""
+        stderr = "You've hit your usage limit"
+
+    monkeypatch.setattr(watcher, "run_probe_command", lambda: ProbeLimited())
+
+    assert watcher.run_once() == 0
+    assert len(watcher.state["pending_jobs"]) == 1
+    job = watcher.state["pending_jobs"][0]
+    assert job["status"] == "pending"
+    assert job["origin_reason"] == "explicit model capacity turn error"
+    assert job["origin_retry_at"] == "2026-07-13T09:54:51+08:00"
+    assert job["scheduled_run_at"] == "2026-07-13T10:04:51+08:00"
+
+
 def test_run_once_schedules_pending_job_from_rollout_premium_credits_candidate_when_logs_absent(
     module, monkeypatch, base_dir, codex_home
 ):

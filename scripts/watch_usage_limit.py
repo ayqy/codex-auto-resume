@@ -38,6 +38,7 @@ PROBE_LIMIT_MARKERS = (
     'X-Codex-Primary-Used-Percent":"100"',
     'X-Codex-Secondary-Used-Percent":"100"',
 )
+MODEL_CAPACITY_TEXT = "Selected model is at capacity. Please try a different model."
 
 
 @dataclass
@@ -924,6 +925,7 @@ class UsageLimitWatcher:
                 or feedback_log_body like '%"type":"usage_limit_reached"%'
                 or feedback_log_body like '%"status_code":429%'
                 or feedback_log_body like '%X-Codex-Primary-Used-Percent":"100"%'
+                or feedback_log_body like '%Selected model is at capacity. Please try a different model.%'
               )
         """
         clauses = []
@@ -1022,8 +1024,19 @@ class UsageLimitWatcher:
         )
         if any(marker in text for marker in noise_markers):
             return None
-        if "run_sampling_request" in text and "You've hit your usage limit" not in text and '"type":"usage_limit_reached"' not in text:
+        if (
+            "run_sampling_request" in text
+            and "You've hit your usage limit" not in text
+            and '"type":"usage_limit_reached"' not in text
+            and MODEL_CAPACITY_TEXT not in text
+        ):
             return None
+        if f"run_turn: Turn error: {MODEL_CAPACITY_TEXT}" in text:
+            return {
+                "priority": 1,
+                "signal_strength": "strong",
+                "reason": "explicit model capacity turn error",
+            }
         if (
             "run_turn: Turn error: You've hit your usage limit" in text
             or "startup_prewarm.resolve: startup websocket prewarm setup failed: You've hit your usage limit"
@@ -1304,6 +1317,8 @@ class UsageLimitWatcher:
             if reset_ts:
                 retry_at = datetime.fromtimestamp(reset_ts, tz=ZoneInfo("UTC")).astimezone(self.local_tz)
                 return retry_at, source
+        if MODEL_CAPACITY_TEXT in target_row.feedback_log_body:
+            return event_dt, "model_capacity.default_now"
         return None, None
 
     def group_rows_by_session(self, rows):
@@ -2267,7 +2282,7 @@ class UsageLimitWatcher:
 
     def is_usage_limit_text(self, text: str):
         lowered = text.lower()
-        return "usage limit" in lowered or "try again at" in lowered
+        return "usage limit" in lowered or "try again at" in lowered or MODEL_CAPACITY_TEXT.lower() in lowered
 
     def rollout_entry_has_normal_agent_message(self, obj: dict):
         payload = obj.get("payload", {})

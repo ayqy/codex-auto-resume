@@ -1014,6 +1014,37 @@ def test_collect_rollout_candidates_for_thread_ignores_probe_workspace_session(m
     assert candidates == []
 
 
+def test_collect_log_candidates_detects_model_capacity_turn_error(module, monkeypatch, base_dir, codex_home):
+    create_logs_db(
+        codex_home / "logs_2.sqlite",
+        [
+            {
+                "id": 2001,
+                "ts": int(datetime(2026, 7, 13, 1, 54, 51, tzinfo=module.ZoneInfo("UTC")).timestamp()),
+                "level": "INFO",
+                "thread_id": "22222222-2222-4222-8222-222222222222",
+                "process_uuid": "pid:test:capacity",
+                "feedback_log_body": (
+                    "session_loop{thread_id=22222222-2222-4222-8222-222222222222}: "
+                    "run_turn: Turn error: Selected model is at capacity. Please try a different model."
+                ),
+            }
+        ],
+    )
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+
+    candidates = watcher.collect_log_candidates(days=30, session_id="22222222-2222-4222-8222-222222222222", limit=20)
+
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate["session_id"] == "22222222-2222-4222-8222-222222222222"
+    assert candidate["reason"] == "explicit model capacity turn error"
+    assert candidate["retry_source"] == "model_capacity.default_now"
+    assert candidate["retry_at"].isoformat() == "2026-07-13T09:54:51+08:00"
+    assert candidate["scheduled_run_at"].isoformat() == "2026-07-13T10:04:51+08:00"
+    assert candidate["limit_scope"] == "session_window"
+
+
 def test_maybe_release_pending_jobs_via_probe_releases_all_pending_jobs_after_success(
     module, monkeypatch, base_dir, codex_home
 ):

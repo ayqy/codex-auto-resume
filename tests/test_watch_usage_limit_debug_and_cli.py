@@ -218,3 +218,20 @@ def test_parse_retry_time_supports_long_date_message_format(module, monkeypatch,
 
     assert retry_at.isoformat() == "2026-07-11T00:59:00+08:00"
     assert source == "message"
+
+
+def test_parse_retry_time_uses_event_time_for_model_capacity_error(module, monkeypatch, base_dir, codex_home):
+    watcher = module.UsageLimitWatcher(base_dir, cleanup_on_init=False)
+    row = module.LogRow(
+        id=3,
+        ts=int(datetime(2026, 7, 13, 1, 54, 51, tzinfo=module.ZoneInfo("UTC")).timestamp()),
+        level="INFO",
+        thread_id="sample-session",
+        process_uuid="pid:test:sample",
+        feedback_log_body="run_turn: Turn error: Selected model is at capacity. Please try a different model.",
+    )
+
+    retry_at, source = watcher.parse_retry_time([row], row)
+
+    assert retry_at.isoformat() == "2026-07-13T09:54:51+08:00"
+    assert source == "model_capacity.default_now"
