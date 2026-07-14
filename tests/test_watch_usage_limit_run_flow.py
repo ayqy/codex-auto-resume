@@ -982,6 +982,143 @@ def test_run_once_schedules_pending_job_from_rollout_premium_credits_candidate_w
     assert job["scheduled_run_at"] == "2026-07-17T06:14:48+08:00"
 
 
+def test_run_once_replaces_global_governed_pending_when_newer_session_limit_has_farther_retry(
+    module, monkeypatch, base_dir, codex_home
+):
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    watcher = module.UsageLimitWatcher(base_dir, cleanup_on_init=False)
+    session_id = "same-session"
+    old_job = {
+        "session_id": session_id,
+        "retry_at": "2026-07-18T14:48:57+08:00",
+        "scheduled_run_at": "2026-07-18T14:58:57+08:00",
+        "error_log_id": "rollout:same-session:hard-stop",
+        "status": "pending",
+        "cwd": "/workspace/same-session",
+        "origin_source": "logs",
+        "origin_error_id": "same-session-5h",
+        "origin_event_at": "2026-07-14T02:13:03+08:00",
+        "origin_retry_at": "2026-07-20T09:18:00+08:00",
+        "origin_scheduled_run_at": "2026-07-20T09:28:00+08:00",
+        "origin_retry_source": "message",
+        "origin_reason": "explicit usage limit turn error",
+        "origin_limit_scope": "session_window",
+        "origin_candidate_family": "session_window_limit",
+        "governing_source": "rollout",
+        "governing_session_id": session_id,
+        "governing_error_id": "rollout:same-session:hard-stop",
+        "governing_event_at": "2026-07-12T06:34:55+08:00",
+        "governing_retry_at": "2026-07-18T14:48:57+08:00",
+        "governing_scheduled_run_at": "2026-07-18T14:58:57+08:00",
+        "governing_retry_source": "inferred.previous_secondary_reset_at",
+        "governing_reason": "rollout premium hard stop inferred from previous secondary reset",
+        "governing_limit_scope": "global_window",
+        "governing_candidate_family": "global_window_limit",
+        "governing_rollout_path": "/tmp/hard-stop.jsonl",
+        "created_at": "2026-07-14T02:34:11.520291+08:00",
+        "updated_at": "2026-07-14T02:34:11.520291+08:00",
+    }
+    watcher.state["pending_jobs"] = [old_job]
+    now = datetime(2026, 7, 14, 2, 34, 19, tzinfo=watcher.local_tz)
+
+    class FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now if tz else now.replace(tzinfo=None)
+
+        @classmethod
+        def fromtimestamp(cls, ts, tz=None):
+            return datetime.fromtimestamp(ts, tz=tz)
+
+        @classmethod
+        def fromisoformat(cls, value):
+            return datetime.fromisoformat(value)
+
+        @classmethod
+        def strptime(cls, date_string, fmt):
+            return datetime.strptime(date_string, fmt)
+
+    monkeypatch.setattr(module, "datetime", FakeDateTime)
+    monkeypatch.setattr(watcher, "inspect_latest_error", lambda confirmed_candidates=None: None)
+
+    hard_stop = watcher.normalize_candidate_metadata(
+        {
+            "source": "rollout",
+            "priority": 2,
+            "signal_strength": "rollout",
+            "event_dt": datetime(2026, 7, 12, 6, 34, 55, tzinfo=watcher.local_tz),
+            "error_id": "rollout:same-session:hard-stop",
+            "session_id": session_id,
+            "retry_at": datetime(2026, 7, 18, 14, 48, 57, tzinfo=watcher.local_tz),
+            "scheduled_run_at": datetime(2026, 7, 18, 14, 58, 57, tzinfo=watcher.local_tz),
+            "thread_info": watcher.default_thread_info(session_id),
+            "message": "premium hard stop",
+            "message_preview": "premium hard stop",
+            "retry_source": "inferred.previous_secondary_reset_at",
+            "reason": "rollout premium hard stop inferred from previous secondary reset",
+            "limit_kind": "rollout_premium_credits_exhausted",
+            "limit_id": "premium",
+            "primary_used_percent": 100.0,
+            "secondary_used_percent": 100.0,
+            "credits_has": False,
+            "credits_balance": "0",
+            "terminal_task_complete_without_last_agent_message": True,
+            "hard_stop_global_window": True,
+        }
+    )
+    newer_session_limit = watcher.normalize_candidate_metadata(
+        {
+            "source": "logs",
+            "priority": 1,
+            "signal_strength": "strong",
+            "event_dt": datetime(2026, 7, 14, 2, 13, 3, tzinfo=watcher.local_tz),
+            "error_id": "same-session-5h",
+            "session_id": session_id,
+            "retry_at": datetime(2026, 7, 20, 9, 18, 0, tzinfo=watcher.local_tz),
+            "scheduled_run_at": datetime(2026, 7, 20, 9, 28, 0, tzinfo=watcher.local_tz),
+            "thread_info": watcher.default_thread_info(session_id),
+            "message": "5d limit",
+            "message_preview": "5d limit",
+            "retry_source": "message",
+            "reason": "explicit usage limit turn error",
+            "limit_kind": "log_turn_error",
+            "limit_id": "codex",
+            "primary_used_percent": 100.0,
+            "secondary_used_percent": 31.0,
+            "credits_has": False,
+            "credits_balance": "0",
+        }
+    )
+    monkeypatch.setattr(
+        watcher,
+        "collect_confirmed_candidates",
+        lambda days=14, log_limit=5000, rollout_limit_threads=400: ([hard_stop, newer_session_limit], True),
+    )
+
+    class ProbeLimited:
+        returncode = 1
+        stdout = ""
+        stderr = "You've hit your usage limit"
+
+    monkeypatch.setattr(watcher, "run_probe_command", lambda: ProbeLimited())
+
+    assert watcher.run_once() == 0
+
+    replaced_jobs = [job for job in watcher.state["pending_jobs"] if job["status"] == "replaced"]
+    pending_jobs = [job for job in watcher.state["pending_jobs"] if job["status"] == "pending"]
+
+    assert len(replaced_jobs) == 1
+    assert replaced_jobs[0]["replacement_scheduled_run_at"] == "2026-07-20T09:28:00+08:00"
+    assert len(pending_jobs) == 1
+    job = pending_jobs[0]
+    assert job["session_id"] == session_id
+    assert job["retry_at"] == "2026-07-20T09:18:00+08:00"
+    assert job["scheduled_run_at"] == "2026-07-20T09:28:00+08:00"
+    assert job["governing_limit_scope"] == "session_window"
+    assert job["governing_session_id"] == session_id
+    assert job["governing_error_id"] == "same-session-5h"
+
+
 def test_run_once_probe_success_flushes_pending_before_prewarm(module, monkeypatch, base_dir, codex_home):
     write_config(base_dir, ["10:30"])
     monkeypatch.setenv("CODEX_HOME", str(codex_home))

@@ -271,11 +271,21 @@ class UsageLimitWatcher:
         conn.row_factory = sqlite3.Row
         return conn
 
-    def sort_key_for_max(self, candidate: dict):
+    def candidate_precedence_key(self, candidate: Optional[dict]):
+        if not candidate:
+            zero = datetime.fromtimestamp(0, tz=ZoneInfo("UTC"))
+            return (zero, zero, zero, 0, 0, 0, "")
         event_dt = candidate.get("event_dt") or datetime.fromtimestamp(0, tz=ZoneInfo("UTC"))
-        priority = candidate.get("priority", 99)
+        retry_at = candidate.get("retry_at") or datetime.fromtimestamp(0, tz=ZoneInfo("UTC"))
+        scheduled_run_at = candidate.get("scheduled_run_at") or datetime.fromtimestamp(0, tz=ZoneInfo("UTC"))
+        scope_rank = self.candidate_scope_rank(candidate)
+        family_rank = self.candidate_family_rank(candidate)
+        trust_rank = self.candidate_trust_rank(candidate)
         error_id = str(candidate.get("error_id", ""))
-        return (event_dt, -priority, error_id)
+        return (event_dt, retry_at, scheduled_run_at, scope_rank, family_rank, trust_rank, error_id)
+
+    def sort_key_for_max(self, candidate: dict):
+        return self.candidate_precedence_key(candidate)
 
     def sort_key_for_retry_desc(self, candidate: dict):
         retry_at = candidate.get("retry_at") or datetime.fromtimestamp(0, tz=ZoneInfo("UTC"))
@@ -285,14 +295,7 @@ class UsageLimitWatcher:
         return (retry_at, event_dt, -priority, error_id)
 
     def same_session_candidate_sort_key(self, candidate: dict):
-        event_dt = candidate.get("event_dt") or datetime.fromtimestamp(0, tz=ZoneInfo("UTC"))
-        trust_rank = self.candidate_trust_rank(candidate)
-        scope_rank = self.candidate_scope_rank(candidate)
-        family_rank = self.candidate_family_rank(candidate)
-        retry_at = candidate.get("retry_at") or datetime.fromtimestamp(0, tz=ZoneInfo("UTC"))
-        scheduled_run_at = candidate.get("scheduled_run_at") or datetime.fromtimestamp(0, tz=ZoneInfo("UTC"))
-        error_id = str(candidate.get("error_id", ""))
-        return (event_dt, trust_rank, scope_rank, family_rank, retry_at, scheduled_run_at, error_id)
+        return self.candidate_precedence_key(candidate)
 
     def candidate_trust_rank(self, candidate: dict):
         source = candidate.get("source")
@@ -310,22 +313,8 @@ class UsageLimitWatcher:
             return current
         if current is None:
             return challenger
-        if challenger.get("session_id") and challenger.get("session_id") == current.get("session_id"):
-            if self.same_session_candidate_sort_key(challenger) != self.same_session_candidate_sort_key(current):
-                return (
-                    challenger
-                    if self.same_session_candidate_sort_key(challenger) > self.same_session_candidate_sort_key(current)
-                    else current
-                )
-            return challenger if str(challenger.get("error_id", "")) > str(current.get("error_id", "")) else current
-        if self.candidate_scope_rank(challenger) != self.candidate_scope_rank(current):
-            return challenger if self.candidate_scope_rank(challenger) > self.candidate_scope_rank(current) else current
-        if self.candidate_family_rank(challenger) != self.candidate_family_rank(current):
-            return challenger if self.candidate_family_rank(challenger) > self.candidate_family_rank(current) else current
-        if self.candidate_trust_rank(challenger) != self.candidate_trust_rank(current):
-            return challenger if self.candidate_trust_rank(challenger) > self.candidate_trust_rank(current) else current
-        if self.sort_key_for_max(challenger) != self.sort_key_for_max(current):
-            return challenger if self.sort_key_for_max(challenger) > self.sort_key_for_max(current) else current
+        if self.candidate_precedence_key(challenger) != self.candidate_precedence_key(current):
+            return challenger if self.candidate_precedence_key(challenger) > self.candidate_precedence_key(current) else current
         return challenger if str(challenger.get("error_id", "")) > str(current.get("error_id", "")) else current
 
     def is_limit_fully_used(self, value) -> bool:
@@ -410,17 +399,26 @@ class UsageLimitWatcher:
             return current
         if current is None:
             return challenger
-        challenger_time = challenger.get("scheduled_run_at") or challenger.get("retry_at")
-        current_time = current.get("scheduled_run_at") or current.get("retry_at")
-        if challenger_time != current_time:
-            return challenger if challenger_time > current_time else current
-        if self.candidate_family_rank(challenger) != self.candidate_family_rank(current):
-            return challenger if self.candidate_family_rank(challenger) > self.candidate_family_rank(current) else current
-        if self.candidate_trust_rank(challenger) != self.candidate_trust_rank(current):
-            return challenger if self.candidate_trust_rank(challenger) > self.candidate_trust_rank(current) else current
-        if self.sort_key_for_max(challenger) != self.sort_key_for_max(current):
-            return challenger if self.sort_key_for_max(challenger) > self.sort_key_for_max(current) else current
+        if self.candidate_precedence_key(challenger) != self.candidate_precedence_key(current):
+            return challenger if self.candidate_precedence_key(challenger) > self.candidate_precedence_key(current) else current
         return challenger if str(challenger.get("error_id", "")) > str(current.get("error_id", "")) else current
+
+    def choose_governing_candidate_for_session(self, session_candidate: Optional[dict], global_candidate: Optional[dict]):
+        if session_candidate is None:
+            return global_candidate
+        if global_candidate is None:
+            return session_candidate
+        if self.candidate_precedence_key(global_candidate) != self.candidate_precedence_key(session_candidate):
+            return (
+                global_candidate
+                if self.candidate_precedence_key(global_candidate) > self.candidate_precedence_key(session_candidate)
+                else session_candidate
+            )
+        return (
+            global_candidate
+            if str(global_candidate.get("error_id", "")) > str(session_candidate.get("error_id", ""))
+            else session_candidate
+        )
 
     def is_candidate_expired(self, candidate: dict, now: datetime):
         scheduled_run_at = candidate.get("scheduled_run_at")
@@ -2068,7 +2066,7 @@ class UsageLimitWatcher:
             if resume_checkpoint and self.session_has_normal_agent_activity_after(session_id, resume_checkpoint):
                 prune_reasons_by_session[session_id] = "session_already_resumed_manually"
                 continue
-            governing_candidate = global_governing_candidate or candidate
+            governing_candidate = self.choose_governing_candidate_for_session(candidate, global_governing_candidate)
             desired_jobs_by_session[session_id] = self.build_job_from_candidate(candidate, governing_candidate, now)
         return desired_jobs_by_session, global_governing_candidate, active_candidates, logs_available, prune_reasons_by_session
 
@@ -2602,9 +2600,13 @@ class UsageLimitWatcher:
         if latest_result and not active_candidates:
             self.log("detected retry time is already in the past; mark as expired and skip scheduling", console=False)
         if active_candidates:
+            global_governed_sessions = sum(
+                1 for job in desired_jobs_by_session.values() if job.get("governing_limit_scope") == "global_window"
+            )
             self.log(
                 f"reconciling pending jobs sessions={len(desired_jobs_by_session)} "
-                f"global_override={'yes' if global_governing_candidate else 'no'}",
+                f"global_candidate={'yes' if global_governing_candidate else 'no'} "
+                f"global_governed_sessions={global_governed_sessions}",
                 console=False,
             )
         self.reconcile_pending_jobs(

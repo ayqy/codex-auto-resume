@@ -210,9 +210,9 @@ def test_build_desired_pending_jobs_handles_global_override(module, monkeypatch,
     assert prune_reasons == {}
     assert global_candidate["limit_scope"] == "global_window"
     job = desired_jobs["11111111-1111-4111-8111-111111111111"]
-    assert job["governing_limit_scope"] == "global_window"
-    assert job["governing_session_id"] == "hard-stop-session"
-    assert job["scheduled_run_at"] == "2026-07-18T14:58:57+08:00"
+    assert job["governing_limit_scope"] == "session_window"
+    assert job["governing_session_id"] == "11111111-1111-4111-8111-111111111111"
+    assert job["scheduled_run_at"] == "2026-07-12T11:20:28+08:00"
 
 
 def test_build_desired_pending_jobs_preserves_hard_stop_global_candidate_against_newer_same_session_limit(
@@ -287,9 +287,9 @@ def test_build_desired_pending_jobs_preserves_hard_stop_global_candidate_against
     assert set(desired_jobs) == {"same-session"}
     job = desired_jobs["same-session"]
     assert job["origin_error_id"] == "same-session-5h"
-    assert job["governing_error_id"] == "rollout:same-session:hard-stop"
-    assert job["governing_limit_scope"] == "global_window"
-    assert job["scheduled_run_at"] == "2026-07-18T14:58:57+08:00"
+    assert job["governing_error_id"] == "same-session-5h"
+    assert job["governing_limit_scope"] == "session_window"
+    assert job["scheduled_run_at"] == "2026-07-12T11:20:28+08:00"
 
 
 def test_reconcile_pending_jobs_marks_replaced_and_preserves_future_pending_without_prune_reason(
@@ -411,6 +411,175 @@ def test_choose_session_candidate_prefers_latest_event_over_later_scheduled_run_
     )
 
     assert watcher.choose_session_candidate(current, challenger) == challenger
+
+
+def test_choose_session_candidate_prefers_farther_retry_when_event_times_match(module, monkeypatch, base_dir, codex_home):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    session_id = "same-event-farther-retry"
+    event_dt = datetime(2026, 7, 10, 10, 58, 47, tzinfo=watcher.local_tz)
+    current = watcher.normalize_candidate_metadata(
+        {
+            "source": "logs",
+            "priority": 1,
+            "signal_strength": "strong",
+            "event_dt": event_dt,
+            "error_id": "earlier-retry",
+            "session_id": session_id,
+            "retry_at": datetime(2026, 7, 10, 11, 4, 0, tzinfo=watcher.local_tz),
+            "scheduled_run_at": datetime(2026, 7, 10, 11, 14, 0, tzinfo=watcher.local_tz),
+            "thread_info": watcher.default_thread_info(session_id),
+            "message": "earlier retry",
+            "message_preview": "earlier retry",
+            "retry_source": "message",
+            "reason": "explicit usage limit turn error",
+            "limit_kind": "log_turn_error",
+            "primary_used_percent": 100.0,
+            "secondary_used_percent": 31.0,
+            "credits_has": False,
+            "credits_balance": "0",
+        }
+    )
+    challenger = watcher.normalize_candidate_metadata(
+        {
+            "source": "rollout",
+            "priority": 2,
+            "signal_strength": "rollout",
+            "event_dt": event_dt,
+            "error_id": "farther-retry",
+            "session_id": session_id,
+            "retry_at": datetime(2026, 7, 20, 9, 18, 0, tzinfo=watcher.local_tz),
+            "scheduled_run_at": datetime(2026, 7, 20, 9, 28, 0, tzinfo=watcher.local_tz),
+            "thread_info": watcher.default_thread_info(session_id),
+            "message": "farther retry",
+            "message_preview": "farther retry",
+            "retry_source": "rate_limits.primary.resets_at",
+            "reason": "rollout primary usage limit reached",
+            "limit_kind": "rollout_primary_limit",
+            "primary_used_percent": 100.0,
+            "secondary_used_percent": 31.0,
+            "credits_has": False,
+            "credits_balance": "0",
+        }
+    )
+
+    assert watcher.choose_session_candidate(current, challenger) == challenger
+
+
+def test_choose_global_governing_candidate_prefers_newer_event_over_older_farther_retry(
+    module, monkeypatch, base_dir, codex_home
+):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    current = watcher.normalize_candidate_metadata(
+        {
+            "source": "rollout",
+            "priority": 2,
+            "signal_strength": "rollout",
+            "event_dt": datetime(2026, 7, 12, 6, 34, 55, tzinfo=watcher.local_tz),
+            "error_id": "older-farther-retry",
+            "session_id": "global-one",
+            "retry_at": datetime(2026, 7, 20, 9, 18, 0, tzinfo=watcher.local_tz),
+            "scheduled_run_at": datetime(2026, 7, 20, 9, 28, 0, tzinfo=watcher.local_tz),
+            "thread_info": watcher.default_thread_info("global-one"),
+            "message": "older farther retry",
+            "message_preview": "older farther retry",
+            "retry_source": "inferred.previous_secondary_reset_at",
+            "reason": "rollout premium hard stop inferred from previous secondary reset",
+            "limit_kind": "rollout_premium_credits_exhausted",
+            "limit_id": "premium",
+            "primary_used_percent": 100.0,
+            "secondary_used_percent": 100.0,
+            "credits_has": False,
+            "credits_balance": "0",
+            "terminal_task_complete_without_last_agent_message": True,
+            "hard_stop_global_window": True,
+        }
+    )
+    challenger = watcher.normalize_candidate_metadata(
+        {
+            "source": "rollout",
+            "priority": 2,
+            "signal_strength": "rollout",
+            "event_dt": datetime(2026, 7, 14, 2, 13, 3, tzinfo=watcher.local_tz),
+            "error_id": "newer-nearer-retry",
+            "session_id": "global-two",
+            "retry_at": datetime(2026, 7, 18, 14, 48, 57, tzinfo=watcher.local_tz),
+            "scheduled_run_at": datetime(2026, 7, 18, 14, 58, 57, tzinfo=watcher.local_tz),
+            "thread_info": watcher.default_thread_info("global-two"),
+            "message": "newer nearer retry",
+            "message_preview": "newer nearer retry",
+            "retry_source": "inferred.previous_secondary_reset_at",
+            "reason": "rollout premium hard stop inferred from previous secondary reset",
+            "limit_kind": "rollout_premium_credits_exhausted",
+            "limit_id": "premium",
+            "primary_used_percent": 100.0,
+            "secondary_used_percent": 100.0,
+            "credits_has": False,
+            "credits_balance": "0",
+            "terminal_task_complete_without_last_agent_message": True,
+            "hard_stop_global_window": True,
+        }
+    )
+
+    assert watcher.choose_global_governing_candidate(current, challenger) == challenger
+
+
+def test_choose_global_governing_candidate_prefers_farther_retry_when_event_times_match(
+    module, monkeypatch, base_dir, codex_home
+):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    event_dt = datetime(2026, 7, 14, 2, 13, 3, tzinfo=watcher.local_tz)
+    current = watcher.normalize_candidate_metadata(
+        {
+            "source": "rollout",
+            "priority": 2,
+            "signal_strength": "rollout",
+            "event_dt": event_dt,
+            "error_id": "nearer-retry",
+            "session_id": "global-one",
+            "retry_at": datetime(2026, 7, 18, 14, 48, 57, tzinfo=watcher.local_tz),
+            "scheduled_run_at": datetime(2026, 7, 18, 14, 58, 57, tzinfo=watcher.local_tz),
+            "thread_info": watcher.default_thread_info("global-one"),
+            "message": "nearer retry",
+            "message_preview": "nearer retry",
+            "retry_source": "inferred.previous_secondary_reset_at",
+            "reason": "rollout premium hard stop inferred from previous secondary reset",
+            "limit_kind": "rollout_premium_credits_exhausted",
+            "limit_id": "premium",
+            "primary_used_percent": 100.0,
+            "secondary_used_percent": 100.0,
+            "credits_has": False,
+            "credits_balance": "0",
+            "terminal_task_complete_without_last_agent_message": True,
+            "hard_stop_global_window": True,
+        }
+    )
+    challenger = watcher.normalize_candidate_metadata(
+        {
+            "source": "rollout",
+            "priority": 2,
+            "signal_strength": "rollout",
+            "event_dt": event_dt,
+            "error_id": "farther-retry",
+            "session_id": "global-two",
+            "retry_at": datetime(2026, 7, 20, 9, 18, 0, tzinfo=watcher.local_tz),
+            "scheduled_run_at": datetime(2026, 7, 20, 9, 28, 0, tzinfo=watcher.local_tz),
+            "thread_info": watcher.default_thread_info("global-two"),
+            "message": "farther retry",
+            "message_preview": "farther retry",
+            "retry_source": "inferred.previous_secondary_reset_at",
+            "reason": "rollout premium hard stop inferred from previous secondary reset",
+            "limit_kind": "rollout_premium_credits_exhausted",
+            "limit_id": "premium",
+            "primary_used_percent": 100.0,
+            "secondary_used_percent": 100.0,
+            "credits_has": False,
+            "credits_balance": "0",
+            "terminal_task_complete_without_last_agent_message": True,
+            "hard_stop_global_window": True,
+        }
+    )
+
+    assert watcher.choose_global_governing_candidate(current, challenger) == challenger
 
 
 def test_collect_rollout_candidates_for_thread_skips_transient_limit_when_normal_agent_message_follows(
