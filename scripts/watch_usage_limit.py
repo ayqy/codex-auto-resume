@@ -347,11 +347,35 @@ class UsageLimitWatcher:
             credits_balance = credits_balance.strip()
         return credits_has is False or credits_balance == "0"
 
+    def candidate_is_rollout_codex_primary_global_window(self, candidate: Optional[dict]):
+        if not candidate:
+            return False
+        # Local positive rollout sessions for this heuristic:
+        # 019f6e4c-fd70-76f2-b9f9-cb0e661a9f6f
+        # 019f3d22-7857-7a82-ae16-cc4fce072eb7
+        # 019f4745-f799-7842-b6ef-6b33282963e1
+        if candidate.get("source") != "rollout":
+            return False
+        if candidate.get("limit_id") != "codex":
+            return False
+        if not self.is_limit_fully_used(candidate.get("primary_used_percent")):
+            return False
+        if not self.candidate_credits_empty(candidate):
+            return False
+        secondary_used = candidate.get("secondary_used_percent")
+        if secondary_used in (None, ""):
+            return True
+        return not self.is_limit_fully_used(secondary_used)
+
     def candidate_is_verified_global_window(self, candidate: Optional[dict]):
         if not candidate:
             return False
+        if self.candidate_is_rollout_codex_primary_global_window(candidate):
+            return True
         if candidate.get("hard_stop_global_window") is True:
             return True
+        # Local positive rollout session for the premium hard-stop heuristic:
+        # 019f4e3c-b812-7653-a52a-99cfe6847110
         if candidate.get("limit_kind") != "rollout_premium_credits_exhausted":
             return False
         if candidate.get("retry_source") != "inferred.previous_secondary_reset_at":
@@ -1695,6 +1719,8 @@ class UsageLimitWatcher:
                     event_dt = self.parse_iso_timestamp(timestamp)
                     if self.rollout_entry_has_normal_agent_message(obj):
                         for candidate in pending_limit_candidates:
+                            if self.candidate_is_verified_global_window(candidate):
+                                continue
                             candidate["transient_rollout_limit"] = True
                     if self.rollout_entry_is_terminal_task_complete_without_last_agent_message(obj):
                         for candidate in pending_limit_candidates:

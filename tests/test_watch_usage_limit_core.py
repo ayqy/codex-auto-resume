@@ -292,6 +292,74 @@ def test_build_desired_pending_jobs_preserves_hard_stop_global_candidate_against
     assert job["scheduled_run_at"] == "2026-07-12T11:20:28+08:00"
 
 
+def test_candidate_is_verified_global_window_matches_rollout_codex_primary_shape(
+    module, monkeypatch, base_dir, codex_home
+):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+
+    candidate = watcher.normalize_candidate_metadata(
+        {
+            "source": "rollout",
+            "priority": 2,
+            "signal_strength": "rollout",
+            "event_dt": datetime(2026, 7, 18, 10, 25, 11, tzinfo=watcher.local_tz),
+            "error_id": "rollout:codex-primary-global:1:rollout_primary_credits_exhausted",
+            "session_id": "codex-primary-global",
+            "retry_at": datetime(2026, 7, 24, 10, 16, 0, tzinfo=watcher.local_tz),
+            "scheduled_run_at": datetime(2026, 7, 24, 10, 26, 0, tzinfo=watcher.local_tz),
+            "thread_info": watcher.default_thread_info("codex-primary-global"),
+            "message": "codex primary global",
+            "message_preview": "codex primary global",
+            "retry_source": "credits.primary.resets_at",
+            "reason": "rollout credits exhausted while primary limit is active",
+            "limit_kind": "rollout_primary_credits_exhausted",
+            "limit_id": "codex",
+            "primary_used_percent": 100.0,
+            "secondary_used_percent": 31.0,
+            "credits_has": False,
+            "credits_balance": "0",
+        }
+    )
+
+    assert watcher.candidate_is_verified_global_window(candidate) is True
+    assert candidate["candidate_family"] == "global_window_limit"
+    assert candidate["limit_scope"] == "global_window"
+
+
+def test_candidate_is_verified_global_window_rejects_rollout_codex_primary_shape_with_full_secondary(
+    module, monkeypatch, base_dir, codex_home
+):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+
+    candidate = watcher.normalize_candidate_metadata(
+        {
+            "source": "rollout",
+            "priority": 2,
+            "signal_strength": "rollout",
+            "event_dt": datetime(2026, 7, 18, 10, 25, 11, tzinfo=watcher.local_tz),
+            "error_id": "rollout:codex-primary-not-global:1:rollout_primary_credits_exhausted",
+            "session_id": "codex-primary-not-global",
+            "retry_at": datetime(2026, 7, 24, 10, 16, 0, tzinfo=watcher.local_tz),
+            "scheduled_run_at": datetime(2026, 7, 24, 10, 26, 0, tzinfo=watcher.local_tz),
+            "thread_info": watcher.default_thread_info("codex-primary-not-global"),
+            "message": "codex primary not global",
+            "message_preview": "codex primary not global",
+            "retry_source": "credits.primary.resets_at",
+            "reason": "rollout credits exhausted while primary limit is active",
+            "limit_kind": "rollout_primary_credits_exhausted",
+            "limit_id": "codex",
+            "primary_used_percent": 100.0,
+            "secondary_used_percent": 100.0,
+            "credits_has": False,
+            "credits_balance": "0",
+        }
+    )
+
+    assert watcher.candidate_is_verified_global_window(candidate) is False
+    assert candidate["candidate_family"] == "session_credits_exhausted"
+    assert candidate["limit_scope"] == "session_window"
+
+
 def test_reconcile_pending_jobs_marks_replaced_and_preserves_future_pending_without_prune_reason(
     module, monkeypatch, base_dir, codex_home
 ):
@@ -808,6 +876,81 @@ def test_collect_rollout_candidates_for_thread_detects_terminal_premium_credits_
     assert candidate["limit_scope"] == "global_window"
     assert candidate["retry_at"].isoformat() == "2026-07-17T06:04:48+08:00"
     assert candidate["scheduled_run_at"].isoformat() == "2026-07-17T06:14:48+08:00"
+
+
+def test_collect_rollout_candidates_for_thread_keeps_rollout_codex_primary_global_window_when_normal_agent_message_follows(
+    module, monkeypatch, base_dir, codex_home
+):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    session_id = "codex-primary-global-session"
+    rollout_path = (
+        codex_home / "sessions" / "2026" / "07" / "18" / f"rollout-2026-07-18T10-25-11-{session_id}.jsonl"
+    )
+    write_rollout(
+        rollout_path,
+        [
+            {
+                "timestamp": "2026-07-18T02:25:11.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "session_id": session_id,
+                    "cwd": "/workspace/codex-primary-global",
+                    "title": "Codex primary global session",
+                    "model_provider": "codexzh",
+                },
+            },
+            {
+                "timestamp": "2026-07-18T02:25:30.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "limit_id": "codex",
+                        "primary": {"used_percent": 100.0, "window_minutes": 10080, "resets_at": 1784859369},
+                        "secondary": {"used_percent": 31.0, "window_minutes": 10080, "resets_at": 1785446169},
+                        "credits": {"has_credits": True, "unlimited": False, "balance": "12"},
+                    },
+                },
+            },
+            {
+                "timestamp": "2026-07-18T02:25:45.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "limit_id": "codex",
+                        "primary": {"used_percent": 100.0, "window_minutes": 10080, "resets_at": 1784859369},
+                        "secondary": {"used_percent": 31.0, "window_minutes": 10080, "resets_at": 1785446169},
+                        "credits": {"has_credits": False, "unlimited": False, "balance": "0"},
+                    },
+                },
+            },
+            {
+                "timestamp": "2026-07-18T02:25:50.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "继续正常执行"}],
+                },
+            },
+            {
+                "timestamp": "2026-07-18T02:26:00.000Z",
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "turn-1", "last_agent_message": "继续正常执行"},
+            },
+        ],
+    )
+    thread_info = watcher.parse_rollout_metadata(rollout_path, session_id=session_id)
+
+    candidates = watcher.collect_rollout_candidates_for_thread(thread_info)
+
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate["limit_kind"] == "rollout_primary_credits_exhausted"
+    assert candidate["candidate_family"] == "global_window_limit"
+    assert candidate["limit_scope"] == "global_window"
+    assert candidate["governs_all_sessions"] is True
 
 
 def test_collect_rollout_candidates_for_thread_skips_transient_premium_credits_exhausted_when_normal_agent_message_follows(
