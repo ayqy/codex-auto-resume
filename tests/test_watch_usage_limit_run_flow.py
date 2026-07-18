@@ -477,6 +477,130 @@ def test_trigger_due_jobs_skips_session_that_already_has_agent_reply(module, mon
     assert calls == []
 
 
+def test_trigger_due_jobs_does_not_treat_same_task_agent_reply_as_manual_resume(
+    module, monkeypatch, base_dir, codex_home
+):
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    watcher = module.UsageLimitWatcher(base_dir, cleanup_on_init=False)
+    session_id = "88888888-8888-4888-8888-888888888888"
+    rollout_path = (
+        codex_home / "sessions" / "2026" / "07" / "18" / f"rollout-2026-07-18T10-00-00-{session_id}.jsonl"
+    )
+    retry_at = datetime(2026, 7, 24, 10, 16, 28, tzinfo=watcher.local_tz)
+    reset_ts = int(retry_at.astimezone(module.ZoneInfo("UTC")).timestamp())
+    rollout_path.parent.mkdir(parents=True, exist_ok=True)
+    rollout_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "timestamp": "2026-07-18T02:00:00.000Z",
+                        "type": "turn_context",
+                        "payload": {
+                            "cwd": "/workspace/global-window",
+                            "title": "Global window trigger session",
+                            "model_provider": "openai",
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "timestamp": "2026-07-18T02:05:00.000Z",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "rate_limits": {
+                                "limit_id": "codex",
+                                "primary": {"used_percent": 100.0, "resets_at": reset_ts},
+                                "secondary": None,
+                                "credits": {"has_credits": False, "unlimited": False, "balance": "0"},
+                                "individual_limit": None,
+                                "plan_type": "plus",
+                                "rate_limit_reached_type": None,
+                            },
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "timestamp": "2026-07-18T02:06:00.000Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "继续正常执行"}],
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "timestamp": "2026-07-18T02:10:00.000Z",
+                        "type": "event_msg",
+                        "payload": {"type": "task_complete", "turn_id": "turn-1", "last_agent_message": None},
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    thread_info = watcher.parse_rollout_metadata(rollout_path, session_id=session_id)
+    watcher.cache_thread_info(thread_info, persist=False)
+    watcher.state["pending_jobs"] = [
+        {
+            "session_id": session_id,
+            "retry_at": "2026-07-18T10:12:00+08:00",
+            "scheduled_run_at": "2026-07-18T10:15:00+08:00",
+            "error_log_id": "limit-1",
+            "status": "pending",
+            "cwd": "/workspace/global-window",
+            "origin_event_at": "2026-07-18T10:05:00+08:00",
+            "origin_retry_at": "2026-07-24T10:16:28+08:00",
+            "origin_scheduled_run_at": "2026-07-24T10:26:28+08:00",
+            "governing_event_at": "2026-07-18T10:05:00+08:00",
+            "governing_retry_at": "2026-07-24T10:16:28+08:00",
+            "governing_scheduled_run_at": "2026-07-24T10:26:28+08:00",
+            "resume_checkpoint_at": "2026-07-18T10:10:00+08:00",
+        }
+    ]
+
+    class FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = datetime(2026, 7, 18, 10, 30, 0, tzinfo=watcher.local_tz)
+            return current if tz else current.replace(tzinfo=None)
+
+        @classmethod
+        def fromtimestamp(cls, ts, tz=None):
+            return datetime.fromtimestamp(ts, tz=tz)
+
+        @classmethod
+        def fromisoformat(cls, value):
+            return datetime.fromisoformat(value)
+
+        @classmethod
+        def strptime(cls, date_string, fmt):
+            return datetime.strptime(date_string, fmt)
+
+    monkeypatch.setattr(module, "datetime", FakeDateTime)
+    monkeypatch.setattr(
+        watcher,
+        "launch_resume_job",
+        lambda job: {"ok": True, "stderr": "", "mode": "silent", "log_path": None},
+    )
+
+    summary = watcher.trigger_due_jobs()
+
+    assert summary["attempted"] == 1
+    assert summary["skipped_manual"] == 0
+    assert summary["triggered"] == 1
+    assert watcher.state["pending_jobs"][0]["status"] == "triggered"
+
+
 def test_run_once_cancels_future_pending_job_when_session_already_resumed(module, monkeypatch, base_dir, codex_home):
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     watcher = module.UsageLimitWatcher(base_dir, cleanup_on_init=False)

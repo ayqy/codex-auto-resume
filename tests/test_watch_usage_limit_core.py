@@ -360,6 +360,87 @@ def test_candidate_is_verified_global_window_rejects_rollout_codex_primary_shape
     assert candidate["limit_scope"] == "session_window"
 
 
+def test_rollout_global_window_uses_task_boundary_as_resume_checkpoint(module, monkeypatch, base_dir, codex_home):
+    watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
+    session_id = "77777777-7777-4777-8777-777777777777"
+    rollout_path = (
+        codex_home / "sessions" / "2026" / "07" / "18" / f"rollout-2026-07-18T10-00-00-{session_id}.jsonl"
+    )
+    retry_at = datetime(2026, 7, 24, 10, 16, 28, tzinfo=watcher.local_tz)
+    reset_ts = int(retry_at.astimezone(module.ZoneInfo("UTC")).timestamp())
+    write_rollout(
+        rollout_path,
+        [
+            {
+                "timestamp": "2026-07-18T02:00:00.000Z",
+                "type": "turn_context",
+                "payload": {
+                    "cwd": "/workspace/global-window",
+                    "title": "Global window checkpoint session",
+                    "model_provider": "openai",
+                },
+            },
+            {
+                "timestamp": "2026-07-18T02:05:00.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "limit_id": "codex",
+                        "primary": {"used_percent": 100.0, "resets_at": reset_ts},
+                        "secondary": None,
+                        "credits": {"has_credits": False, "unlimited": False, "balance": "0"},
+                        "individual_limit": None,
+                        "plan_type": "plus",
+                        "rate_limit_reached_type": None,
+                    },
+                },
+            },
+            {
+                "timestamp": "2026-07-18T02:06:00.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "继续正常执行"}],
+                },
+            },
+            {
+                "timestamp": "2026-07-18T02:10:00.000Z",
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "turn-1", "last_agent_message": None},
+            },
+        ],
+    )
+    thread_info = watcher.parse_rollout_metadata(rollout_path, session_id=session_id)
+    watcher.cache_thread_info(thread_info, persist=False)
+
+    candidates = watcher.collect_rollout_candidates_for_thread(thread_info)
+
+    assert len(candidates) == 2
+    candidate = next(item for item in candidates if item["limit_kind"] == "rollout_primary_credits_exhausted")
+    assert candidate["limit_scope"] == "global_window"
+    checkpoint = watcher.candidate_resume_checkpoint(candidate)
+    expected_checkpoint = datetime(2026, 7, 18, 10, 10, 0, tzinfo=watcher.local_tz)
+    assert checkpoint == expected_checkpoint
+    assert checkpoint != candidate["event_dt"]
+
+    monkeypatch.setattr(
+        watcher,
+        "collect_confirmed_candidates",
+        lambda days=14, log_limit=5000, rollout_limit_threads=400: ([candidate], True),
+    )
+
+    desired_jobs, _, _, _, prune_reasons = watcher.build_desired_pending_jobs(
+        now=datetime(2026, 7, 18, 10, 6, 0, tzinfo=watcher.local_tz),
+        days=14,
+    )
+
+    assert prune_reasons == {}
+    assert session_id in desired_jobs
+    assert desired_jobs[session_id]["resume_checkpoint_at"] == expected_checkpoint.isoformat()
+
+
 def test_reconcile_pending_jobs_marks_replaced_and_preserves_future_pending_without_prune_reason(
     module, monkeypatch, base_dir, codex_home
 ):

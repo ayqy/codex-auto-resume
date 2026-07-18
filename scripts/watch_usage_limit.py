@@ -1689,9 +1689,12 @@ class UsageLimitWatcher:
         pending_limit_candidates = []
         latest_limit_context = None
 
-        def flush_pending_limit_candidates():
+        def flush_pending_limit_candidates(boundary_dt: Optional[datetime] = None):
             nonlocal pending_limit_candidates
             if pending_limit_candidates:
+                if boundary_dt is not None:
+                    for candidate in pending_limit_candidates:
+                        candidate["resume_checkpoint_dt"] = boundary_dt
                 candidates.extend(
                     candidate
                     for candidate in pending_limit_candidates
@@ -1730,7 +1733,7 @@ class UsageLimitWatcher:
                             candidate["hard_stop_global_window"] = True
                             self.normalize_candidate_metadata(candidate)
                     if self.rollout_entry_is_task_boundary(obj):
-                        flush_pending_limit_candidates()
+                        flush_pending_limit_candidates(boundary_dt=event_dt)
                     text = line
                     payload = obj.get("payload", {})
                     if not isinstance(payload, dict) or payload.get("type") != "token_count":
@@ -1986,6 +1989,7 @@ class UsageLimitWatcher:
     def build_job_from_candidate(self, candidate: dict, governing_candidate: dict, now: datetime):
         thread_info = candidate.get("thread_info") or {}
         governing_thread_info = governing_candidate.get("thread_info") or {}
+        resume_checkpoint = self.candidate_resume_checkpoint(candidate)
         return {
             "session_id": candidate["session_id"],
             "retry_at": governing_candidate["retry_at"].isoformat(),
@@ -2003,6 +2007,7 @@ class UsageLimitWatcher:
             "origin_event_at": candidate["event_dt"].isoformat(),
             "origin_retry_at": candidate["retry_at"].isoformat(),
             "origin_scheduled_run_at": candidate["scheduled_run_at"].isoformat(),
+            "resume_checkpoint_at": resume_checkpoint.isoformat() if resume_checkpoint is not None else None,
             "origin_retry_source": candidate.get("retry_source"),
             "origin_reason": candidate.get("reason"),
             "origin_limit_scope": candidate.get("limit_scope"),
@@ -2037,6 +2042,7 @@ class UsageLimitWatcher:
             "origin_event_at",
             "origin_retry_at",
             "origin_scheduled_run_at",
+            "resume_checkpoint_at",
             "origin_retry_source",
             "origin_reason",
             "origin_limit_scope",
@@ -2519,14 +2525,14 @@ class UsageLimitWatcher:
         return False
 
     def candidate_resume_checkpoint(self, candidate: dict):
-        for key in ("event_dt", "retry_at", "scheduled_run_at"):
+        for key in ("resume_checkpoint_dt", "event_dt", "retry_at", "scheduled_run_at"):
             value = candidate.get(key)
             if value is not None and hasattr(value, "isoformat"):
                 return value
         return None
 
     def parse_job_resume_checkpoint(self, job: dict):
-        for key in ("origin_event_at", "governing_event_at", "origin_retry_at", "retry_at", "scheduled_run_at"):
+        for key in ("resume_checkpoint_at", "origin_event_at", "governing_event_at", "origin_retry_at", "retry_at", "scheduled_run_at"):
             value = job.get(key)
             if not value or not isinstance(value, str):
                 continue
