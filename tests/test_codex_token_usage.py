@@ -124,6 +124,67 @@ def test_collect_usage_aggregates_multiple_entries_in_one_session(monkeypatch, c
     assert results["gpt-5"]["output_tokens"] == 200_000_000
 
 
+def test_collect_usage_report_ignores_model_names_inside_function_call_output(monkeypatch, tmp_path):
+    module = load_module()
+    codex_home = tmp_path / "codex_home"
+    session_id = "12121212-1212-4212-8212-121212121212"
+    write_session_file(
+        codex_home,
+        "2026-07-22",
+        "2026-07-22T14-10-32",
+        session_id,
+        [
+            {
+                "timestamp": "2026-07-22T06:10:32.172Z",
+                "type": "session_meta",
+                "payload": {
+                    "session_id": session_id,
+                    "id": session_id,
+                    "cwd": "/workspace/model-attribution",
+                },
+            },
+            {
+                "timestamp": "2026-07-22T06:10:36.253Z",
+                "type": "turn_context",
+                "payload": {
+                    "turn_id": "turn-model-attribution",
+                    "cwd": "/workspace/model-attribution",
+                    "model": "gpt-5.4",
+                },
+            },
+            {
+                "timestamp": "2026-07-22T09:42:25.734Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call-foreign-model-json",
+                    "output": (
+                        '{"assistantMessage":{"extra":{"model":"claude-sonnet-4-6",'
+                        '"provider":"codeagent","usage":{"total_tokens":4340}}}}'
+                    ),
+                },
+            },
+            token_event("2026-07-22T09:42:25.735Z", 171_739, 153_984, 740),
+        ],
+    )
+
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    start_local = datetime(2026, 7, 22, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    end_local = datetime(2026, 7, 23, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+
+    report = module.collect_usage_report(start_local, end_local)
+    session = report["sessions"][session_id]
+
+    assert report["models"]["gpt-5.4"]["input_tokens"] == 171_739
+    assert report["models"]["gpt-5.4"]["cached_input_tokens"] == 153_984
+    assert report["models"]["gpt-5.4"]["output_tokens"] == 740
+    assert "claude-sonnet-4-6" not in report["models"]
+    assert session["models"]["gpt-5.4"]["input_tokens"] == 171_739
+    assert session["models"]["gpt-5.4"]["cached_input_tokens"] == 153_984
+    assert session["models"]["gpt-5.4"]["output_tokens"] == 740
+    assert "claude-sonnet-4-6" not in session["models"]
+
+
 def test_format_token_count_uses_expected_units():
     module = load_module()
 

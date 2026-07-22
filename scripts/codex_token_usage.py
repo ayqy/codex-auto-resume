@@ -23,7 +23,6 @@ PRICES = {
     "gpt-5.4-mini": {"miss": 0.75, "hit": 0.075, "output": 4.50},
 }
 
-MODEL_DETECTION_REGEX = re.compile(r'"model":\s*"([^"]+)"')
 SESSION_ID_REGEX = re.compile(r"rollout-.*-([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$")
 SESSION_ID_LINE_REGEX = re.compile(r"session id:\s*([0-9a-f]{8}-[0-9a-f-]{27})", re.IGNORECASE)
 ABSOLUTE_PATH_REGEX = re.compile(r"(/(?:[^\s\"'`<>|]|\\ )+)")
@@ -752,23 +751,13 @@ def update_model_tracking(obj: dict, state: dict):
     if not isinstance(payload, dict):
         return
 
-    obj_type = obj.get("type")
-    if obj_type == "turn_context":
-        model = payload.get("model")
-        if model:
-            state["turn_default_model"] = model
-            state["last_model_seen"] = model
+    if obj.get("type") != "turn_context":
         return
 
-    if payload.get("type") != "function_call_output":
-        return
-
-    output_value = payload.get("output", "")
-    if not isinstance(output_value, str):
-        return
-    found_models = MODEL_DETECTION_REGEX.findall(output_value)
-    if found_models:
-        state["last_model_seen"] = found_models[-1]
+    model = payload.get("model")
+    if model:
+        state["turn_default_model"] = model
+        state["last_model_seen"] = model
 
 
 def session_title_candidate(state: dict):
