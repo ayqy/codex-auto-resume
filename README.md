@@ -118,8 +118,14 @@ Estimated costs are based on OpenAI official pricing pages checked on July 25, 2
 `https://developers.openai.com/api/docs/models/gpt-5.6-sol`,
 `https://developers.openai.com/api/docs/models/gpt-5.6-terra`,
 and `https://developers.openai.com/api/docs/models/gpt-5.6-luna`.
-At this stage, the usage report only applies pricing for the currently supported
-`uncached input`, `cached input`, and `output` dimensions.
+For the `gpt-5.6` series, the usage report now applies event-level pricing from
+rollout logs when those log fields are present, including:
+`default` vs `priority` service tier, the official `>272K input tokens` long-context
+multiplier, and `cache write` billing when cache-write token fields can be recovered.
+If a `gpt-5.6` event does not expose cache-write token fields in the local log, the
+report still estimates the rest of that event but marks the cost as excluding the
+unrecoverable cache-write portion. Other models continue using the supported
+aggregate `uncached input`, `cached input`, and `output` dimensions.
 
 Auto-resume now restores the original session model and reasoning effort from that session's rollout log before running `codex resume`. This avoids switching models and losing cache continuity.
 

@@ -56,7 +56,39 @@ def write_session_file(codex_home: Path, day: str, started_at: str, session_id: 
     return target
 
 
-def token_event(timestamp: str, input_tokens: int, cached_input_tokens: int, output_tokens: int) -> dict:
+def turn_context_event(timestamp: str, model: str, turn_id: str = "turn-default", cwd: str = "/workspace/test") -> dict:
+    return {
+        "timestamp": timestamp,
+        "type": "turn_context",
+        "payload": {
+            "turn_id": turn_id,
+            "cwd": cwd,
+            "model": model,
+        },
+    }
+
+
+def thread_settings_applied_event(timestamp: str, service_tier: str) -> dict:
+    return {
+        "timestamp": timestamp,
+        "type": "event_msg",
+        "payload": {
+            "type": "thread_settings_applied",
+            "thread_settings": {
+                "service_tier": service_tier,
+            },
+        },
+    }
+
+
+def token_event(
+    timestamp: str,
+    input_tokens: int,
+    cached_input_tokens: int,
+    output_tokens: int,
+    last_usage_extra: dict | None = None,
+    info_extra: dict | None = None,
+) -> dict:
     usage = {
         "input_tokens": input_tokens,
         "cached_input_tokens": cached_input_tokens,
@@ -64,16 +96,22 @@ def token_event(timestamp: str, input_tokens: int, cached_input_tokens: int, out
         "reasoning_output_tokens": 0,
         "total_tokens": input_tokens + output_tokens,
     }
+    if last_usage_extra:
+        usage.update(last_usage_extra)
+    total_usage = dict(usage)
+    info = {
+        "total_token_usage": total_usage,
+        "last_token_usage": usage,
+        "model_context_window": 258400,
+    }
+    if info_extra:
+        info.update(info_extra)
     return {
         "timestamp": timestamp,
         "type": "event_msg",
         "payload": {
             "type": "token_count",
-            "info": {
-                "total_token_usage": usage,
-                "last_token_usage": usage,
-                "model_context_window": 258400,
-            },
+            "info": info,
             "rate_limits": None,
         },
     }
@@ -149,16 +187,19 @@ def test_collect_usage_report_prices_gpt_5_6_alias_model(monkeypatch, tmp_path):
         "2026-07-25T09-00-00",
         session_id,
         [
-            {
-                "timestamp": "2026-07-25T01:00:00.000Z",
-                "type": "turn_context",
-                "payload": {
-                    "turn_id": "turn-gpt-5.6-alias",
-                    "cwd": "/workspace/gpt-5-6-alias",
-                    "model": "gpt-5.6",
-                },
-            },
-            token_event("2026-07-25T01:00:05.000Z", 1_000_000, 250_000, 400_000),
+            turn_context_event(
+                "2026-07-25T01:00:00.000Z",
+                "gpt-5.6",
+                turn_id="turn-gpt-5.6-alias",
+                cwd="/workspace/gpt-5-6-alias",
+            ),
+            token_event(
+                "2026-07-25T01:00:05.000Z",
+                1_000_000,
+                250_000,
+                400_000,
+                last_usage_extra={"cache_write_input_tokens": 0},
+            ),
         ],
     )
 
@@ -167,13 +208,204 @@ def test_collect_usage_report_prices_gpt_5_6_alias_model(monkeypatch, tmp_path):
     end_local = datetime(2026, 7, 26, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
 
     report = module.collect_usage_report(start_local, end_local)
-    total_cost, partial_cost = module.calculate_models_cost(report["models"])
+    total_cost, cost_status = module.calculate_models_cost(report["models"])
 
     assert report["models"]["gpt-5.6"]["input_tokens"] == 1_000_000
     assert report["models"]["gpt-5.6"]["cached_input_tokens"] == 250_000
     assert report["models"]["gpt-5.6"]["output_tokens"] == 400_000
-    assert total_cost == pytest.approx(15.875)
-    assert partial_cost is False
+    assert total_cost == pytest.approx(25.75)
+    assert cost_status == {"unknown_model": False, "unrecoverable_cache_write": False}
+
+
+def test_calculate_event_cost_gpt_5_6_sol_default_short_context():
+    module = load_module()
+    usage = {
+        "input_tokens": 200_000,
+        "cached_input_tokens": 50_000,
+        "output_tokens": 10_000,
+        "cache_write_input_tokens": 20_000,
+    }
+
+    cost = module.calculate_event_cost("gpt-5.6-sol", usage, "default", {"last_token_usage": usage})
+
+    assert cost is not None
+    assert cost["cache_write_tokens"] == 20_000
+    assert cost["miss_cost"] == pytest.approx(0.65)
+    assert cost["hit_cost"] == pytest.approx(0.025)
+    assert cost["write_cost"] == pytest.approx(0.125)
+    assert cost["output_cost"] == pytest.approx(0.3)
+    assert cost["total_cost"] == pytest.approx(1.1)
+    assert cost["partial_unrecoverable_cache_write"] is False
+
+
+def test_calculate_event_cost_gpt_5_6_alias_matches_sol_rates():
+    module = load_module()
+    usage = {
+        "input_tokens": 200_000,
+        "cached_input_tokens": 50_000,
+        "output_tokens": 10_000,
+        "cache_write_input_tokens": 20_000,
+    }
+
+    alias_cost = module.calculate_event_cost("gpt-5.6", usage, "default", {"last_token_usage": usage})
+    sol_cost = module.calculate_event_cost("gpt-5.6-sol", usage, "default", {"last_token_usage": usage})
+
+    assert alias_cost == sol_cost
+
+
+def test_calculate_event_cost_gpt_5_6_terra_default_short_context():
+    module = load_module()
+    usage = {
+        "input_tokens": 200_000,
+        "cached_input_tokens": 50_000,
+        "output_tokens": 20_000,
+        "cache_write_input_tokens": 10_000,
+    }
+
+    cost = module.calculate_event_cost("gpt-5.6-terra", usage, "default", {"last_token_usage": usage})
+
+    assert cost is not None
+    assert cost["miss_cost"] == pytest.approx(0.35)
+    assert cost["hit_cost"] == pytest.approx(0.0125)
+    assert cost["write_cost"] == pytest.approx(0.03125)
+    assert cost["output_cost"] == pytest.approx(0.3)
+    assert cost["total_cost"] == pytest.approx(0.69375)
+    assert cost["partial_unrecoverable_cache_write"] is False
+
+
+def test_calculate_event_cost_gpt_5_6_luna_default_short_context():
+    module = load_module()
+    usage = {
+        "input_tokens": 100_000,
+        "cached_input_tokens": 10_000,
+        "output_tokens": 15_000,
+        "cache_write_input_tokens": 5_000,
+    }
+
+    cost = module.calculate_event_cost("gpt-5.6-luna", usage, "default", {"last_token_usage": usage})
+
+    assert cost is not None
+    assert cost["miss_cost"] == pytest.approx(0.085)
+    assert cost["hit_cost"] == pytest.approx(0.001)
+    assert cost["write_cost"] == pytest.approx(0.00625)
+    assert cost["output_cost"] == pytest.approx(0.09)
+    assert cost["total_cost"] == pytest.approx(0.18225)
+    assert cost["partial_unrecoverable_cache_write"] is False
+
+
+def test_collect_usage_report_prices_mixed_gpt_5_6_sol_short_and_long_events_per_event(monkeypatch, tmp_path):
+    module = load_module()
+    codex_home = tmp_path / "codex_home"
+    session_id = "56565656-5656-4565-8565-565656565656"
+    write_session_file(
+        codex_home,
+        "2026-07-25",
+        "2026-07-25T10-30-00",
+        session_id,
+        [
+            turn_context_event(
+                "2026-07-25T02:30:00.000Z",
+                "gpt-5.6-sol",
+                turn_id="turn-gpt-5.6-sol-mixed",
+                cwd="/workspace/gpt-5-6-sol-mixed",
+            ),
+            token_event(
+                "2026-07-25T02:30:05.000Z",
+                200_000,
+                100_000,
+                10_000,
+                last_usage_extra={"cache_write_input_tokens": 0},
+            ),
+            token_event(
+                "2026-07-25T02:30:15.000Z",
+                300_000,
+                50_000,
+                20_000,
+                last_usage_extra={"cache_write_input_tokens": 0},
+            ),
+        ],
+    )
+
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    start_local = datetime(2026, 7, 25, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    end_local = datetime(2026, 7, 26, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+
+    report = module.collect_usage_report(start_local, end_local)
+    total_cost, cost_status = module.calculate_models_cost(report["models"])
+
+    assert report["models"]["gpt-5.6-sol"]["input_tokens"] == 500_000
+    assert report["models"]["gpt-5.6-sol"]["cached_input_tokens"] == 150_000
+    assert report["models"]["gpt-5.6-sol"]["output_tokens"] == 30_000
+    assert total_cost == pytest.approx(4.3)
+    assert cost_status == {"unknown_model": False, "unrecoverable_cache_write": False}
+
+
+def test_collect_usage_report_uses_priority_service_tier_for_gpt_5_6_sol(monkeypatch, tmp_path):
+    module = load_module()
+    codex_home = tmp_path / "codex_home"
+    session_id = "78787878-7878-4787-8787-787878787878"
+    write_session_file(
+        codex_home,
+        "2026-07-25",
+        "2026-07-25T11-00-00",
+        session_id,
+        [
+            turn_context_event(
+                "2026-07-25T03:00:00.000Z",
+                "gpt-5.6-sol",
+                turn_id="turn-gpt-5.6-sol-priority",
+                cwd="/workspace/gpt-5-6-sol-priority",
+            ),
+            thread_settings_applied_event("2026-07-25T03:00:01.000Z", "priority"),
+            token_event(
+                "2026-07-25T03:00:05.000Z",
+                100_000,
+                20_000,
+                10_000,
+                last_usage_extra={"cache_write_input_tokens": 0},
+            ),
+        ],
+    )
+
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    start_local = datetime(2026, 7, 25, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    end_local = datetime(2026, 7, 26, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+
+    report = module.collect_usage_report(start_local, end_local)
+    total_cost, cost_status = module.calculate_models_cost(report["models"])
+
+    assert total_cost == pytest.approx(1.42)
+    assert cost_status == {"unknown_model": False, "unrecoverable_cache_write": False}
+
+
+def test_build_summary_lines_marks_unrecoverable_cache_write_for_gpt_5_6_when_field_is_absent(monkeypatch, tmp_path):
+    module = load_module()
+    codex_home = tmp_path / "codex_home"
+    session_id = "90909090-9090-4090-8090-909090909090"
+    write_session_file(
+        codex_home,
+        "2026-07-25",
+        "2026-07-25T12-00-00",
+        session_id,
+        [
+            turn_context_event(
+                "2026-07-25T04:00:00.000Z",
+                "gpt-5.6-sol",
+                turn_id="turn-gpt-5.6-sol-unrecoverable-cache-write",
+                cwd="/workspace/gpt-5-6-sol-unrecoverable-cache-write",
+            ),
+            token_event("2026-07-25T04:00:05.000Z", 200_000, 50_000, 10_000),
+        ],
+    )
+
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    start_local = datetime(2026, 7, 25, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    end_local = datetime(2026, 7, 26, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+
+    report = module.collect_usage_report(start_local, end_local)
+    lines = module.build_summary_lines(report, start_local, end_local)
+
+    assert "估算总成本：$1.07（未含无法从日志恢复的 cache write）" in lines
 
 def test_collect_usage_handles_null_info_and_non_string_function_output(monkeypatch, codex_home):
     module = load_module()

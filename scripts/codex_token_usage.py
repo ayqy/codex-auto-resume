@@ -31,6 +31,55 @@ PRICES = {
     "gpt-5.3-codex": {"miss": 1.75, "hit": 0.175, "output": 14.00},
     "gpt-5.4-mini": {"miss": 0.75, "hit": 0.075, "output": 4.50},
 }
+GPT_5_6_EVENT_PRICES = {
+    "gpt-5.6": {
+        "default": {"miss": 5.00, "hit": 0.50, "write": 6.25, "output": 30.00},
+        "priority": {"miss": 10.00, "hit": 1.00, "write": 12.50, "output": 60.00},
+    },
+    "gpt-5.6-sol": {
+        "default": {"miss": 5.00, "hit": 0.50, "write": 6.25, "output": 30.00},
+        "priority": {"miss": 10.00, "hit": 1.00, "write": 12.50, "output": 60.00},
+    },
+    "gpt-5.6-terra": {
+        "default": {"miss": 2.50, "hit": 0.25, "write": 3.125, "output": 15.00},
+        "priority": {"miss": 5.00, "hit": 0.50, "write": 6.25, "output": 30.00},
+    },
+    "gpt-5.6-luna": {
+        "default": {"miss": 1.00, "hit": 0.10, "write": 1.25, "output": 6.00},
+        "priority": {"miss": 2.00, "hit": 0.20, "write": 2.50, "output": 12.00},
+    },
+}
+LONG_CONTEXT_INPUT_THRESHOLD = 272_000
+LONG_CONTEXT_INPUT_MULTIPLIER = 2.0
+LONG_CONTEXT_OUTPUT_MULTIPLIER = 1.5
+CACHE_WRITE_TOKEN_PATHS = [
+    ("cache_write_input_tokens",),
+    ("cache_creation_input_tokens",),
+    ("cache_write_tokens",),
+    ("cache_creation_tokens",),
+    ("prompt_cache_write_input_tokens",),
+    ("input_token_details", "cache_write_input_tokens"),
+    ("input_token_details", "cache_creation_input_tokens"),
+    ("input_token_details", "cache_write_tokens"),
+    ("input_token_details", "cache_creation_tokens"),
+    ("input_token_details", "prompt_cache_write_input_tokens"),
+    ("token_details", "cache_write_input_tokens"),
+    ("token_details", "cache_creation_input_tokens"),
+    ("token_details", "cache_write_tokens"),
+    ("token_details", "cache_creation_tokens"),
+    ("last_token_usage", "cache_write_input_tokens"),
+    ("last_token_usage", "cache_creation_input_tokens"),
+    ("last_token_usage", "cache_write_tokens"),
+    ("last_token_usage", "cache_creation_tokens"),
+    ("last_token_usage", "input_token_details", "cache_write_input_tokens"),
+    ("last_token_usage", "input_token_details", "cache_creation_input_tokens"),
+    ("total_token_usage", "cache_write_input_tokens"),
+    ("total_token_usage", "cache_creation_input_tokens"),
+    ("total_token_usage", "cache_write_tokens"),
+    ("total_token_usage", "cache_creation_tokens"),
+    ("total_token_usage", "input_token_details", "cache_write_input_tokens"),
+    ("total_token_usage", "input_token_details", "cache_creation_input_tokens"),
+]
 
 SESSION_ID_REGEX = re.compile(r"rollout-.*-([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$")
 SESSION_ID_LINE_REGEX = re.compile(r"session id:\s*([0-9a-f]{8}-[0-9a-f-]{27})", re.IGNORECASE)
@@ -71,7 +120,20 @@ def is_usage_item(obj: dict) -> bool:
 
 
 def create_usage_dict():
-    return {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
+    return {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "cache_write_tokens": 0,
+        "estimated_miss_cost": 0.0,
+        "estimated_hit_cost": 0.0,
+        "estimated_write_cost": 0.0,
+        "estimated_output_cost": 0.0,
+        "estimated_total_cost": 0.0,
+        "has_estimated_cost": False,
+        "cost_partial_unknown_model": False,
+        "cost_partial_unrecoverable_cache_write": False,
+    }
 
 
 def create_session_record(session_id: str):
@@ -430,7 +492,85 @@ def model_miss_tokens(usage: dict) -> int:
     return max(usage["input_tokens"] - usage["cached_input_tokens"], 0)
 
 
+def create_cost_status():
+    return {"unknown_model": False, "unrecoverable_cache_write": False}
+
+
+def merge_cost_status(target: dict, source: dict):
+    target["unknown_model"] = target["unknown_model"] or bool(source.get("unknown_model"))
+    target["unrecoverable_cache_write"] = target["unrecoverable_cache_write"] or bool(
+        source.get("unrecoverable_cache_write")
+    )
+
+
+def usage_cost_status(usage: dict):
+    return {
+        "unknown_model": bool(usage.get("cost_partial_unknown_model")),
+        "unrecoverable_cache_write": bool(usage.get("cost_partial_unrecoverable_cache_write")),
+    }
+
+
+def cost_status_has_partial(cost_status: dict) -> bool:
+    return bool(cost_status.get("unknown_model") or cost_status.get("unrecoverable_cache_write"))
+
+
+def lookup_nested_token_count(payload: Any, path: tuple[str, ...]) -> Optional[int]:
+    current = payload
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    if not isinstance(current, (int, float)):
+        return None
+    return max(int(current), 0)
+
+
+def extract_cache_write_tokens(info: dict, last_usage: dict):
+    for payload in (last_usage, info):
+        for path in CACHE_WRITE_TOKEN_PATHS:
+            value = lookup_nested_token_count(payload, path)
+            if value is not None:
+                return value, True
+    return 0, False
+
+
+def calculate_event_cost(model: str, last_usage: dict, service_tier: str, info: dict):
+    if model not in GPT_5_6_EVENT_PRICES:
+        return None
+
+    price_info = GPT_5_6_EVENT_PRICES[model][normalize_service_tier(service_tier)]
+    input_tokens = int(last_usage.get("input_tokens", 0) or 0)
+    cached_input_tokens = int(last_usage.get("cached_input_tokens", 0) or 0)
+    output_tokens = int(last_usage.get("output_tokens", 0) or 0)
+    cache_write_tokens, cache_write_known = extract_cache_write_tokens(info, last_usage)
+    miss_tokens = max(input_tokens - cached_input_tokens - cache_write_tokens, 0)
+    input_multiplier = LONG_CONTEXT_INPUT_MULTIPLIER if input_tokens > LONG_CONTEXT_INPUT_THRESHOLD else 1.0
+    output_multiplier = LONG_CONTEXT_OUTPUT_MULTIPLIER if input_tokens > LONG_CONTEXT_INPUT_THRESHOLD else 1.0
+    miss_cost = (miss_tokens / 1_000_000) * price_info["miss"] * input_multiplier
+    hit_cost = (cached_input_tokens / 1_000_000) * price_info["hit"] * input_multiplier
+    write_cost = (cache_write_tokens / 1_000_000) * price_info["write"] * input_multiplier if cache_write_known else 0.0
+    output_cost = (output_tokens / 1_000_000) * price_info["output"] * output_multiplier
+    total_cost = miss_cost + hit_cost + write_cost + output_cost
+    return {
+        "cache_write_tokens": cache_write_tokens,
+        "miss_cost": miss_cost,
+        "hit_cost": hit_cost,
+        "write_cost": write_cost,
+        "output_cost": output_cost,
+        "total_cost": total_cost,
+        "partial_unrecoverable_cache_write": not cache_write_known,
+    }
+
+
 def calculate_cost(model: str, usage: dict):
+    if usage.get("has_estimated_cost"):
+        return {
+            "miss_cost": float(usage.get("estimated_miss_cost", 0.0) or 0.0),
+            "hit_cost": float(usage.get("estimated_hit_cost", 0.0) or 0.0),
+            "write_cost": float(usage.get("estimated_write_cost", 0.0) or 0.0),
+            "output_cost": float(usage.get("estimated_output_cost", 0.0) or 0.0),
+            "total_cost": float(usage.get("estimated_total_cost", 0.0) or 0.0),
+        }
     if model not in PRICES:
         return None
     price_info = PRICES[model]
@@ -441,6 +581,7 @@ def calculate_cost(model: str, usage: dict):
     return {
         "miss_cost": miss_cost,
         "hit_cost": hit_cost,
+        "write_cost": 0.0,
         "output_cost": output_cost,
         "total_cost": total_cost,
     }
@@ -448,22 +589,36 @@ def calculate_cost(model: str, usage: dict):
 
 def calculate_models_cost(models: dict):
     total_cost = 0.0
-    partial = False
+    cost_status = create_cost_status()
     for model, usage in models.items():
         if usage["input_tokens"] == 0 and usage["output_tokens"] == 0:
             continue
+        merge_cost_status(cost_status, usage_cost_status(usage))
         cost_info = calculate_cost(model, usage)
         if cost_info:
             total_cost += cost_info["total_cost"]
         else:
-            partial = True
-    return total_cost, partial
+            cost_status["unknown_model"] = True
+    return total_cost, cost_status
 
 
 def add_usage(target: dict, usage: dict):
     target["input_tokens"] += int(usage.get("input_tokens", 0) or 0)
     target["cached_input_tokens"] += int(usage.get("cached_input_tokens", 0) or 0)
     target["output_tokens"] += int(usage.get("output_tokens", 0) or 0)
+    target["cache_write_tokens"] += int(usage.get("cache_write_tokens", 0) or 0)
+    target["estimated_miss_cost"] += float(usage.get("estimated_miss_cost", 0.0) or 0.0)
+    target["estimated_hit_cost"] += float(usage.get("estimated_hit_cost", 0.0) or 0.0)
+    target["estimated_write_cost"] += float(usage.get("estimated_write_cost", 0.0) or 0.0)
+    target["estimated_output_cost"] += float(usage.get("estimated_output_cost", 0.0) or 0.0)
+    target["estimated_total_cost"] += float(usage.get("estimated_total_cost", 0.0) or 0.0)
+    target["has_estimated_cost"] = target.get("has_estimated_cost", False) or bool(usage.get("has_estimated_cost"))
+    target["cost_partial_unknown_model"] = target.get("cost_partial_unknown_model", False) or bool(
+        usage.get("cost_partial_unknown_model")
+    )
+    target["cost_partial_unrecoverable_cache_write"] = target.get(
+        "cost_partial_unrecoverable_cache_write", False
+    ) or bool(usage.get("cost_partial_unrecoverable_cache_write"))
 
 
 def normalize_title_text(text: str) -> str:
@@ -677,6 +832,7 @@ def create_file_state(file_path: Path):
         "session_id": session_id,
         "turn_default_model": "unknown",
         "last_model_seen": "unknown",
+        "service_tier": "default",
         "current_turn_id": None,
         "cwd": None,
         "title": None,
@@ -769,6 +925,24 @@ def update_model_tracking(obj: dict, state: dict):
         state["last_model_seen"] = model
 
 
+def normalize_service_tier(value: Optional[str]) -> str:
+    if value == "priority":
+        return "priority"
+    return "default"
+
+
+def update_service_tier_tracking(obj: dict, state: dict):
+    payload = obj.get("payload", {})
+    if not isinstance(payload, dict):
+        return
+    if obj.get("type") != "event_msg" or payload.get("type") != "thread_settings_applied":
+        return
+    thread_settings = payload.get("thread_settings", {})
+    if not isinstance(thread_settings, dict):
+        return
+    state["service_tier"] = normalize_service_tier(thread_settings.get("service_tier"))
+
+
 def session_title_candidate(state: dict):
     if state["semantic_user_messages"]:
         return state["semantic_user_messages"], 4
@@ -825,9 +999,15 @@ def format_event_window(start_at: Optional[datetime], end_at: Optional[datetime]
     return f"{start_text} 至 {end_text}"
 
 
-def format_cost_text(total_cost: float, partial: bool) -> str:
-    if partial:
+def format_cost_text(total_cost: float, cost_status: Any) -> str:
+    if isinstance(cost_status, bool):
+        cost_status = {"unknown_model": cost_status, "unrecoverable_cache_write": False}
+    if cost_status.get("unknown_model") and cost_status.get("unrecoverable_cache_write"):
+        return f"${total_cost:,.2f}（部分模型未计价；未含无法从日志恢复的 cache write）"
+    if cost_status.get("unknown_model"):
         return f"${total_cost:,.2f}（部分模型未计价）"
+    if cost_status.get("unrecoverable_cache_write"):
+        return f"${total_cost:,.2f}（未含无法从日志恢复的 cache write）"
     return f"${total_cost:,.2f}"
 
 
@@ -1123,7 +1303,7 @@ def build_unresolved_child_clusters(sessions: dict, child_sessions: dict, assign
         totals = cluster.pop("totals")
         active_totals = cluster.pop("active_totals")
         cluster["_activity_spans"] = merge_activity_spans(cluster["_activity_spans"])
-        total_cost, partial_cost = calculate_models_cost(cluster["models"])
+        total_cost, cost_status = calculate_models_cost(cluster["models"])
         cluster["average_tokens"] = sum(totals) // len(totals) if totals else 0
         cluster["median_tokens"] = int(median(totals)) if totals else 0
         cluster["p90_tokens"] = percentile_90(totals)
@@ -1134,7 +1314,7 @@ def build_unresolved_child_clusters(sessions: dict, child_sessions: dict, assign
         cluster["p90_active_seconds"] = percentile_90(active_totals)
         cluster["max_active_seconds"] = max(active_totals) if active_totals else 0
         cluster["total_cost"] = total_cost
-        cluster["partial_cost"] = partial_cost
+        cluster["cost_status"] = cost_status
         results.append(cluster)
 
     results.sort(
@@ -1181,6 +1361,7 @@ def collect_usage_data(start_local: datetime, end_local: datetime, include_sessi
             if include_sessions:
                 update_file_state_metadata(obj, file_state, event_time_local)
             update_model_tracking(obj, file_state)
+            update_service_tier_tracking(obj, file_state)
 
             if event_time_utc is None:
                 continue
@@ -1211,13 +1392,27 @@ def collect_usage_data(start_local: datetime, end_local: datetime, include_sessi
             session_id = file_state["session_id"]
             model_key = file_state["last_model_seen"] or file_state["turn_default_model"] or "unknown"
             event_time_local = event_time_utc.astimezone(target_tz)
+            usage_event = create_usage_dict()
+            add_usage(usage_event, last_usage)
+            event_cost = calculate_event_cost(model_key, last_usage, file_state["service_tier"], info)
+            if event_cost:
+                usage_event["cache_write_tokens"] = event_cost["cache_write_tokens"]
+                usage_event["estimated_miss_cost"] = event_cost["miss_cost"]
+                usage_event["estimated_hit_cost"] = event_cost["hit_cost"]
+                usage_event["estimated_write_cost"] = event_cost["write_cost"]
+                usage_event["estimated_output_cost"] = event_cost["output_cost"]
+                usage_event["estimated_total_cost"] = event_cost["total_cost"]
+                usage_event["has_estimated_cost"] = True
+                usage_event["cost_partial_unrecoverable_cache_write"] = event_cost[
+                    "partial_unrecoverable_cache_write"
+                ]
 
-            add_usage(model_totals[model_key], last_usage)
+            add_usage(model_totals[model_key], usage_event)
 
             session_record = activity_sessions.setdefault(session_id, create_session_record(session_id))
             if include_sessions:
-                add_usage(session_record, last_usage)
-                add_usage(session_record["models"][model_key], last_usage)
+                add_usage(session_record, usage_event)
+                add_usage(session_record["models"][model_key], usage_event)
             session_record["first_event_at"] = merge_time_window(session_record["first_event_at"], event_time_local, True)
             session_record["last_event_at"] = merge_time_window(session_record["last_event_at"], event_time_local, False)
             session_record["has_usage_in_range"] = True
@@ -1225,8 +1420,8 @@ def collect_usage_data(start_local: datetime, end_local: datetime, include_sessi
             if include_days:
                 day_key = event_time_local.strftime("%Y-%m-%d")
                 day_record = days.setdefault(day_key, create_day_record(day_key))
-                add_usage(day_record["usage"], last_usage)
-                add_usage(day_record["models"][model_key], last_usage)
+                add_usage(day_record["usage"], usage_event)
+                add_usage(day_record["models"][model_key], usage_event)
 
             file_state["used_in_range"] = True
             file_state["last_model_seen"] = file_state["turn_default_model"]
@@ -1285,14 +1480,14 @@ def collect_recent_usage(start_local: datetime, end_local: datetime, day_count: 
         day_start = start_local + timedelta(days=offset)
         day_key = day_start.strftime("%Y-%m-%d")
         day_record = report["days"].get(day_key, create_day_record(day_key))
-        total_cost, partial_cost = calculate_models_cost(day_record["models"])
+        total_cost, cost_status = calculate_models_cost(day_record["models"])
         records.append(
             {
                 "day": day_key,
                 "usage": day_record["usage"],
                 "models": day_record["models"],
                 "total_cost": total_cost,
-                "partial_cost": partial_cost,
+                "cost_status": cost_status,
                 "active_seconds": int(day_record.get("active_seconds", 0) or 0),
             }
         )
@@ -1308,7 +1503,7 @@ def build_summary_lines(report: dict, start_local: datetime, end_local: datetime
     total_usage = create_usage_dict()
     for _, usage in report["models"].items():
         add_usage(total_usage, usage)
-    total_cost, partial_cost = calculate_models_cost(report["models"])
+    total_cost, cost_status = calculate_models_cost(report["models"])
     total_active_seconds = int(report.get("active_seconds", 0) or 0)
 
     lines = [
@@ -1323,7 +1518,7 @@ def build_summary_lines(report: dict, start_local: datetime, end_local: datetime
         f"非缓存输入：{format_token_count(model_miss_tokens(total_usage))}",
         f"输出：{format_token_count(total_usage['output_tokens'])}",
         f"活跃时长：{format_duration(total_active_seconds)}",
-        f"估算总成本：{format_cost_text(total_cost, partial_cost)}",
+        f"估算总成本：{format_cost_text(total_cost, cost_status)}",
         "",
         "二、模型汇总",
     ]
@@ -1338,8 +1533,9 @@ def build_summary_lines(report: dict, start_local: datetime, end_local: datetime
         if usage["input_tokens"] == 0 and usage["output_tokens"] == 0:
             continue
         visible_index += 1
+        model_cost, model_cost_status = calculate_models_cost({model: usage})
         cost_info = calculate_cost(model, usage)
-        cost_text = f"${cost_info['total_cost']:,.2f}" if cost_info else "未计价"
+        cost_text = format_cost_text(model_cost, model_cost_status) if cost_info else "未计价"
         lines.extend(
             [
                 f"2.{visible_index} {model}",
@@ -1366,7 +1562,7 @@ def build_session_lines(report: dict):
         lines.append("当日未发现可展开的 session 级使用记录。")
     else:
         for index, session in enumerate(session_items, start=1):
-            session_cost, partial_cost = calculate_models_cost(session["models"])
+            session_cost, cost_status = calculate_models_cost(session["models"])
             model_parts = build_model_parts(session["models"])
             lines.extend(
                 [
@@ -1388,7 +1584,7 @@ def build_session_lines(report: dict):
                     f"输出：{format_token_count(session['output_tokens'])}",
                     f"活跃时长：{format_duration(int(session.get('active_seconds', 0) or 0))}",
                     f"模型分布：{'；'.join(model_parts) if model_parts else '无'}",
-                    f"估算成本：{format_cost_text(session_cost, partial_cost)}",
+                    f"估算成本：{format_cost_text(session_cost, cost_status)}",
                     "",
                 ]
             )
@@ -1415,7 +1611,7 @@ def build_session_lines(report: dict):
                     f"P90 活跃时长：{format_duration(cluster['p90_active_seconds'])}",
                     f"最大活跃时长：{format_duration(cluster['max_active_seconds'])}",
                     f"模型分布：{'；'.join(build_model_parts(cluster['models'])) or '无'}",
-                    f"估算成本：{format_cost_text(cluster['total_cost'], cluster['partial_cost'])}",
+                    f"估算成本：{format_cost_text(cluster['total_cost'], cluster['cost_status'])}",
                     "",
                 ]
             )
@@ -1438,7 +1634,9 @@ def build_recent_summary_lines(recent_report: dict):
     total_tokens = sum(totals)
     total_cost = sum(record["total_cost"] for record in day_records)
     total_active_seconds = sum(active_totals)
-    partial_cost = any(record["partial_cost"] for record in day_records)
+    cost_status = create_cost_status()
+    for record in day_records:
+        merge_cost_status(cost_status, record["cost_status"])
     active_days = sum(1 for total in active_totals if total > 0)
     average_tokens = total_tokens // len(day_records) if day_records else 0
     average_cost = total_cost / len(day_records) if day_records else 0.0
@@ -1469,7 +1667,7 @@ def build_recent_summary_lines(recent_report: dict):
         f"中位数Token：{format_token_count(median_tokens)}",
         f"P90 Token：{format_token_count(p90_tokens)}",
         f"最大单日Token：{format_token_count(max_tokens)}（{max_day}）",
-        f"总成本：{format_cost_text(total_cost, partial_cost)}",
+        f"总成本：{format_cost_text(total_cost, cost_status)}",
         f"日均成本：${average_cost:,.2f}",
         f"最大单日成本：${max_cost:,.2f}（{max_cost_day}）",
         f"总活跃时长：{format_duration(total_active_seconds)}",
@@ -1484,7 +1682,7 @@ def build_recent_detail_lines(recent_report: dict):
     lines = ["", "二、每日明细"]
     for record in recent_report["days"]:
         lines.append(
-            f"{record['day']} | 总Token {format_token_count(usage_total(record['usage']))} | 成本 {format_cost_text(record['total_cost'], record['partial_cost'])} | 活跃时长 {format_duration(int(record.get('active_seconds', 0) or 0))}"
+            f"{record['day']} | 总Token {format_token_count(usage_total(record['usage']))} | 成本 {format_cost_text(record['total_cost'], record['cost_status'])} | 活跃时长 {format_duration(int(record.get('active_seconds', 0) or 0))}"
         )
     return lines
 
@@ -1516,7 +1714,7 @@ def build_recent_markdown(recent_report: dict):
     )
     for record in recent_report["days"]:
         detail_lines.append(
-            f"| {record['day']} | {format_token_count(usage_total(record['usage']))} | {format_cost_text(record['total_cost'], record['partial_cost'])} | {format_duration(int(record.get('active_seconds', 0) or 0))} |"
+            f"| {record['day']} | {format_token_count(usage_total(record['usage']))} | {format_cost_text(record['total_cost'], record['cost_status'])} | {format_duration(int(record.get('active_seconds', 0) or 0))} |"
         )
     return "\n".join(detail_lines) + "\n"
 

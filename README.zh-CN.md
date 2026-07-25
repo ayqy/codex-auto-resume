@@ -118,8 +118,11 @@
 `https://developers.openai.com/api/docs/models/gpt-5.6-sol`、
 `https://developers.openai.com/api/docs/models/gpt-5.6-terra`
 和 `https://developers.openai.com/api/docs/models/gpt-5.6-luna`。
-当前阶段的用量报告只会对脚本已支持的 `非缓存输入`、`缓存输入`
-和 `输出` 三类口径做价格估算。
+对于 `gpt-5.6` 系列，只要本地 rollout 日志里有对应字段，用量报告现在会按事件级计费规则估算价格，包括：
+`default` / `priority` service tier、官方 `>272K input tokens` 长上下文倍率，以及可恢复时的 `cache write` 计费。
+如果某个 `gpt-5.6` 事件在本地日志里没有暴露 cache write token 字段，报告仍会估算其余部分，
+但会明确标记该成本 `未含无法从日志恢复的 cache write`。其他模型仍按当前脚本已支持的
+`非缓存输入`、`缓存输入` 和 `输出` 三类聚合口径估算。
 
 自动恢复现在会先从目标会话的 rollout 日志中恢复原会话使用的模型和推理强度，再执行 `codex resume`，以避免切换模型导致缓存连续性丢失。
 
