@@ -14,7 +14,16 @@ from statistics import median
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
+# Prices below were checked on 2026-07-25 against official OpenAI docs:
+# https://developers.openai.com/api/docs/pricing
+# https://developers.openai.com/api/docs/models/gpt-5.6-sol
+# https://developers.openai.com/api/docs/models/gpt-5.6-terra
+# https://developers.openai.com/api/docs/models/gpt-5.6-luna
 PRICES = {
+    "gpt-5.6": {"miss": 5.00, "hit": 0.50, "output": 30.00},
+    "gpt-5.6-sol": {"miss": 5.00, "hit": 0.50, "output": 30.00},
+    "gpt-5.6-terra": {"miss": 2.50, "hit": 0.25, "output": 15.00},
+    "gpt-5.6-luna": {"miss": 1.00, "hit": 0.10, "output": 6.00},
     "gpt-5.5": {"miss": 5.00, "hit": 0.50, "output": 30.00},
     "gpt-5.4": {"miss": 2.50, "hit": 0.25, "output": 15.00},
     "gpt-5.2": {"miss": 1.75, "hit": 0.175, "output": 14.00},

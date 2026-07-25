@@ -79,6 +79,102 @@ def token_event(timestamp: str, input_tokens: int, cached_input_tokens: int, out
     }
 
 
+def test_calculate_cost_supports_gpt_5_6_alias():
+    module = load_module()
+
+    cost = module.calculate_cost(
+        "gpt-5.6",
+        {"input_tokens": 1_000_000, "cached_input_tokens": 200_000, "output_tokens": 300_000},
+    )
+
+    assert cost is not None
+    assert cost["miss_cost"] == pytest.approx(4.0)
+    assert cost["hit_cost"] == pytest.approx(0.1)
+    assert cost["output_cost"] == pytest.approx(9.0)
+    assert cost["total_cost"] == pytest.approx(13.1)
+
+
+def test_calculate_cost_supports_gpt_5_6_sol():
+    module = load_module()
+
+    cost = module.calculate_cost(
+        "gpt-5.6-sol",
+        {"input_tokens": 2_000_000, "cached_input_tokens": 500_000, "output_tokens": 100_000},
+    )
+
+    assert cost is not None
+    assert cost["miss_cost"] == pytest.approx(7.5)
+    assert cost["hit_cost"] == pytest.approx(0.25)
+    assert cost["output_cost"] == pytest.approx(3.0)
+    assert cost["total_cost"] == pytest.approx(10.75)
+
+
+def test_calculate_cost_supports_gpt_5_6_terra():
+    module = load_module()
+
+    cost = module.calculate_cost(
+        "gpt-5.6-terra",
+        {"input_tokens": 1_500_000, "cached_input_tokens": 300_000, "output_tokens": 200_000},
+    )
+
+    assert cost is not None
+    assert cost["miss_cost"] == pytest.approx(3.0)
+    assert cost["hit_cost"] == pytest.approx(0.075)
+    assert cost["output_cost"] == pytest.approx(3.0)
+    assert cost["total_cost"] == pytest.approx(6.075)
+
+
+def test_calculate_cost_supports_gpt_5_6_luna():
+    module = load_module()
+
+    cost = module.calculate_cost(
+        "gpt-5.6-luna",
+        {"input_tokens": 900_000, "cached_input_tokens": 400_000, "output_tokens": 250_000},
+    )
+
+    assert cost is not None
+    assert cost["miss_cost"] == pytest.approx(0.5)
+    assert cost["hit_cost"] == pytest.approx(0.04)
+    assert cost["output_cost"] == pytest.approx(1.5)
+    assert cost["total_cost"] == pytest.approx(2.04)
+
+
+def test_collect_usage_report_prices_gpt_5_6_alias_model(monkeypatch, tmp_path):
+    module = load_module()
+    codex_home = tmp_path / "codex_home"
+    session_id = "34343434-3434-4434-8434-343434343434"
+    write_session_file(
+        codex_home,
+        "2026-07-25",
+        "2026-07-25T09-00-00",
+        session_id,
+        [
+            {
+                "timestamp": "2026-07-25T01:00:00.000Z",
+                "type": "turn_context",
+                "payload": {
+                    "turn_id": "turn-gpt-5.6-alias",
+                    "cwd": "/workspace/gpt-5-6-alias",
+                    "model": "gpt-5.6",
+                },
+            },
+            token_event("2026-07-25T01:00:05.000Z", 1_000_000, 250_000, 400_000),
+        ],
+    )
+
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    start_local = datetime(2026, 7, 25, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    end_local = datetime(2026, 7, 26, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+
+    report = module.collect_usage_report(start_local, end_local)
+    total_cost, partial_cost = module.calculate_models_cost(report["models"])
+
+    assert report["models"]["gpt-5.6"]["input_tokens"] == 1_000_000
+    assert report["models"]["gpt-5.6"]["cached_input_tokens"] == 250_000
+    assert report["models"]["gpt-5.6"]["output_tokens"] == 400_000
+    assert total_cost == pytest.approx(15.875)
+    assert partial_cost is False
+
 def test_collect_usage_handles_null_info_and_non_string_function_output(monkeypatch, codex_home):
     module = load_module()
     monkeypatch.setenv("CODEX_HOME", str(codex_home))

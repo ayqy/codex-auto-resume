@@ -111,6 +111,16 @@
 -   `make today F=/tmp/codex-today.txt`
     > 将今天的详细报告保存到指定文件。
 
+### 价格来源
+
+预估开销基于 2026 年 7 月 25 日核对的 OpenAI 官方价格页面：
+`https://developers.openai.com/api/docs/pricing`、
+`https://developers.openai.com/api/docs/models/gpt-5.6-sol`、
+`https://developers.openai.com/api/docs/models/gpt-5.6-terra`
+和 `https://developers.openai.com/api/docs/models/gpt-5.6-luna`。
+当前阶段的用量报告只会对脚本已支持的 `非缓存输入`、`缓存输入`
+和 `输出` 三类口径做价格估算。
+
 自动恢复现在会先从目标会话的 rollout 日志中恢复原会话使用的模型和推理强度，再执行 `codex resume`，以避免切换模型导致缓存连续性丢失。
 
 如果某个已调度的会话后来收到了新的正常 AI 消息，watcher 会在下一次轮询时自动取消这个 pending schedule，而不是等到计划触发时间才跳过。

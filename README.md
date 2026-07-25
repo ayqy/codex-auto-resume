@@ -111,6 +111,16 @@ Your focus is shattered. You have to remember to come back in an hour to resume 
 -   `make today F=/tmp/codex-today.txt`
     > Save today's detailed report to a specific file.
 
+### Pricing Data Source
+
+Estimated costs are based on OpenAI official pricing pages checked on July 25, 2026:
+`https://developers.openai.com/api/docs/pricing`,
+`https://developers.openai.com/api/docs/models/gpt-5.6-sol`,
+`https://developers.openai.com/api/docs/models/gpt-5.6-terra`,
+and `https://developers.openai.com/api/docs/models/gpt-5.6-luna`.
+At this stage, the usage report only applies pricing for the currently supported
+`uncached input`, `cached input`, and `output` dimensions.
+
 Auto-resume now restores the original session model and reasoning effort from that session's rollout log before running `codex resume`. This avoids switching models and losing cache continuity.
 
 If a scheduled session later receives a normal AI reply, the watcher cancels that pending resume on the next polling cycle instead of waiting until the scheduled trigger time.
