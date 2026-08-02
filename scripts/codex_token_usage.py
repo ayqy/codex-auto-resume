@@ -91,6 +91,10 @@ NOISE_BARE_MODE_REGEX = re.compile(r"^(EXECUTE|PLAN|RESEARCH|INNOVATE|REVIEW)$",
 COMMAND_ECHO_REGEX = re.compile(r"^[%$]\s+\S+")
 TAG_ONLY_REGEX = re.compile(r"^<[^>]+>$")
 NOISE_BLOCK_REGEXES = [
+    re.compile(
+        r"<recommended_plugins(?:\s[^>]*)?>.*?</recommended_plugins\s*>",
+        re.DOTALL | re.IGNORECASE,
+    ),
     re.compile(r"<INSTRUCTIONS>.*?</INSTRUCTIONS>", re.DOTALL),
     re.compile(r"<environment_context>.*?</environment_context>", re.DOTALL),
     re.compile(r"<turn_aborted>.*?</turn_aborted>", re.DOTALL),
@@ -117,6 +121,31 @@ def is_usage_item(obj: dict) -> bool:
         and isinstance(payload, dict)
         and payload.get("type") == "token_count"
     )
+
+
+def token_usage_snapshot_signature(obj: dict) -> Optional[str]:
+    if not is_usage_item(obj):
+        return None
+    payload = obj.get("payload", {})
+    info = payload.get("info", {})
+    if not isinstance(info, dict):
+        return None
+    last_usage = info.get("last_token_usage", {})
+    total_usage = info.get("total_token_usage", {})
+    if not isinstance(last_usage, dict) or not last_usage:
+        return None
+    if not isinstance(total_usage, dict) or not total_usage:
+        return None
+    return json.dumps(total_usage, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def register_token_usage_snapshot(state: dict, obj: dict) -> bool:
+    signature = token_usage_snapshot_signature(obj)
+    if signature is None:
+        return False
+    previous_signature = state.get("last_token_usage_snapshot_signature")
+    state["last_token_usage_snapshot_signature"] = signature
+    return signature == previous_signature
 
 
 def create_usage_dict():
@@ -843,6 +872,7 @@ def create_file_state(file_path: Path):
         "last_seen_at": None,
         "source_file": str(file_path),
         "used_in_range": False,
+        "last_token_usage_snapshot_signature": None,
     }
 
 
@@ -1365,7 +1395,8 @@ def collect_usage_data(start_local: datetime, end_local: datetime, include_sessi
 
             if event_time_utc is None:
                 continue
-            if is_activity_event(obj):
+            duplicate_usage_snapshot = register_token_usage_snapshot(file_state, obj)
+            if is_activity_event(obj) and not duplicate_usage_snapshot:
                 session_id = file_state["session_id"]
                 activity_record = activity_sessions.setdefault(session_id, create_session_record(session_id))
                 register_activity_event(activity_record, file_state, obj, event_time_local)
@@ -1378,7 +1409,7 @@ def collect_usage_data(start_local: datetime, end_local: datetime, include_sessi
                     )
             if not (start_utc <= event_time_utc < end_utc):
                 continue
-            if not is_usage_item(obj):
+            if not is_usage_item(obj) or duplicate_usage_snapshot:
                 continue
 
             payload = obj.get("payload", {})

@@ -117,6 +117,36 @@ def token_event(
     }
 
 
+def cumulative_token_event(
+    timestamp: str,
+    input_tokens: int,
+    cached_input_tokens: int,
+    output_tokens: int,
+    total_input_tokens: int,
+    total_cached_input_tokens: int,
+    total_output_tokens: int,
+    rate_limit_id: str = "",
+) -> dict:
+    event = token_event(
+        timestamp,
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        info_extra={
+            "total_token_usage": {
+                "input_tokens": total_input_tokens,
+                "cached_input_tokens": total_cached_input_tokens,
+                "output_tokens": total_output_tokens,
+                "reasoning_output_tokens": 0,
+                "total_tokens": total_input_tokens + total_output_tokens,
+            }
+        },
+    )
+    if rate_limit_id:
+        event["payload"]["rate_limits"] = {"limit_id": rate_limit_id}
+    return event
+
+
 def test_calculate_cost_supports_gpt_5_6_alias():
     module = load_module()
 
@@ -598,6 +628,35 @@ def test_extract_semantic_title_text_skips_noise_and_merges_lines():
     assert module.extract_semantic_title_text('{"status":"ok"}') is None
 
 
+def test_extract_semantic_title_text_ignores_recommended_plugins_block():
+    module = load_module()
+
+    text = """
+    <recommended_plugins>
+    Here is a list of plugins that are available but not installed.
+
+    - Airtable (airtable@openai-curated-remote)
+    - Asana (asana@openai-curated-remote)
+    </recommended_plugins>
+    """
+
+    assert module.extract_semantic_title_text(text) is None
+
+
+def test_extract_semantic_title_text_keeps_real_text_after_recommended_plugins():
+    module = load_module()
+
+    text = """
+    <RECOMMENDED_PLUGINS source="remote">
+    Here is a list of plugins that are available but not installed.
+    - Airtable (airtable@openai-curated-remote)
+    </RECOMMENDED_PLUGINS>
+    继续作为任务管理员 方方 推进以下任务。
+    """
+
+    assert module.extract_semantic_title_text(text) == "继续作为任务管理员 方方 推进以下任务。"
+
+
 def test_build_session_title_joins_next_message_when_first_is_short():
     module = load_module()
 
@@ -605,6 +664,256 @@ def test_build_session_title_joins_next_message_when_first_is_short():
     assert module.build_session_title("\n\n第一行   标题\n第二行", "fallback") == "第一行 标题 第二行"
     assert module.build_session_title(["第一条", "第二条补充"], "fallback") == "第一条 | 第二条补充"
     assert module.build_session_title("甲" * 240, "fallback") == "甲" * 200
+
+
+def test_collect_usage_report_uses_real_prompt_after_recommended_plugins(monkeypatch, tmp_path):
+    module = load_module()
+    codex_home = tmp_path / "codex_home"
+    session_id = "77777777-7777-4777-8777-777777777777"
+    write_session_file(
+        codex_home,
+        "2026-07-05",
+        "2026-07-05T10-00-00",
+        session_id,
+        [
+            {
+                "timestamp": "2026-07-05T02:00:00.000Z",
+                "type": "session_meta",
+                "payload": {"session_id": session_id, "id": session_id, "cwd": "/workspace/plugins"},
+            },
+            {
+                "timestamp": "2026-07-05T02:00:01.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "<recommended_plugins>\n"
+                                "Here is a list of plugins that are available but not installed.\n"
+                                "- Airtable (airtable@openai-curated-remote)\n"
+                                "</recommended_plugins>"
+                            ),
+                        },
+                        {
+                            "type": "input_text",
+                            "text": "# AGENTS.md instructions\n<INSTRUCTIONS>Always respond in 简体中文</INSTRUCTIONS>",
+                        },
+                    ],
+                },
+            },
+            {
+                "timestamp": "2026-07-05T02:00:02.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "继续作为任务管理员 方方 推进以下任务。"}],
+                },
+            },
+            turn_context_event("2026-07-05T02:00:03.000Z", "gpt-5.6-sol", cwd="/workspace/plugins"),
+            cumulative_token_event("2026-07-05T02:01:00.000Z", 100, 40, 10, 100, 40, 10),
+        ],
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    start_local = datetime(2026, 7, 5, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    end_local = datetime(2026, 7, 6, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    report = module.collect_usage_report(start_local, end_local)
+
+    assert report["sessions"][session_id]["title"] == "继续作为任务管理员 方方 推进以下任务。"
+
+
+def test_collect_usage_report_deduplicates_repeated_total_usage_snapshots(monkeypatch, tmp_path):
+    module = load_module()
+    codex_home = tmp_path / "codex_home"
+    session_id = "88888888-8888-4888-8888-888888888888"
+    write_session_file(
+        codex_home,
+        "2026-07-06",
+        "2026-07-06T10-00-00",
+        session_id,
+        [
+            turn_context_event("2026-07-06T02:00:00.000Z", "gpt-5.6-sol"),
+            cumulative_token_event("2026-07-06T02:01:00.000Z", 100, 40, 10, 100, 40, 10, "codex"),
+            cumulative_token_event("2026-07-06T02:02:00.000Z", 100, 40, 10, 100, 40, 10, "codex_bengalfox"),
+            cumulative_token_event("2026-07-06T02:03:00.000Z", 100, 40, 10, 100, 40, 10, "codex"),
+        ],
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    start_local = datetime(2026, 7, 6, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    end_local = datetime(2026, 7, 7, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    report = module.collect_usage_report(start_local, end_local)
+    session = report["sessions"][session_id]
+
+    assert session["input_tokens"] == 100
+    assert session["cached_input_tokens"] == 40
+    assert session["output_tokens"] == 10
+
+
+def test_collect_usage_report_deduplicates_snapshot_after_intervening_activity(monkeypatch, tmp_path):
+    module = load_module()
+    codex_home = tmp_path / "codex_home"
+    session_id = "99999999-9999-4999-8999-999999999999"
+    write_session_file(
+        codex_home,
+        "2026-07-06",
+        "2026-07-06T11-00-00",
+        session_id,
+        [
+            turn_context_event("2026-07-06T03:00:00.000Z", "gpt-5.6-sol"),
+            cumulative_token_event("2026-07-06T03:01:00.000Z", 100, 40, 10, 100, 40, 10),
+            {
+                "timestamp": "2026-07-06T03:02:00.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "处理中"}],
+                },
+            },
+            cumulative_token_event("2026-07-06T03:03:00.000Z", 100, 40, 10, 100, 40, 10),
+        ],
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    start_local = datetime(2026, 7, 6, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    end_local = datetime(2026, 7, 7, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    session = module.collect_usage_report(start_local, end_local)["sessions"][session_id]
+
+    assert session["input_tokens"] == 100
+    assert session["output_tokens"] == 10
+
+
+def test_collect_usage_report_counts_matching_last_usage_when_cumulative_total_grows(monkeypatch, tmp_path):
+    module = load_module()
+    codex_home = tmp_path / "codex_home"
+    session_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2"
+    write_session_file(
+        codex_home,
+        "2026-07-06",
+        "2026-07-06T12-00-00",
+        session_id,
+        [
+            turn_context_event("2026-07-06T04:00:00.000Z", "gpt-5.6-sol"),
+            cumulative_token_event("2026-07-06T04:01:00.000Z", 100, 40, 10, 100, 40, 10),
+            cumulative_token_event("2026-07-06T04:02:00.000Z", 100, 40, 10, 200, 80, 20),
+        ],
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    start_local = datetime(2026, 7, 6, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    end_local = datetime(2026, 7, 7, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    session = module.collect_usage_report(start_local, end_local)["sessions"][session_id]
+
+    assert session["input_tokens"] == 200
+    assert session["cached_input_tokens"] == 80
+    assert session["output_tokens"] == 20
+
+
+def test_collect_usage_report_deduplicates_snapshot_replayed_across_date_boundary(monkeypatch, tmp_path):
+    module = load_module()
+    codex_home = tmp_path / "codex_home"
+    session_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2"
+    write_session_file(
+        codex_home,
+        "2026-07-05",
+        "2026-07-05T23-59-00",
+        session_id,
+        [
+            turn_context_event("2026-07-05T15:59:00.000Z", "gpt-5.6-sol"),
+            cumulative_token_event("2026-07-05T15:59:50.000Z", 100, 40, 10, 100, 40, 10),
+            cumulative_token_event("2026-07-05T16:00:10.000Z", 100, 40, 10, 100, 40, 10),
+            cumulative_token_event("2026-07-05T16:01:00.000Z", 50, 20, 5, 150, 60, 15),
+        ],
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    start_local = datetime(2026, 7, 6, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    end_local = datetime(2026, 7, 7, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    session = module.collect_usage_report(start_local, end_local)["sessions"][session_id]
+
+    assert session["input_tokens"] == 50
+    assert session["cached_input_tokens"] == 20
+    assert session["output_tokens"] == 5
+
+
+def test_collect_usage_report_keeps_legacy_events_without_total_usage(monkeypatch, tmp_path):
+    module = load_module()
+    codex_home = tmp_path / "codex_home"
+    session_id = "cccccccc-cccc-4ccc-8ccc-ccccccccccc2"
+    first = token_event("2026-07-06T05:01:00.000Z", 100, 40, 10, info_extra={"total_token_usage": None})
+    second = token_event("2026-07-06T05:02:00.000Z", 100, 40, 10, info_extra={"total_token_usage": None})
+    write_session_file(
+        codex_home,
+        "2026-07-06",
+        "2026-07-06T13-00-00",
+        session_id,
+        [turn_context_event("2026-07-06T05:00:00.000Z", "gpt-5.6-sol"), first, second],
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    start_local = datetime(2026, 7, 6, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    end_local = datetime(2026, 7, 7, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    session = module.collect_usage_report(start_local, end_local)["sessions"][session_id]
+
+    assert session["input_tokens"] == 200
+    assert session["cached_input_tokens"] == 80
+    assert session["output_tokens"] == 20
+
+
+def test_collect_usage_report_counts_cumulative_counter_reset(monkeypatch, tmp_path):
+    module = load_module()
+    codex_home = tmp_path / "codex_home"
+    session_id = "dddddddd-dddd-4ddd-8ddd-ddddddddddd3"
+    write_session_file(
+        codex_home,
+        "2026-07-06",
+        "2026-07-06T14-00-00",
+        session_id,
+        [
+            turn_context_event("2026-07-06T06:00:00.000Z", "gpt-5.6-sol"),
+            cumulative_token_event("2026-07-06T06:01:00.000Z", 200, 80, 20, 200, 80, 20),
+            cumulative_token_event("2026-07-06T06:02:00.000Z", 50, 20, 5, 50, 20, 5),
+        ],
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    start_local = datetime(2026, 7, 6, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    end_local = datetime(2026, 7, 7, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    session = module.collect_usage_report(start_local, end_local)["sessions"][session_id]
+
+    assert session["input_tokens"] == 250
+    assert session["cached_input_tokens"] == 100
+    assert session["output_tokens"] == 25
+
+
+def test_collect_usage_report_duplicate_snapshot_does_not_extend_activity(monkeypatch, tmp_path):
+    module = load_module()
+    codex_home = tmp_path / "codex_home"
+    session_id = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee4"
+    write_session_file(
+        codex_home,
+        "2026-07-06",
+        "2026-07-06T15-00-00",
+        session_id,
+        [
+            turn_context_event("2026-07-06T07:00:00.000Z", "gpt-5.6-sol", turn_id="turn-activity"),
+            cumulative_token_event("2026-07-06T07:01:00.000Z", 100, 40, 10, 100, 40, 10),
+            cumulative_token_event("2026-07-06T07:30:00.000Z", 100, 40, 10, 100, 40, 10),
+        ],
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    start_local = datetime(2026, 7, 6, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    end_local = datetime(2026, 7, 7, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    report = module.collect_usage_report(start_local, end_local)
+
+    assert report["sessions"][session_id]["active_seconds"] == 60
+    assert report["active_seconds"] == 60
 
 
 def test_collect_usage_report_includes_session_title_and_totals(monkeypatch, codex_home):
