@@ -4,3 +4,4 @@ scripts/__pycache__/
 tests/__pycache__/
 *.pyc
 .DS_Store
+*.plist.tmp

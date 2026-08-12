@@ -81,6 +81,12 @@
 | `make recent`| 显示过去 30 天的用量统计。(例如: `make recent N=7` 显示过去 7 天) |
 | `make status`| 显示监控程序的当前状态，包括等待中和已触发的恢复任务。 |
 | `make test` | 运行项目中的自动化测试。 |
+| `make reset-query` | 通过官方 Codex RPC 与只读 WHAM GET 交叉查询重置权益，仅显示状态和北京时间过期时间。 |
+| `make reset-doctor` | 只读检查 Codex、认证、双路查询和可用重置权益。 |
+| `make reset-dry-run` | 演练锁卡、主路径、10 分钟升级和确认流程；不会发送消费 POST。 |
+| `make reset-arm` | 明确授权并锁定唯一可用卡，持久化单次操作和幂等键。 |
+| `make reset-install` | 安装并启动 macOS LaunchAgent，持续守候到目标时间且阻止休眠。 |
+| `make reset-status` | 输出脱敏的重置守候状态。 |
 
 ### 使用示例
 
@@ -135,6 +141,37 @@
 如果需要，您也可以随时通过 `make check` 手动执行这套探针。
 
 当 `make run` 运行正常且本轮没有用户需要关注的变化时，控制台只会输出一行简短摘要。如果需要查看完整内部轨迹，请检查 `tmp/logs/watcher.log`；`tmp/state.json` 仍然是 pending / triggered 任务的最终状态来源。
+
+### 到期前自动使用重置权益
+
+该流程默认只读。`reset-query` 会同时使用官方 `account/rateLimits/read` RPC 和
+`GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`，只有两边返回的数量、
+状态、类型及时间完全一致才继续。控制台只显示卡片状态和北京时间过期时间，不记录
+access token、refresh token、完整卡 ID 或幂等键。
+
+真实操作必须先运行 `make reset-arm`。它要求当前恰好只有一张可用卡，锁定最早到期的
+`codexRateLimits` 卡，并在到期前一小时通过官方稳定 RPC
+`account/rateLimitResetCredit/consume` 使用该卡。网络结果不明确时复用同一个幂等键，
+卡片处于 `redeeming` 时只查询、不重复写；成功后立即停止，绝不切换到其他卡。
+
+如果主路径在十分钟内仍未由双路查询确认，程序进入官方 `/usage` TUI 兜底；再过两分钟
+仍未确认时，进入已按同一版 OpenAI Codex 源码准备的底层官方契约兜底。官方源码确认的
+底层消费路由是 `/wham/rate-limit-reset-credits/consume`，而不是
+`/wham/rate-limit-reset`。所有兜底均继续使用锁定卡和原未决幂等键。
+
+推荐的部署顺序：
+
+```bash
+make reset-doctor
+make reset-dry-run
+make reset-arm
+make reset-install
+make reset-status
+```
+
+LaunchAgent 会在登录会话中自动启动，并通过 macOS `caffeinate` 阻止目标窗口前休眠。
+脱敏状态和日志位于 `tmp/reset-credit/`，私有操作文件权限为 `0600` 且已被 `.gitignore`
+排除。停止或重启进程不会更换卡或幂等键。
 
 <details>
 <summary><b>高级用法与调试</b></summary>

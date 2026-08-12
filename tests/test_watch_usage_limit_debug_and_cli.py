@@ -76,6 +76,27 @@ def seed_logs(path: Path):
     )
 
 
+def freeze_module_time(module, monkeypatch, now):
+    class FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+
+        @classmethod
+        def fromtimestamp(cls, ts, tz=None):
+            return datetime.fromtimestamp(ts, tz=tz)
+
+        @classmethod
+        def fromisoformat(cls, value):
+            return datetime.fromisoformat(value)
+
+        @classmethod
+        def strptime(cls, date_string, fmt):
+            return datetime.strptime(date_string, fmt)
+
+    monkeypatch.setattr(module, "datetime", FakeDateTime)
+
+
 def test_main_status_outputs_json(module, monkeypatch, base_dir, codex_home, capsys):
     seed_logs(codex_home / "logs_2.sqlite")
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
@@ -131,6 +152,11 @@ def test_main_debug_limit_history_outputs_sections(module, monkeypatch, base_dir
 
 
 def test_main_debug_session_outputs_session_json(module, monkeypatch, codex_home, capsys):
+    monkeypatch.setattr(
+        module.UsageLimitWatcher,
+        "build_since_dt",
+        lambda self, days: datetime(2026, 6, 18, 0, 0, 0, tzinfo=self.local_tz),
+    )
     seed_logs(codex_home / "logs_2.sqlite")
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     monkeypatch.setattr(

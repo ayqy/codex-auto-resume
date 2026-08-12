@@ -81,6 +81,12 @@ Your focus is shattered. You have to remember to come back in an hour to resume 
 | `make recent`| Shows usage stats for the last 30 days. (e.g., `make recent N=7` for the last 7 days) |
 | `make status`| Shows the current status of the watcher, including pending and triggered resume jobs. |
 | `make test`  | Runs the automated tests for the project. |
+| `make reset-query` | Cross-checks reset credits through the official Codex RPC and a read-only WHAM GET; prints status and Beijing expiry only. |
+| `make reset-doctor` | Read-only validation of Codex, authentication, both query paths, and an available reset credit. |
+| `make reset-dry-run` | Exercises locking, primary, ten-minute escalation, and verification without a consume POST. |
+| `make reset-arm` | Explicitly authorizes and locks the only available reset credit with persistent idempotency state. |
+| `make reset-install` | Installs and starts the macOS LaunchAgent, including sleep prevention. |
+| `make reset-status` | Prints redacted reset-watch status. |
 
 ### Usage Examples
 
@@ -138,6 +144,38 @@ If pending resumes exist, each polling cycle also reuses that same probe to chec
 You can also run that probe manually at any time with `make check`.
 
 When `make run` is healthy and there are no user-visible changes, it prints a single short summary line for that cycle. If you need the full internal trace, inspect `tmp/logs/watcher.log`; `tmp/state.json` remains the source of truth for pending and triggered jobs.
+
+### Redeeming an expiring reset credit automatically
+
+This workflow is read-only by default. `reset-query` cross-validates the official
+`account/rateLimits/read` RPC with
+`GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`. It proceeds only when
+counts, status, type, and timestamps agree. Output and logs never contain access or refresh tokens,
+full credit IDs, or idempotency keys.
+
+Run `make reset-arm` to explicitly authorize one redemption. Arming requires exactly one available
+credit, locks that specific `codexRateLimits` credit, and schedules the official stable
+`account/rateLimitResetCredit/consume` RPC for one hour before expiry. Ambiguous network retries
+reuse one persistent idempotency key; a `redeeming` credit is polled without another write; a
+confirmed success permanently stops the one-shot watcher.
+
+If the primary path is not confirmed within ten minutes, the watcher escalates to the official
+Codex `/usage` UI. Two minutes later it can use a rescue runner derived from the pinned OpenAI Codex
+source contract. The current official backend route is
+`/wham/rate-limit-reset-credits/consume`, not `/wham/rate-limit-reset`. Every fallback remains bound
+to the locked credit and the pending idempotency key.
+
+```bash
+make reset-doctor
+make reset-dry-run
+make reset-arm
+make reset-install
+make reset-status
+```
+
+The LaunchAgent starts in the login session and uses macOS `caffeinate` to prevent sleep during the
+critical window. Redacted state lives under `tmp/reset-credit/`; the `0600` private operation file is
+ignored by Git. Restarting the process does not select another credit or replace an uncertain key.
 
 <details>
 <summary><b>Advanced Usage & Debugging</b></summary>

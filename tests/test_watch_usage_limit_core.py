@@ -45,6 +45,27 @@ def make_watcher(module, monkeypatch, base_dir, codex_home):
     return module.UsageLimitWatcher(base_dir, cleanup_on_init=False)
 
 
+def freeze_module_time(module, monkeypatch, now):
+    class FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+
+        @classmethod
+        def fromtimestamp(cls, ts, tz=None):
+            return datetime.fromtimestamp(ts, tz=tz)
+
+        @classmethod
+        def fromisoformat(cls, value):
+            return datetime.fromisoformat(value)
+
+        @classmethod
+        def strptime(cls, date_string, fmt):
+            return datetime.strptime(date_string, fmt)
+
+    monkeypatch.setattr(module, "datetime", FakeDateTime)
+
+
 def seed_logs(path: Path):
     create_logs_db(
         path,
@@ -1111,6 +1132,11 @@ def test_collect_rollout_candidates_for_thread_skips_transient_premium_credits_e
 def test_build_desired_pending_jobs_prefers_latest_log_error_after_transient_rollout_limit(
     module, monkeypatch, base_dir, codex_home
 ):
+    freeze_module_time(
+        module,
+        monkeypatch,
+        datetime(2026, 7, 10, 11, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai")),
+    )
     session_id = "019f49c4-e8b6-7523-a3fa-45312102d488"
     create_logs_db(
         codex_home / "logs_2.sqlite",
@@ -1301,6 +1327,11 @@ def test_fetch_logs_matching_keeps_exact_desc_order_with_batched_scan(module, mo
 
 
 def test_collect_confirmed_candidates_falls_back_when_logs_db_unavailable(module, monkeypatch, base_dir, codex_home):
+    freeze_module_time(
+        module,
+        monkeypatch,
+        datetime(2026, 7, 13, 12, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai")),
+    )
     watcher = make_watcher(module, monkeypatch, base_dir, codex_home)
     broken_logs = codex_home / "logs_2.sqlite"
     broken_logs.write_text("not a sqlite db", encoding="utf-8")
@@ -1675,6 +1706,11 @@ def test_collect_rollout_candidates_for_thread_ignores_probe_workspace_session(m
 
 
 def test_collect_log_candidates_detects_model_capacity_turn_error(module, monkeypatch, base_dir, codex_home):
+    freeze_module_time(
+        module,
+        monkeypatch,
+        datetime(2026, 7, 13, 12, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai")),
+    )
     create_logs_db(
         codex_home / "logs_2.sqlite",
         [
