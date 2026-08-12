@@ -12,6 +12,10 @@ umask 077
 
 while true; do
   NOW="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+  if [[ -s "$STATUS_PATH" ]] && /usr/bin/grep -Eq '"status"[[:space:]]*:[[:space:]]*"(completed|expired|disabled)"' "$STATUS_PATH"; then
+    printf '%s terminal-state; monitor-exit\n' "$NOW" >>"$MONITOR_LOG"
+    exit 0
+  fi
   LAUNCH_STATUS="$(/bin/launchctl print "$DOMAIN/$LABEL" 2>/dev/null || true)"
   if ! /usr/bin/grep -q 'state = running' <<<"$LAUNCH_STATUS"; then
     printf '%s launch-agent-not-running; kickstart\n' "$NOW" >>"$MONITOR_LOG"
