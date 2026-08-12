@@ -22,6 +22,7 @@ SCRIPT_FILES = (
     "codex_reset_transport.py",
     "configure_config.py",
     "official_usage_fallback.py",
+    "monitor_reset_credit_launch_agent.sh",
     "reset_credit_manager.py",
     "run_reset_credit_manager.sh",
 )
