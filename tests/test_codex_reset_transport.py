@@ -76,6 +76,41 @@ def test_cross_validation_rejects_status_and_count_disagreement(module):
         module.validate_snapshot_pair(app, direct)
 
 
+def test_cross_validation_accepts_official_sparse_details_and_reconciles(monkeypatch, module):
+    sparse = app_payload()
+    sparse["rateLimitResetCredits"]["credits"] = None
+    app = module.normalize_app_server_snapshot(sparse)
+    direct = module.normalize_direct_snapshot(direct_payload())
+    module.validate_snapshot_pair(app, direct)
+
+    class AppClient:
+        def __init__(self, **_kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *_args): pass
+        def read_rate_limits(self): return app
+        def refresh_auth(self): return None
+
+    class DirectClient:
+        def __init__(self, **_kwargs): pass
+        def read_credits(self): return direct
+
+    monkeypatch.setattr(module, "CodexAppServerClient", AppClient)
+    monkeypatch.setattr(module, "WhamReadClient", DirectClient)
+    result = module.default_cross_validate()
+    assert result.app_server.available_count == 1
+    assert result.app_server.credits == direct.credits
+
+
+def test_sparse_app_details_still_reject_count_disagreement(module):
+    sparse = app_payload()
+    sparse["rateLimitResetCredits"]["credits"] = None
+    app = module.normalize_app_server_snapshot(sparse)
+    direct = module.normalize_direct_snapshot(direct_payload())
+    direct = module.ResetSnapshot(0, direct.credits, direct.source)
+    with pytest.raises(module.ResetTransportError, match="counts disagree"):
+        module.validate_snapshot_pair(app, direct)
+
+
 def test_selects_only_earliest_unexpired_available_codex_credit(module):
     payload = app_payload()
     payload["rateLimitResetCredits"]["availableCount"] = 4

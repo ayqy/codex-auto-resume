@@ -384,7 +384,16 @@ def default_cross_validate(codex_bin: str = "codex") -> CrossValidationResult:
 
         direct_snapshot = WhamReadClient(refresh_callback=refresh).read_credits()
     validate_snapshot_pair(app_snapshot, direct_snapshot)
-    return CrossValidationResult(app_server=app_snapshot, direct_get=direct_snapshot)
+    # The official app-server contract explicitly permits `credits: null` (and
+    # capped detail rows) while still returning an authoritative availableCount.
+    # Once that count and every detail row it did return agree with the direct
+    # read-only endpoint, use the latter's complete rows for fixed-card checks.
+    reconciled_app_snapshot = ResetSnapshot(
+        available_count=app_snapshot.available_count,
+        credits=direct_snapshot.credits,
+        source="app-server-count+direct-get-details",
+    )
+    return CrossValidationResult(app_server=reconciled_app_snapshot, direct_get=direct_snapshot)
 
 
 def _comparison_rows(snapshot: ResetSnapshot):
@@ -397,7 +406,9 @@ def _comparison_rows(snapshot: ResetSnapshot):
 def validate_snapshot_pair(app_snapshot: ResetSnapshot, direct_snapshot: ResetSnapshot):
     if app_snapshot.available_count != direct_snapshot.available_count:
         raise ResetTransportError("cross-validation-failed", "reset-credit counts disagree")
-    if _comparison_rows(app_snapshot) != _comparison_rows(direct_snapshot):
+    app_rows = _comparison_rows(app_snapshot)
+    direct_rows = _comparison_rows(direct_snapshot)
+    if any(direct_rows.get(credit_id) != row for credit_id, row in app_rows.items()):
         raise ResetTransportError("cross-validation-failed", "reset-credit details disagree")
 
 
