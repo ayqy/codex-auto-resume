@@ -45,7 +45,7 @@ TUI_FALLBACK_PATH = BASE_DIR / "scripts" / "official_usage_fallback.py"
 SOURCE_RESCUE_PATH = Path(
     os.environ.get(
         "CODEX_SOURCE_RESCUE_PATH",
-        BASE_DIR / "scripts" / "reset_credit_rescue.py",
+        Path.home() / "Documents" / "source" / "codex" / "scripts" / "reset_credit_rescue.py",
     )
 )
 DEFAULT_BEFORE_SECONDS = 3600

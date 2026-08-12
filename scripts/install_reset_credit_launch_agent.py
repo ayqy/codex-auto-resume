@@ -17,7 +17,7 @@ RUNTIME_DIR = INSTALL_ROOT / "state"
 RUNNER_PATH = BUNDLE_DIR / "scripts" / "run_reset_credit_manager.sh"
 LOG_DIR = RUNTIME_DIR
 LEGACY_RUNTIME_DIR = BASE_DIR / "tmp" / "reset-credit"
-SOURCE_RESCUE_PATH = Path("/Users/pocket/Documents/source/codex/scripts/reset_credit_rescue.py")
+SOURCE_RESCUE_PATH = Path.home() / "Documents" / "source" / "codex" / "scripts" / "reset_credit_rescue.py"
 SCRIPT_FILES = (
     "codex_reset_transport.py",
     "configure_config.py",
