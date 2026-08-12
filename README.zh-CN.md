@@ -170,8 +170,9 @@ make reset-status
 ```
 
 LaunchAgent 会在登录会话中自动启动，并通过 macOS `caffeinate` 阻止目标窗口前休眠。
-脱敏状态和日志位于 `tmp/reset-credit/`，私有操作文件权限为 `0600` 且已被 `.gitignore`
-排除。停止或重启进程不会更换卡或幂等键。
+安装器会把最小运行包和私有状态部署到
+`~/Library/Application Support/codex-auto-resume/reset-credit/`，避免 macOS 隐私控制阻止
+LaunchAgent 访问 `Documents`。私有操作文件权限为 `0600`；停止或重启进程不会更换卡或幂等键。
 
 <details>
 <summary><b>高级用法与调试</b></summary>

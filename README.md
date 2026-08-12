@@ -174,8 +174,10 @@ make reset-status
 ```
 
 The LaunchAgent starts in the login session and uses macOS `caffeinate` to prevent sleep during the
-critical window. Redacted state lives under `tmp/reset-credit/`; the `0600` private operation file is
-ignored by Git. Restarting the process does not select another credit or replace an uncertain key.
+critical window. The installer deploys a minimal runtime bundle and private state under
+`~/Library/Application Support/codex-auto-resume/reset-credit/`, outside the macOS-protected
+`Documents` directory. The private operation file is `0600`; restarting the process does not select
+another credit or replace an uncertain key.
 
 <details>
 <summary><b>Advanced Usage & Debugging</b></summary>

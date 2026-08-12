@@ -35,13 +35,19 @@ from codex_reset_transport import (
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-RUNTIME_DIR = BASE_DIR / "tmp" / "reset-credit"
+APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "codex-auto-resume" / "reset-credit"
+RUNTIME_DIR = Path(os.environ.get("CODEX_RESET_RUNTIME_DIR", APP_SUPPORT_DIR / "state"))
 PRIVATE_OPERATION_PATH = RUNTIME_DIR / "private-operation.json"
 STATUS_PATH = RUNTIME_DIR / "status.json"
 EVENT_LOG_PATH = RUNTIME_DIR / "events.log"
 LOCK_PATH = RUNTIME_DIR / "manager.lock"
 TUI_FALLBACK_PATH = BASE_DIR / "scripts" / "official_usage_fallback.py"
-SOURCE_RESCUE_PATH = Path("/Users/pocket/Documents/source/codex/scripts/reset_credit_rescue.py")
+SOURCE_RESCUE_PATH = Path(
+    os.environ.get(
+        "CODEX_SOURCE_RESCUE_PATH",
+        BASE_DIR / "scripts" / "reset_credit_rescue.py",
+    )
+)
 DEFAULT_BEFORE_SECONDS = 3600
 DEFAULT_FALLBACK_AFTER_SECONDS = 600
 DEFAULT_SOURCE_RESCUE_AFTER_SECONDS = 720

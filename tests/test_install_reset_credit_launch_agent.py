@@ -26,7 +26,37 @@ def test_plist_has_absolute_paths_restart_policy_and_no_secrets():
     assert payload["ProgramArguments"][0] == "/bin/bash"
     assert payload["ProgramArguments"][1].startswith("/")
     assert payload["WorkingDirectory"].startswith("/")
+    assert "/Documents/" not in payload["ProgramArguments"][1]
+    assert "/Documents/" not in payload["WorkingDirectory"]
+    assert payload["EnvironmentVariables"]["CODEX_RESET_RUNTIME_DIR"] == str(module.RUNTIME_DIR)
+    assert payload["EnvironmentVariables"]["CODEX_SOURCE_RESCUE_PATH"].startswith(str(module.BUNDLE_DIR))
     assert "access_token" not in serialized
     assert "refresh_token" not in serialized
     assert "credit_id" not in serialized
     assert "idempotency" not in serialized
+
+
+def test_deploy_bundle_migrates_private_state_and_official_rescue(tmp_path, monkeypatch):
+    module = load_script_module("install_reset_credit_launch_agent")
+    source = tmp_path / "source"
+    legacy = tmp_path / "legacy"
+    bundle = tmp_path / "installed" / "app"
+    runtime = tmp_path / "installed" / "state"
+    (source / "scripts").mkdir(parents=True)
+    legacy.mkdir()
+    for name in module.SCRIPT_FILES:
+        (source / "scripts" / name).write_text(name)
+    rescue = tmp_path / "reset_credit_rescue.py"
+    rescue.write_text("rescue")
+    (legacy / "private-operation.json").write_text("{}")
+    monkeypatch.setattr(module, "BASE_DIR", source)
+    monkeypatch.setattr(module, "LEGACY_RUNTIME_DIR", legacy)
+    monkeypatch.setattr(module, "BUNDLE_DIR", bundle)
+    monkeypatch.setattr(module, "RUNTIME_DIR", runtime)
+    monkeypatch.setattr(module, "SOURCE_RESCUE_PATH", rescue)
+
+    module.deploy_bundle()
+
+    assert (bundle / "scripts" / "reset_credit_manager.py").is_file()
+    assert (bundle / "scripts" / "reset_credit_rescue.py").read_text() == "rescue"
+    assert (runtime / "private-operation.json").stat().st_mode & 0o777 == 0o600

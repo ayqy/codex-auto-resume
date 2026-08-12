@@ -2,8 +2,10 @@
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUNTIME_DIR="$APP_DIR/tmp/reset-credit"
+RUNTIME_DIR="${CODEX_RESET_RUNTIME_DIR:-$HOME/Library/Application Support/codex-auto-resume/reset-credit/state}"
 mkdir -p "$RUNTIME_DIR"
+chmod 700 "$RUNTIME_DIR"
+umask 077
 
 export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.cargo/bin"
 CODEX_BIN="${CODEX_BIN:-/usr/local/bin/codex}"
