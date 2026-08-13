@@ -29,9 +29,9 @@ STATE_FILES = (
     "private-operation.json",
     "status.json",
     "events.log",
-    "source-manifest.json",
 )
 OBSOLETE_SCRIPT_FILES = ("monitor_reset_credit_launch_agent.sh",)
+OBSOLETE_STATE_FILES = ("source-manifest.json",)
 
 
 def _copy_file(source: Path, destination: Path, mode: int) -> None:
@@ -57,6 +57,10 @@ def deploy_bundle() -> None:
         _copy_file(BASE_DIR / "scripts" / name, scripts_dir / name, mode)
     for name in OBSOLETE_SCRIPT_FILES:
         stale = scripts_dir / name
+        if stale.is_file():
+            stale.unlink()
+    for name in OBSOLETE_STATE_FILES:
+        stale = RUNTIME_DIR / name
         if stale.is_file():
             stale.unlink()
     config_path = BASE_DIR / "config.json"

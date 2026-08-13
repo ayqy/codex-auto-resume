@@ -48,6 +48,8 @@ def test_deploy_bundle_migrates_private_state_and_bundled_rescue(tmp_path, monke
         (source / "scripts" / name).write_text(name)
     (bundle / "scripts").mkdir(parents=True)
     (bundle / "scripts" / "monitor_reset_credit_launch_agent.sh").write_text("stale")
+    runtime.mkdir(parents=True)
+    (runtime / "source-manifest.json").write_text("stale source paths")
     (legacy / "private-operation.json").write_text("{}")
     monkeypatch.setattr(module, "BASE_DIR", source)
     monkeypatch.setattr(module, "LEGACY_RUNTIME_DIR", legacy)
@@ -59,6 +61,7 @@ def test_deploy_bundle_migrates_private_state_and_bundled_rescue(tmp_path, monke
     assert (bundle / "scripts" / "reset_credit_manager.py").is_file()
     assert (bundle / "scripts" / "reset_credit_rescue.py").read_text() == "reset_credit_rescue.py"
     assert not (bundle / "scripts" / "monitor_reset_credit_launch_agent.sh").exists()
+    assert not (runtime / "source-manifest.json").exists()
     assert (runtime / "private-operation.json").stat().st_mode & 0o777 == 0o600
 
 
