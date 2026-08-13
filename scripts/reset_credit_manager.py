@@ -43,10 +43,7 @@ EVENT_LOG_PATH = RUNTIME_DIR / "events.log"
 LOCK_PATH = RUNTIME_DIR / "manager.lock"
 TUI_FALLBACK_PATH = BASE_DIR / "scripts" / "official_usage_fallback.py"
 SOURCE_RESCUE_PATH = Path(
-    os.environ.get(
-        "CODEX_SOURCE_RESCUE_PATH",
-        Path.home() / "Documents" / "source" / "codex" / "scripts" / "reset_credit_rescue.py",
-    )
+    BASE_DIR / "scripts" / "reset_credit_rescue.py"
 )
 DEFAULT_BEFORE_SECONDS = 3600
 DEFAULT_FALLBACK_AFTER_SECONDS = 600
@@ -107,6 +104,7 @@ def public_operation(operation: dict) -> dict:
         "version": operation.get("version"),
         "status": operation.get("status"),
         "authorized": bool(operation.get("authorize_consume")),
+        "execution_mode": operation.get("execution_mode"),
         "expires_at": iso_beijing(operation.get("expires_at")),
         "trigger_at": iso_beijing(operation.get("trigger_at")),
         "fallback_at": iso_beijing(operation.get("fallback_at")),
@@ -200,24 +198,49 @@ def build_operation(
     available_count: int,
     authorize_consume: bool,
     now: Optional[int] = None,
+    execution_mode: str = "scheduled",
 ) -> dict:
     now = epoch_now() if now is None else int(now)
     if credit.expires_at is None:
         raise ResetTransportError("invalid-credit", "the selected reset credit has no expiry")
-    trigger_at = credit.expires_at - DEFAULT_BEFORE_SECONDS
     if now >= credit.expires_at:
         raise ResetTransportError("credit-expired", "the selected reset credit is already expired")
+    if execution_mode not in {"scheduled", "immediate"}:
+        raise ResetTransportError("invalid-execution-mode", "the reset execution mode is invalid")
+    scheduled_at = credit.expires_at - DEFAULT_BEFORE_SECONDS
+    trigger_at = now if execution_mode == "immediate" or scheduled_at <= now else scheduled_at
+    if execution_mode == "immediate" or scheduled_at <= now:
+        execution_mode = "immediate"
+    remaining = credit.expires_at - trigger_at
+    if remaining <= 60:
+        raise ResetTransportError("window-too-short", "less than one minute remains before the credit expires")
+
+    if remaining >= DEFAULT_BEFORE_SECONDS:
+        fallback_delay = DEFAULT_FALLBACK_AFTER_SECONDS
+        source_delay = DEFAULT_SOURCE_RESCUE_AFTER_SECONDS
+        target_delay = DEFAULT_TARGET_AFTER_SECONDS
+    else:
+        fallback_delay = min(DEFAULT_FALLBACK_AFTER_SECONDS, max(20, remaining // 5))
+        source_delay = min(
+            DEFAULT_SOURCE_RESCUE_AFTER_SECONDS,
+            max(fallback_delay + 20, remaining * 3 // 10),
+        )
+        target_delay = min(
+            DEFAULT_TARGET_AFTER_SECONDS,
+            max(source_delay + 20, remaining - 60),
+        )
     return {
         "version": 1,
         "credit_id": credit.id,
         "credit_fingerprint": secrets.token_hex(16),
         "expires_at": credit.expires_at,
         "initial_available_count": available_count,
+        "execution_mode": execution_mode,
         "trigger_at": trigger_at,
-        "fallback_at": trigger_at + DEFAULT_FALLBACK_AFTER_SECONDS,
-        "source_rescue_at": trigger_at + DEFAULT_SOURCE_RESCUE_AFTER_SECONDS,
-        "target_at": trigger_at + DEFAULT_TARGET_AFTER_SECONDS,
-        "precheck_at": [trigger_at - offset for offset in PRECHECK_OFFSETS],
+        "fallback_at": trigger_at + fallback_delay,
+        "source_rescue_at": trigger_at + source_delay,
+        "target_at": trigger_at + target_delay,
+        "precheck_at": [] if execution_mode == "immediate" else [trigger_at - offset for offset in PRECHECK_OFFSETS],
         "completed_prechecks": [],
         "authorize_consume": bool(authorize_consume),
         "status": "armed" if authorize_consume else "dry-run-armed",
@@ -232,6 +255,45 @@ def build_operation(
         "updated_at": now,
         "pid": None,
     }
+
+
+def arm_selected_credit(
+    codex_bin: str,
+    selected_credit: ResetCredit,
+    execution_mode: str,
+    authorize_consume: bool = True,
+) -> dict:
+    with manager_lock():
+        result = default_cross_validate(codex_bin=codex_bin)
+        current = result.direct_get.credit_by_id(selected_credit.id)
+        if current is None:
+            raise ResetTransportError("credit-unavailable", "the selected reset credit is no longer present")
+        if current.status != "available" or current.reset_type != "codexRateLimits":
+            raise ResetTransportError("credit-unavailable", "the selected reset credit is no longer available")
+        if current.expires_at != selected_credit.expires_at:
+            raise ResetTransportError("credit-changed", "the selected reset credit changed before confirmation")
+
+        try:
+            existing = read_json(PRIVATE_OPERATION_PATH)
+        except ResetTransportError as exc:
+            if exc.category != "not-armed":
+                raise
+            existing = None
+        if existing and existing.get("credit_id") == current.id and existing.get("status") not in TERMINAL_STATUSES:
+            operation = existing
+            operation["authorize_consume"] = bool(authorize_consume or operation.get("authorize_consume"))
+            operation["status"] = "armed" if operation["authorize_consume"] else "dry-run-armed"
+            operation["last_event"] = "rearmed"
+        else:
+            operation = build_operation(
+                current,
+                result.app_server.available_count,
+                authorize_consume,
+                execution_mode=execution_mode,
+            )
+        save_operation(operation)
+        log_event("armed", status=operation["status"], scheduled_at=iso_beijing(operation["trigger_at"]))
+        return operation
 
 
 def arm(codex_bin: str, authorize_consume: bool, require_available_count: int) -> int:
@@ -287,6 +349,15 @@ def confirmed_consumed(result: CrossValidationResult, operation: dict, accepted_
         and absent_or_not_available
     ):
         return True
+    initial_count = int(operation.get("initial_available_count", -1))
+    if (
+        accepted_outcome == "reset"
+        and initial_count > 1
+        and result.app_server.available_count == initial_count - 1
+        and result.direct_get.available_count == initial_count - 1
+        and absent_or_not_available
+    ):
+        return True
     return accepted_outcome == "alreadyRedeemed" and absent_or_not_available
 
 
@@ -322,11 +393,12 @@ def rotate_logical_attempt(operation: dict, next_at: int):
 
 def next_source_retry_at(operation: dict, now: int) -> int:
     trigger_at = int(operation["trigger_at"])
+    expires_at = int(operation["expires_at"])
     for offset in SOURCE_RETRY_OFFSETS:
         candidate = trigger_at + offset
-        if candidate > now:
+        if now < candidate < expires_at:
             return candidate
-    return min(now + 20, int(operation["expires_at"]) - 1)
+    return min(now + 20, expires_at - 1)
 
 
 def verify_before_write(operation: dict, codex_bin: str) -> CrossValidationResult:
@@ -393,7 +465,8 @@ def primary_attempt(operation: dict, codex_bin: str, now: int) -> str:
         prior_uncertain = sum(
             1 for item in operation.get("attempts", []) if str(item.get("outcome", "")).startswith("error:")
         )
-        operation["next_attempt_at"] = now + (20 if prior_uncertain <= 1 else 60)
+        retry_delay = 20 if prior_uncertain <= 1 else 60
+        operation["next_attempt_at"] = min(now + retry_delay, int(operation["fallback_at"]))
         operation["status"] = "retrying"
         save_operation(operation)
         log_event("primary-attempt-error", transport="app-server", category=exc.category)
@@ -411,14 +484,17 @@ def primary_attempt(operation: dict, codex_bin: str, now: int) -> str:
         if logical_attempt > len(retry_offsets):
             next_at = int(operation["fallback_at"])
         else:
-            next_at = int(operation["trigger_at"]) + retry_offsets[logical_attempt - 1]
+            next_at = min(
+                int(operation["trigger_at"]) + retry_offsets[logical_attempt - 1],
+                int(operation["fallback_at"]),
+            )
         if next_at <= now:
-            next_at = max(now + 30, int(operation["fallback_at"]))
+            next_at = now if now >= int(operation["fallback_at"]) else min(now + 20, int(operation["fallback_at"]))
         rotate_logical_attempt(operation, next_at)
         operation["status"] = "retrying"
         save_operation(operation)
         return outcome
-    operation["next_attempt_at"] = now + 20
+    operation["next_attempt_at"] = min(now + 20, int(operation["fallback_at"]))
     operation["status"] = "retrying"
     save_operation(operation)
     return "unconfirmed"

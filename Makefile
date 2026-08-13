@@ -10,7 +10,7 @@ D ?=
 N ?= 30
 F ?=
 
-.PHONY: today usage recent run check status debug clean chmod test config proxy workat resume reset-query reset-doctor reset-dry-run reset-arm reset-watch reset-status reset-install
+.PHONY: today usage recent run check status debug clean chmod test config proxy workat resume reset
 
 today: usage
 
@@ -43,26 +43,8 @@ check:
 	@mkdir -p "$(LOG_DIR)"
 	@"$(APP_DIR)/scripts/run_workat_prewarm.sh"
 
-reset-query:
-	@$(PYTHON) "$(APP_DIR)/scripts/reset_credit_manager.py" query
-
-reset-doctor:
-	@$(PYTHON) "$(APP_DIR)/scripts/reset_credit_manager.py" doctor
-
-reset-dry-run:
-	@$(PYTHON) "$(APP_DIR)/scripts/reset_credit_manager.py" dry-run
-
-reset-arm:
-	@$(PYTHON) "$(APP_DIR)/scripts/reset_credit_manager.py" arm --authorize-consume --require-available-count 1
-
-reset-watch:
-	@"$(APP_DIR)/scripts/run_reset_credit_manager.sh"
-
-reset-status:
-	@$(PYTHON) "$(APP_DIR)/scripts/reset_credit_manager.py" status
-
-reset-install:
-	@$(PYTHON) "$(APP_DIR)/scripts/install_reset_credit_launch_agent.py"
+reset:
+	@$(PYTHON) "$(APP_DIR)/scripts/reset_credit_workflow.py"
 
 config:
 	@$(PYTHON) "$(APP_DIR)/scripts/configure_config.py" $(filter-out $@,$(MAKECMDGOALS))

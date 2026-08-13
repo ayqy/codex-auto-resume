@@ -81,12 +81,7 @@ Your focus is shattered. You have to remember to come back in an hour to resume 
 | `make recent`| Shows usage stats for the last 30 days. (e.g., `make recent N=7` for the last 7 days) |
 | `make status`| Shows the current status of the watcher, including pending and triggered resume jobs. |
 | `make test`  | Runs the automated tests for the project. |
-| `make reset-query` | Cross-checks reset credits through the official Codex RPC and a read-only WHAM GET; prints status and Beijing expiry only. |
-| `make reset-doctor` | Read-only validation of Codex, authentication, both query paths, and an available reset credit. |
-| `make reset-dry-run` | Exercises locking, primary, ten-minute escalation, and verification without a consume POST. |
-| `make reset-arm` | Explicitly authorizes and locks the only available reset credit with persistent idempotency state. |
-| `make reset-install` | Installs and starts the macOS LaunchAgent, including sleep prevention. |
-| `make reset-status` | Prints redacted reset-watch status. |
+| `make reset` | The single reset-credit entry point: prepare, cross-query, select a card, choose immediate or scheduled execution, dry-run, confirm, and start. Run it again to inspect an existing task. |
 
 ### Usage Examples
 
@@ -147,17 +142,17 @@ When `make run` is healthy and there are no user-visible changes, it prints a si
 
 ### Redeeming an expiring reset credit automatically
 
-This workflow is read-only by default. `reset-query` cross-validates the official
-`account/rateLimits/read` RPC with
-`GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`. It proceeds only when
-counts, status, type, and timestamps agree. Output and logs never contain access or refresh tokens,
-full credit IDs, or idempotency keys.
+Use a single command:
 
-Run `make reset-arm` to explicitly authorize one redemption. Arming requires exactly one available
-credit, locks that specific `codexRateLimits` credit, and schedules the official stable
-`account/rateLimitResetCredit/consume` RPC for one hour before expiry. Ambiguous network retries
-reuse one persistent idempotency key; a `redeeming` credit is polled without another write; a
-confirmed success permanently stops the one-shot watcher.
+```bash
+make reset
+```
+
+It checks macOS, Codex, authentication, `launchctl`, the system-provided `caffeinate`, and the
+bundled rescue; cross-validates both read paths; lets you select a credit and scheduled (default) or
+immediate execution; performs a zero-POST dry-run; and asks for final confirmation before persisting
+the selected credit and idempotency key. Running `make reset` again shows and reuses an active task.
+Output and logs never contain tokens, full credit IDs, or idempotency keys.
 
 If the primary path is not confirmed within ten minutes, the watcher escalates to the official
 Codex `/usage` UI. Two minutes later it can use a rescue runner derived from the pinned OpenAI Codex
@@ -165,19 +160,17 @@ source contract. The current official backend route is
 `/wham/rate-limit-reset-credits/consume`, not `/wham/rate-limit-reset`. Every fallback remains bound
 to the locked credit and the pending idempotency key.
 
-```bash
-make reset-doctor
-make reset-dry-run
-make reset-arm
-make reset-install
-make reset-status
-```
-
 The LaunchAgent starts in the login session and uses macOS `caffeinate` to prevent sleep during the
-critical window. The installer deploys a minimal runtime bundle and private state under
+critical window. `caffeinate` is a standard macOS component, not a third-party package, so setup
+checks it instead of invoking a package manager. The official-contract rescue is bundled in this
+repository and has no dependency on a separate source checkout.
+
+The installer deploys a minimal snapshot of the current project and private state under
 `~/Library/Application Support/codex-auto-resume/reset-credit/`, outside the macOS-protected
-`Documents` directory. The private operation file is `0600`; restarting the process does not select
-another credit or replace an uncertain key.
+`Documents` directory. This snapshot is required for LaunchAgent access and is refreshed from the
+current project whenever a task is started or resumed; it is not a separately maintained codebase.
+The private operation file is `0600`; restarting the process does not select another credit or
+replace an uncertain key.
 
 <details>
 <summary><b>Advanced Usage & Debugging</b></summary>

@@ -17,13 +17,12 @@ RUNTIME_DIR = INSTALL_ROOT / "state"
 RUNNER_PATH = BUNDLE_DIR / "scripts" / "run_reset_credit_manager.sh"
 LOG_DIR = RUNTIME_DIR
 LEGACY_RUNTIME_DIR = BASE_DIR / "tmp" / "reset-credit"
-SOURCE_RESCUE_PATH = Path.home() / "Documents" / "source" / "codex" / "scripts" / "reset_credit_rescue.py"
 SCRIPT_FILES = (
     "codex_reset_transport.py",
     "configure_config.py",
     "official_usage_fallback.py",
-    "monitor_reset_credit_launch_agent.sh",
     "reset_credit_manager.py",
+    "reset_credit_rescue.py",
     "run_reset_credit_manager.sh",
 )
 STATE_FILES = (
@@ -32,6 +31,7 @@ STATE_FILES = (
     "events.log",
     "source-manifest.json",
 )
+OBSOLETE_SCRIPT_FILES = ("monitor_reset_credit_launch_agent.sh",)
 
 
 def _copy_file(source: Path, destination: Path, mode: int) -> None:
@@ -55,7 +55,10 @@ def deploy_bundle() -> None:
     for name in SCRIPT_FILES:
         mode = 0o700 if name.endswith(".sh") or name == "reset_credit_manager.py" else 0o600
         _copy_file(BASE_DIR / "scripts" / name, scripts_dir / name, mode)
-    _copy_file(SOURCE_RESCUE_PATH, scripts_dir / "reset_credit_rescue.py", 0o600)
+    for name in OBSOLETE_SCRIPT_FILES:
+        stale = scripts_dir / name
+        if stale.is_file():
+            stale.unlink()
     config_path = BASE_DIR / "config.json"
     if config_path.is_file():
         _copy_file(config_path, BUNDLE_DIR / "config.json", 0o600)
@@ -73,7 +76,6 @@ def plist_payload() -> dict:
         "WorkingDirectory": str(BUNDLE_DIR),
         "EnvironmentVariables": {
             "CODEX_RESET_RUNTIME_DIR": str(RUNTIME_DIR),
-            "CODEX_SOURCE_RESCUE_PATH": str(BUNDLE_DIR / "scripts" / "reset_credit_rescue.py"),
             "HOME": str(Path.home()),
         },
         "RunAtLoad": True,

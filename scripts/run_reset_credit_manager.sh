@@ -8,6 +8,10 @@ chmod 700 "$RUNTIME_DIR"
 umask 077
 
 export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.cargo/bin"
+if [[ ! -x /usr/bin/caffeinate ]]; then
+  echo "reset-credit error: macOS system component /usr/bin/caffeinate is unavailable" >&2
+  exit 127
+fi
 CODEX_BIN="${CODEX_BIN:-/usr/local/bin/codex}"
 if [[ ! -x "$CODEX_BIN" ]]; then
   CODEX_BIN="$(command -v codex)"

@@ -65,6 +65,45 @@ def test_build_operation_uses_exact_timeline_and_persistent_idempotency(module, 
     assert len(operation["idempotency_key"]) == 36
 
 
+def test_immediate_operation_starts_now_and_compresses_short_window(module, transport):
+    operation = module.build_operation(
+        credit(transport, expires=1000),
+        2,
+        True,
+        now=100,
+        execution_mode="immediate",
+    )
+    assert operation["execution_mode"] == "immediate"
+    assert operation["trigger_at"] == 100
+    assert operation["precheck_at"] == []
+    assert 100 < operation["fallback_at"] < operation["source_rescue_at"]
+    assert operation["source_rescue_at"] < operation["target_at"] < 1000
+
+
+def test_scheduled_operation_becomes_immediate_inside_one_hour(module, transport):
+    operation = module.build_operation(
+        credit(transport, expires=1000),
+        1,
+        True,
+        now=500,
+        execution_mode="scheduled",
+    )
+    assert operation["execution_mode"] == "immediate"
+    assert operation["trigger_at"] == 500
+
+
+def test_operation_rejects_expiry_window_of_one_minute_or_less(module, transport):
+    with pytest.raises(module.ResetTransportError) as error:
+        module.build_operation(
+            credit(transport, expires=160),
+            1,
+            True,
+            now=100,
+            execution_mode="immediate",
+        )
+    assert error.value.category == "window-too-short"
+
+
 def test_public_state_never_contains_sensitive_identifiers(module, transport):
     operation = module.build_operation(credit(transport), 1, True, now=1)
     value = json.dumps(module.public_operation(operation))
@@ -105,6 +144,16 @@ def test_confirmed_consumed_accepts_redeemed_or_count_transition(module, transpo
     assert module.confirmed_consumed(transport.CrossValidationResult(empty_app, empty_direct), operation, "reset")
 
 
+def test_confirmed_consumed_accepts_selected_card_disappearing_from_multiple(module, transport):
+    operation = module.build_operation(credit(transport), 3, True, now=1)
+    remaining = transport.ResetCredit("other", "codexRateLimits", "available", 100, 2_000_000_001)
+    app = transport.ResetSnapshot(2, (remaining,), "app-server")
+    direct = transport.ResetSnapshot(2, (remaining,), "direct-get")
+    result = transport.CrossValidationResult(app, direct)
+    assert module.confirmed_consumed(result, operation, "reset")
+    assert not module.confirmed_consumed(result, operation, "nothingToReset")
+
+
 def test_redeeming_never_writes(module, transport, tmp_path, monkeypatch):
     redirect_paths(module, tmp_path, monkeypatch)
     operation = module.build_operation(credit(transport), 1, True, now=1)
@@ -136,6 +185,35 @@ def test_uncertain_attempt_reuses_same_key_and_schedules_20_then_60(module, tran
     assert module.primary_attempt(operation, "codex", 120) == "uncertain"
     assert operation["idempotency_key"] == original_key
     assert operation["next_attempt_at"] == 180
+
+
+def test_uncertain_primary_retry_is_capped_at_fallback(module, transport, tmp_path, monkeypatch):
+    redirect_paths(module, tmp_path, monkeypatch)
+    operation = module.build_operation(
+        credit(transport, expires=1000),
+        1,
+        True,
+        now=100,
+        execution_mode="immediate",
+    )
+    operation["attempts"] = [
+        {"outcome": "error:timeout"},
+        {"outcome": "error:timeout"},
+    ]
+    module.save_operation(operation)
+    monkeypatch.setattr(module, "default_cross_validate", lambda codex_bin="codex": snapshots(transport, expires=1000))
+
+    class Client:
+        def __init__(self, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def consume_credit(self, *_args):
+            raise module.ResetTransportError("timeout", "timed out")
+
+    monkeypatch.setattr(module, "CodexAppServerClient", Client)
+    now = operation["fallback_at"] - 10
+    assert module.primary_attempt(operation, "codex", now) == "uncertain"
+    assert operation["next_attempt_at"] == operation["fallback_at"]
 
 
 def test_explicit_nothing_to_reset_rotates_only_after_verification(module, transport, tmp_path, monkeypatch):
@@ -176,6 +254,42 @@ def test_fourth_explicit_noop_waits_for_ten_minute_fallback(module, transport, t
     now = operation["trigger_at"] + 480
     assert module.primary_attempt(operation, "codex", now) == "nothingToReset"
     assert operation["next_attempt_at"] == operation["fallback_at"]
+
+
+def test_short_immediate_window_never_schedules_primary_retry_after_fallback(module, transport, tmp_path, monkeypatch):
+    redirect_paths(module, tmp_path, monkeypatch)
+    operation = module.build_operation(
+        credit(transport, expires=1000),
+        1,
+        True,
+        now=100,
+        execution_mode="immediate",
+    )
+    module.save_operation(operation)
+    monkeypatch.setattr(module, "default_cross_validate", lambda codex_bin="codex": snapshots(transport, expires=1000))
+
+    class Client:
+        def __init__(self, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def consume_credit(self, *_args): return "nothingToReset"
+
+    monkeypatch.setattr(module, "CodexAppServerClient", Client)
+    monkeypatch.setattr(module, "confirm_after_attempt", lambda *_args, **_kwargs: False)
+    assert module.primary_attempt(operation, "codex", 100) == "nothingToReset"
+    assert operation["next_attempt_at"] <= operation["fallback_at"]
+
+
+def test_source_retry_never_moves_past_expiry(module, transport):
+    operation = module.build_operation(
+        credit(transport, expires=1000),
+        1,
+        True,
+        now=100,
+        execution_mode="immediate",
+    )
+    assert module.next_source_retry_at(operation, 900) == 920
+    assert module.next_source_retry_at(operation, 999) == 999
 
 
 def test_dry_run_never_constructs_consume_client(module, transport, monkeypatch, capsys):

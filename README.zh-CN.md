@@ -81,12 +81,7 @@
 | `make recent`| 显示过去 30 天的用量统计。(例如: `make recent N=7` 显示过去 7 天) |
 | `make status`| 显示监控程序的当前状态，包括等待中和已触发的恢复任务。 |
 | `make test` | 运行项目中的自动化测试。 |
-| `make reset-query` | 通过官方 Codex RPC 与只读 WHAM GET 交叉查询重置权益，仅显示状态和北京时间过期时间。 |
-| `make reset-doctor` | 只读检查 Codex、认证、双路查询和可用重置权益。 |
-| `make reset-dry-run` | 演练锁卡、主路径、10 分钟升级和确认流程；不会发送消费 POST。 |
-| `make reset-arm` | 明确授权并锁定唯一可用卡，持久化单次操作和幂等键。 |
-| `make reset-install` | 安装并启动 macOS LaunchAgent，持续守候到目标时间且阻止休眠。 |
-| `make reset-status` | 输出脱敏的重置守候状态。 |
+| `make reset` | 重置权益的唯一入口：准备环境、双路查询、选卡、选择立即或定时执行、零写入演练、最终确认并启动。再次运行可查看已有任务。 |
 
 ### 使用示例
 
@@ -144,35 +139,38 @@
 
 ### 到期前自动使用重置权益
 
-该流程默认只读。`reset-query` 会同时使用官方 `account/rateLimits/read` RPC 和
-`GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`，只有两边返回的数量、
-状态、类型及时间完全一致才继续。控制台只显示卡片状态和北京时间过期时间，不记录
-access token、refresh token、完整卡 ID 或幂等键。
+只需运行一个命令：
 
-真实操作必须先运行 `make reset-arm`。它要求当前恰好只有一张可用卡，锁定最早到期的
-`codexRateLimits` 卡，并在到期前一小时通过官方稳定 RPC
-`account/rateLimitResetCredit/consume` 使用该卡。网络结果不明确时复用同一个幂等键，
-卡片处于 `redeeming` 时只查询、不重复写；成功后立即停止，绝不切换到其他卡。
+```bash
+make reset
+```
+
+命令会依次完成：
+
+1. 检查 macOS、Codex CLI、登录状态、`launchctl`、系统自带的 `/usr/bin/caffeinate` 和内置兜底脚本。
+2. 通过官方 `account/rateLimits/read` RPC 与只读 WHAM GET 交叉查询权益。
+3. 用编号选择一张可用权益；默认选择最早到期的一张。
+4. 选择到期前一小时定时执行（默认）或立即执行；若已进入到期前一小时窗口则自动立即执行。
+5. 运行完整零写入演练并明确显示 `POST requests=0`。
+6. 显示脱敏执行摘要，只有输入 `y` 确认后才固定权益、保存幂等键并启动 LaunchAgent。
+
+定时模式启动后台守护后返回；立即模式会在前台跟踪结果，终端中断也不会停止后台
+LaunchAgent。再次运行 `make reset` 会显示并复用已有任务，不会重新选卡或更换幂等键。
+控制台和日志不记录 access token、refresh token、完整卡 ID 或幂等键。
 
 如果主路径在十分钟内仍未由双路查询确认，程序进入官方 `/usage` TUI 兜底；再过两分钟
 仍未确认时，进入已按同一版 OpenAI Codex 源码准备的底层官方契约兜底。官方源码确认的
 底层消费路由是 `/wham/rate-limit-reset-credits/consume`，而不是
 `/wham/rate-limit-reset`。所有兜底均继续使用锁定卡和原未决幂等键。
 
-推荐的部署顺序：
-
-```bash
-make reset-doctor
-make reset-dry-run
-make reset-arm
-make reset-install
-make reset-status
-```
-
 LaunchAgent 会在登录会话中自动启动，并通过 macOS `caffeinate` 阻止目标窗口前休眠。
-安装器会把最小运行包和私有状态部署到
+`caffeinate` 是 macOS 默认系统组件，不是第三方依赖，因此准备阶段只检查，不执行包管理器安装。
+
+本项目内置官方契约兜底脚本，不依赖 `~/Documents/source/codex` 或其他 clone。安装器会把
+当前项目的最小运行快照和私有状态部署到
 `~/Library/Application Support/codex-auto-resume/reset-credit/`，避免 macOS 隐私控制阻止
-LaunchAgent 访问 `Documents`。私有操作文件权限为 `0600`；停止或重启进程不会更换卡或幂等键。
+LaunchAgent 访问 `Documents`。这份快照是 macOS 部署所需，在任务启动或恢复时从当前项目刷新，
+不是独立维护的源码；私有操作文件权限为 `0600`，停止或重启进程不会更换卡或幂等键。
 
 <details>
 <summary><b>高级用法与调试</b></summary>
