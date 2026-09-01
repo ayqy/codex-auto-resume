@@ -77,6 +77,7 @@ Your focus is shattered. You have to remember to come back in an hour to resume 
 | `make run`   | **(Most important)** Starts the background watcher to monitor for usage limits and resume your session automatically. Console output is intentionally concise; detailed diagnostics continue to be written to `tmp/logs/watcher.log`. |
 | `make check` | Runs the same silent availability probe once on demand, so you can manually check whether usage has recovered. |
 | `make today` | Shows a detailed report of your token usage, active time, and estimated costs for today. |
+| `make yesterday` | Shows the same detailed report for yesterday. |
 | `make usage` | Shows the same report for a specific day. (e.g., `make usage D=2026-07-03`) |
 | `make recent`| Shows usage stats for the last 30 days. (e.g., `make recent N=7` for the last 7 days) |
 | `make status`| Shows the current status of the watcher, including pending and triggered resume jobs. |
@@ -100,6 +101,9 @@ Your focus is shattered. You have to remember to come back in an hour to resume 
 -   `make today`
     > Get a summary of your usage for today.
 
+-   `make yesterday`
+    > Get a summary of your usage for yesterday.
+
 -   `make usage D=2026-07-03`
     > Get a usage report for a specific date.
 
@@ -111,6 +115,9 @@ Your focus is shattered. You have to remember to come back in an hour to resume 
 
 -   `make today F=/tmp/codex-today.txt`
     > Save today's detailed report to a specific file.
+
+-   `make yesterday F=/tmp/codex-yesterday.txt`
+    > Save yesterday's detailed report to a specific file.
 
 ### Pricing Data Source
 

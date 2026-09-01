@@ -240,18 +240,24 @@ def resolve_timezone(name: Optional[str]) -> ZoneInfo:
 def parse_range(args, target_tz: ZoneInfo):
     dt_format = "%Y-%m-%d %H:%M:%S"
     has_today = bool(args.t)
+    has_yesterday = bool(args.y)
     has_date = bool(args.d)
     has_recent = bool(args.r)
     has_range = bool(args.start_time or args.end_time)
 
-    selected_modes = sum([has_today, has_date, has_recent, has_range])
+    selected_modes = sum([has_today, has_yesterday, has_date, has_recent, has_range])
     if selected_modes != 1:
-        raise ValueError("只能选择一种时间范围输入方式：-t、-d、-r 或 start_time/end_time")
+        raise ValueError("只能选择一种时间范围输入方式：-t、-y、-d、-r 或 start_time/end_time")
 
     if has_today:
         now_local = datetime.now(target_tz)
         start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
         end_local = start_local + timedelta(days=1)
+        return {"mode": "usage", "start_local": start_local, "end_local": end_local, "days": 1}
+
+    if has_yesterday:
+        end_local = datetime.now(target_tz).replace(hour=0, minute=0, second=0, microsecond=0)
+        start_local = end_local - timedelta(days=1)
         return {"mode": "usage", "start_local": start_local, "end_local": end_local, "days": 1}
 
     if has_date:
@@ -1761,6 +1767,7 @@ def main():
     parser.add_argument("start_time", nargs="?", help="Start time 'YYYY-MM-DD HH:MM:SS'")
     parser.add_argument("end_time", nargs="?", help="End time 'YYYY-MM-DD HH:MM:SS'")
     parser.add_argument("-t", "--today", dest="t", action="store_true", help="Use the current local day")
+    parser.add_argument("-y", "--yesterday", dest="y", action="store_true", help="Use the previous local day")
     parser.add_argument("-d", "--date", dest="d", help="Use one local day, e.g. 2026-07-03")
     parser.add_argument("-r", dest="r", action="store_true", help="Use the latest N local days")
     parser.add_argument("-n", dest="n", type=int, default=30, help="Recent day count for -r")

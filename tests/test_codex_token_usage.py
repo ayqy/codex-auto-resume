@@ -1545,6 +1545,35 @@ def test_main_today_summary_only_succeeds(monkeypatch, codex_home, tmp_path, cap
     assert detail_file.exists()
 
 
+def test_main_yesterday_summary_only_succeeds(monkeypatch, codex_home, tmp_path, capsys):
+    module = load_module()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    detail_file = tmp_path / "detail-yesterday.txt"
+    monkeypatch.setattr(
+        module.sys,
+        "argv",
+        [
+            "codex_token_usage.py",
+            "-y",
+            "-z",
+            "Asia/Shanghai",
+            "-s",
+            "-f",
+            str(detail_file),
+        ],
+    )
+    fake_now = datetime(2026, 7, 4, 12, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    freeze_now(module, monkeypatch, fake_now)
+
+    assert module.main() == 0
+    output = capsys.readouterr().out
+
+    assert "日期：2026-07-03" in output
+    assert "总Token：5.3千万（53,000,000）" in output
+    assert "活跃时长：1小时10分钟" in output
+    assert detail_file.exists()
+
+
 def test_main_recent_30_days_writes_markdown_detail(monkeypatch, codex_home, tmp_path, capsys):
     module = load_module()
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
@@ -1630,7 +1659,7 @@ def test_main_rejects_mixed_time_modes(monkeypatch, codex_home, capsys):
 
     assert module.main() == 1
     err = capsys.readouterr().err
-    assert "只能选择一种时间范围输入方式：-t、-d、-r 或 start_time/end_time" in err
+    assert "只能选择一种时间范围输入方式：-t、-y、-d、-r 或 start_time/end_time" in err
 
 
 def test_main_rejects_invalid_recent_days(monkeypatch, codex_home, capsys):

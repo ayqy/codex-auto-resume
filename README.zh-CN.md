@@ -77,6 +77,7 @@
 | `make run` | **(最重要)** 启动后台监控进程，持续监测用量限制并自动为您恢复会话。控制台输出会刻意保持精简，详细诊断继续写入 `tmp/logs/watcher.log`。 |
 | `make check` | 按需手动执行一次同样的静默可用性探针，用来检查额度是否已经恢复。 |
 | `make today` | 显示您今天的 token 使用量、活跃时间及预估开销的详细报告。 |
+| `make yesterday` | 显示昨天相同维度的详细报告。 |
 | `make usage` | 显示指定某一天的同样内容的报告。(例如: `make usage D=2026-07-03`) |
 | `make recent`| 显示过去 30 天的用量统计。(例如: `make recent N=7` 显示过去 7 天) |
 | `make status`| 显示监控程序的当前状态，包括等待中和已触发的恢复任务。 |
@@ -100,6 +101,9 @@
 -   `make today`
     > 获取您今天的用量摘要。
 
+-   `make yesterday`
+    > 获取您昨天的用量摘要。
+
 -   `make usage D=2026-07-03`
     > 获取指定日期的用量报告。
 
@@ -111,6 +115,9 @@
 
 -   `make today F=/tmp/codex-today.txt`
     > 将今天的详细报告保存到指定文件。
+
+-   `make yesterday F=/tmp/codex-yesterday.txt`
+    > 将昨天的详细报告保存到指定文件。
 
 ### 价格来源
 

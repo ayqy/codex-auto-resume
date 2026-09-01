@@ -9,10 +9,13 @@ DEBUG_ARGS ?= --debug-limit-history --days 7
 D ?=
 N ?= 30
 F ?=
+USAGE_RANGE_ARG ?= -t
 
-.PHONY: today usage recent run check status debug clean chmod test config proxy workat resume reset
+.PHONY: today yesterday usage recent run check status debug clean chmod test config proxy workat resume reset
 
-today: usage
+today: USAGE_RANGE_ARG := -t
+yesterday: USAGE_RANGE_ARG := -y
+today yesterday: usage
 
 usage:
 	@mkdir -p "$(LOG_DIR)"
@@ -20,7 +23,7 @@ usage:
 	if [ -n "$(D)" ]; then \
 		set -- "$$@" -d "$(D)"; \
 	else \
-		set -- "$$@" -t; \
+		set -- "$$@" "$(USAGE_RANGE_ARG)"; \
 	fi; \
 	if [ -n "$(F)" ]; then \
 		set -- "$$@" -f "$(F)"; \
