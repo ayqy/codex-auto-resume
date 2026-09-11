@@ -162,6 +162,21 @@ def test_calculate_cost_supports_gpt_5_6_alias():
     assert cost["total_cost"] == pytest.approx(13.1)
 
 
+def test_calculate_cost_supports_gpt_6_astra():
+    module = load_module()
+
+    cost = module.calculate_cost(
+        "gpt-6-astra",
+        {"input_tokens": 1_000_000, "cached_input_tokens": 200_000, "output_tokens": 300_000},
+    )
+
+    assert cost is not None
+    assert cost["miss_cost"] == pytest.approx(8.0)
+    assert cost["hit_cost"] == pytest.approx(0.2)
+    assert cost["output_cost"] == pytest.approx(15.0)
+    assert cost["total_cost"] == pytest.approx(23.2)
+
+
 def test_calculate_cost_supports_gpt_5_6_sol():
     module = load_module()
 
@@ -265,6 +280,27 @@ def test_calculate_event_cost_gpt_5_6_sol_default_short_context():
     assert cost["write_cost"] == pytest.approx(0.125)
     assert cost["output_cost"] == pytest.approx(0.3)
     assert cost["total_cost"] == pytest.approx(1.1)
+    assert cost["partial_unrecoverable_cache_write"] is False
+
+
+def test_calculate_event_cost_gpt_6_astra_default_short_context():
+    module = load_module()
+    usage = {
+        "input_tokens": 200_000,
+        "cached_input_tokens": 50_000,
+        "output_tokens": 10_000,
+        "cache_write_input_tokens": 20_000,
+    }
+
+    cost = module.calculate_event_cost("gpt-6-astra", usage, "default", {"last_token_usage": usage})
+
+    assert cost is not None
+    assert cost["cache_write_tokens"] == 20_000
+    assert cost["miss_cost"] == pytest.approx(1.3)
+    assert cost["hit_cost"] == pytest.approx(0.05)
+    assert cost["write_cost"] == pytest.approx(0.25)
+    assert cost["output_cost"] == pytest.approx(0.5)
+    assert cost["total_cost"] == pytest.approx(2.1)
     assert cost["partial_unrecoverable_cache_write"] is False
 
 
@@ -406,6 +442,47 @@ def test_collect_usage_report_uses_priority_service_tier_for_gpt_5_6_sol(monkeyp
 
     assert total_cost == pytest.approx(1.42)
     assert cost_status == {"unknown_model": False, "unrecoverable_cache_write": False}
+
+
+def test_collect_usage_report_prices_gpt_6_astra_priority_long_context(monkeypatch, tmp_path):
+    module = load_module()
+    codex_home = tmp_path / "codex_home"
+    session_id = "67676767-6767-4676-8676-676767676767"
+    write_session_file(
+        codex_home,
+        "2026-09-11",
+        "2026-09-11T09-00-00",
+        session_id,
+        [
+            turn_context_event(
+                "2026-09-11T01:00:00.000Z",
+                "gpt-6-astra",
+                turn_id="turn-gpt-6-astra-priority-long",
+                cwd="/workspace/gpt-6-astra-priority-long",
+            ),
+            thread_settings_applied_event("2026-09-11T01:00:01.000Z", "priority"),
+            token_event(
+                "2026-09-11T01:00:05.000Z",
+                300_000,
+                50_000,
+                10_000,
+                last_usage_extra={"cache_write_input_tokens": 20_000},
+            ),
+        ],
+    )
+
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    start_local = datetime(2026, 9, 11, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+    end_local = datetime(2026, 9, 12, 0, 0, 0, tzinfo=module.ZoneInfo("Asia/Shanghai"))
+
+    report = module.collect_usage_report(start_local, end_local)
+    total_cost, cost_status = module.calculate_models_cost(report["models"])
+    summary_lines = module.build_summary_lines(report, start_local, end_local)
+
+    assert report["models"]["gpt-6-astra"]["cache_write_tokens"] == 20_000
+    assert total_cost == pytest.approx(11.9)
+    assert cost_status == {"unknown_model": False, "unrecoverable_cache_write": False}
+    assert "估算成本：$11.90" in summary_lines
 
 
 def test_build_summary_lines_marks_unrecoverable_cache_write_for_gpt_5_6_when_field_is_absent(monkeypatch, tmp_path):

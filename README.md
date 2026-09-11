@@ -121,18 +121,21 @@ Your focus is shattered. You have to remember to come back in an hour to resume 
 
 ### Pricing Data Source
 
-Estimated costs are based on OpenAI official pricing pages checked on July 25, 2026:
+Existing model prices are based on OpenAI official pricing pages checked on July 25, 2026:
 `https://developers.openai.com/api/docs/pricing`,
 `https://developers.openai.com/api/docs/models/gpt-5.6-sol`,
 `https://developers.openai.com/api/docs/models/gpt-5.6-terra`,
 and `https://developers.openai.com/api/docs/models/gpt-5.6-luna`.
-For the `gpt-5.6` series, the usage report now applies event-level pricing from
-rollout logs when those log fields are present, including:
+GPT-6 Astra pricing was checked on September 11, 2026 against
+`https://developers.openai.com/api/docs/models/gpt-6-astra`: Standard pricing per
+1M tokens is $10 input, $1 cached input, $12.50 cache writes, and $50 output.
+For GPT-6 Astra and the `gpt-5.6` series, the usage report applies event-level
+pricing from rollout logs when those log fields are present, including:
 `default` vs `priority` service tier, the official `>272K input tokens` long-context
 multiplier, and `cache write` billing when cache-write token fields can be recovered.
-If a `gpt-5.6` event does not expose cache-write token fields in the local log, the
-report still estimates the rest of that event but marks the cost as excluding the
-unrecoverable cache-write portion. Other models continue using the supported
+If a GPT-6 Astra or `gpt-5.6` event does not expose cache-write token fields in the
+local log, the report still estimates the rest of that event but marks the cost as
+excluding the unrecoverable cache-write portion. Other models continue using the supported
 aggregate `uncached input`, `cached input`, and `output` dimensions.
 
 Auto-resume now restores the original session model and reasoning effort from that session's rollout log before running `codex resume`. This avoids switching models and losing cache continuity.

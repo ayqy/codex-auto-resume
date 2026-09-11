@@ -121,14 +121,19 @@
 
 ### 价格来源
 
-预估开销基于 2026 年 7 月 25 日核对的 OpenAI 官方价格页面：
+现有模型的预估开销基于 2026 年 7 月 25 日核对的 OpenAI 官方价格页面：
 `https://developers.openai.com/api/docs/pricing`、
 `https://developers.openai.com/api/docs/models/gpt-5.6-sol`、
 `https://developers.openai.com/api/docs/models/gpt-5.6-terra`
 和 `https://developers.openai.com/api/docs/models/gpt-5.6-luna`。
-对于 `gpt-5.6` 系列，只要本地 rollout 日志里有对应字段，用量报告现在会按事件级计费规则估算价格，包括：
+GPT-6 Astra 的价格于 2026 年 9 月 11 日根据
+`https://developers.openai.com/api/docs/models/gpt-6-astra` 核对：Standard 模式下每百万 token
+输入 $10、缓存输入 $1、缓存写入 $12.50、输出 $50。
+对于 GPT-6 Astra 和 `gpt-5.6` 系列，只要本地 rollout 日志里有对应字段，
+用量报告会按事件级计费规则估算价格，包括：
 `default` / `priority` service tier、官方 `>272K input tokens` 长上下文倍率，以及可恢复时的 `cache write` 计费。
-如果某个 `gpt-5.6` 事件在本地日志里没有暴露 cache write token 字段，报告仍会估算其余部分，
+如果某个 GPT-6 Astra 或 `gpt-5.6` 事件在本地日志里没有暴露 cache write token 字段，
+报告仍会估算其余部分，
 但会明确标记该成本 `未含无法从日志恢复的 cache write`。其他模型仍按当前脚本已支持的
 `非缓存输入`、`缓存输入` 和 `输出` 三类聚合口径估算。
 

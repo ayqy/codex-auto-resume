@@ -14,12 +14,15 @@ from statistics import median
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
-# Prices below were checked on 2026-07-25 against official OpenAI docs:
+# Existing prices below were checked on 2026-07-25 against official OpenAI docs:
 # https://developers.openai.com/api/docs/pricing
 # https://developers.openai.com/api/docs/models/gpt-5.6-sol
 # https://developers.openai.com/api/docs/models/gpt-5.6-terra
 # https://developers.openai.com/api/docs/models/gpt-5.6-luna
+# GPT-6 Astra prices were checked on 2026-09-11 against:
+# https://developers.openai.com/api/docs/models/gpt-6-astra
 PRICES = {
+    "gpt-6-astra": {"miss": 10.00, "hit": 1.00, "output": 50.00},
     "gpt-5.6": {"miss": 5.00, "hit": 0.50, "output": 30.00},
     "gpt-5.6-sol": {"miss": 5.00, "hit": 0.50, "output": 30.00},
     "gpt-5.6-terra": {"miss": 2.50, "hit": 0.25, "output": 15.00},
@@ -31,7 +34,11 @@ PRICES = {
     "gpt-5.3-codex": {"miss": 1.75, "hit": 0.175, "output": 14.00},
     "gpt-5.4-mini": {"miss": 0.75, "hit": 0.075, "output": 4.50},
 }
-GPT_5_6_EVENT_PRICES = {
+EVENT_PRICES = {
+    "gpt-6-astra": {
+        "default": {"miss": 10.00, "hit": 1.00, "write": 12.50, "output": 50.00},
+        "priority": {"miss": 20.00, "hit": 2.00, "write": 25.00, "output": 100.00},
+    },
     "gpt-5.6": {
         "default": {"miss": 5.00, "hit": 0.50, "write": 6.25, "output": 30.00},
         "priority": {"miss": 10.00, "hit": 1.00, "write": 12.50, "output": 60.00},
@@ -570,10 +577,10 @@ def extract_cache_write_tokens(info: dict, last_usage: dict):
 
 
 def calculate_event_cost(model: str, last_usage: dict, service_tier: str, info: dict):
-    if model not in GPT_5_6_EVENT_PRICES:
+    if model not in EVENT_PRICES:
         return None
 
-    price_info = GPT_5_6_EVENT_PRICES[model][normalize_service_tier(service_tier)]
+    price_info = EVENT_PRICES[model][normalize_service_tier(service_tier)]
     input_tokens = int(last_usage.get("input_tokens", 0) or 0)
     cached_input_tokens = int(last_usage.get("cached_input_tokens", 0) or 0)
     output_tokens = int(last_usage.get("output_tokens", 0) or 0)
