@@ -549,7 +549,7 @@ def test_collect_usage_report_prices_gpt_6_astra_priority_long_context(monkeypat
     assert "估算成本：$11.90" in summary_lines
 
 
-def test_build_summary_lines_marks_unrecoverable_cache_write_for_gpt_5_6_when_field_is_absent(monkeypatch, tmp_path):
+def test_build_summary_lines_omits_cache_write_suffix_when_field_is_absent(monkeypatch, tmp_path):
     module = load_module()
     codex_home = tmp_path / "codex_home"
     session_id = "90909090-9090-4090-8090-909090909090"
@@ -576,7 +576,20 @@ def test_build_summary_lines_marks_unrecoverable_cache_write_for_gpt_5_6_when_fi
     report = module.collect_usage_report(start_local, end_local)
     lines = module.build_summary_lines(report, start_local, end_local)
 
-    assert "估算总成本：$1.07（未含无法从日志恢复的 cache write）" in lines
+    assert "估算总成本：$1.07" in lines
+    assert not any("未含无法从日志恢复的 cache write" in line for line in lines)
+
+
+def test_format_cost_text_keeps_unknown_model_notice_without_cache_write_suffix():
+    module = load_module()
+
+    assert module.format_cost_text(
+        1.07, {"unknown_model": True, "unrecoverable_cache_write": True}
+    ) == "$1.07（部分模型未计价）"
+    assert module.format_cost_text(
+        1.07, {"unknown_model": False, "unrecoverable_cache_write": True}
+    ) == "$1.07"
+
 
 def test_collect_usage_handles_null_info_and_non_string_function_output(monkeypatch, codex_home):
     module = load_module()

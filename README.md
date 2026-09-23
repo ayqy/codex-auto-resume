@@ -147,8 +147,8 @@ pricing from rollout logs when those log fields are present, including:
 `default`, `priority` (including `fast`), `batch`, and `flex` service tiers, the official `>272K input tokens` long-context
 multiplier, and `cache write` billing when cache-write token fields can be recovered. Fast/Priority costs 2x Standard, while Batch/Flex costs half. For long-context requests, input, cached input, and cache-write rates are doubled and output rates are multiplied by 1.5.
 If a GPT-6 or `gpt-5.6` event does not expose cache-write token fields in the
-local log, the report still estimates the rest of that event but marks the cost as
-excluding the unrecoverable cache-write portion. Other models continue using the supported
+local log, the report estimates the visible portion without those cache-write charges.
+Other models continue using the supported
 aggregate `uncached input`, `cached input`, and `output` dimensions. These are API token price estimates, not ChatGPT subscription allowance or credit charges.
 
 Auto-resume now restores the original session model and reasoning effort from that session's rollout log before running `codex resume`. This avoids switching models and losing cache continuity.

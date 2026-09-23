@@ -1073,12 +1073,8 @@ def format_event_window(start_at: Optional[datetime], end_at: Optional[datetime]
 def format_cost_text(total_cost: float, cost_status: Any) -> str:
     if isinstance(cost_status, bool):
         cost_status = {"unknown_model": cost_status, "unrecoverable_cache_write": False}
-    if cost_status.get("unknown_model") and cost_status.get("unrecoverable_cache_write"):
-        return f"${total_cost:,.2f}（部分模型未计价；未含无法从日志恢复的 cache write）"
     if cost_status.get("unknown_model"):
         return f"${total_cost:,.2f}（部分模型未计价）"
-    if cost_status.get("unrecoverable_cache_write"):
-        return f"${total_cost:,.2f}（未含无法从日志恢复的 cache write）"
     return f"${total_cost:,.2f}"
 
 
