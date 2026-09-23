@@ -9,9 +9,11 @@ DEBUG_ARGS ?= --debug-limit-history --days 7
 D ?=
 N ?= 30
 F ?=
+ID ?=
+export ID F
 USAGE_RANGE_ARG ?= -t
 
-.PHONY: today yesterday usage recent run check status debug clean chmod test config proxy workat resume reset
+.PHONY: today yesterday usage recent session run check status debug clean chmod test config proxy workat resume reset
 
 today: USAGE_RANGE_ARG := -t
 yesterday: USAGE_RANGE_ARG := -y
@@ -35,6 +37,15 @@ recent:
 	@set -- -r -n "$(N)"; \
 	if [ -n "$(F)" ]; then \
 		set -- "$$@" -f "$(F)"; \
+	fi; \
+	$(PYTHON) "$(APP_DIR)/scripts/codex_token_usage.py" "$$@"
+
+session:
+	@if [ -z "$$ID" ]; then echo "usage: make session ID=<session-uuid>" >&2; exit 2; fi
+	@mkdir -p "$(LOG_DIR)"
+	@set -- --session-id "$$ID"; \
+	if [ -n "$$F" ]; then \
+		set -- "$$@" -f "$$F"; \
 	fi; \
 	$(PYTHON) "$(APP_DIR)/scripts/codex_token_usage.py" "$$@"
 

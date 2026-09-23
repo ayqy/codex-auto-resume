@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -175,6 +176,69 @@ def test_calculate_cost_supports_gpt_6_astra():
     assert cost["hit_cost"] == pytest.approx(0.2)
     assert cost["output_cost"] == pytest.approx(15.0)
     assert cost["total_cost"] == pytest.approx(23.2)
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [("gpt-6-sol", 4.64), ("gpt-6-luna", 0.232)],
+)
+def test_calculate_cost_supports_new_gpt_6_models(model, expected):
+    module = load_module()
+
+    cost = module.calculate_cost(
+        model,
+        {"input_tokens": 1_000_000, "cached_input_tokens": 200_000, "output_tokens": 300_000},
+    )
+
+    assert cost is not None
+    assert cost["total_cost"] == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    ("model", "tier", "expected"),
+    [
+        ("gpt-6-sol", "default", 0.2665),
+        ("gpt-6-sol", "fast", 0.533),
+        ("gpt-6-sol", "priority", 0.533),
+        ("gpt-6-sol", "batch", 0.13325),
+        ("gpt-6-luna", "default", 0.013325),
+        ("gpt-6-luna", "flex", 0.0066625),
+    ],
+)
+def test_calculate_event_cost_new_gpt_6_short_context(model, tier, expected):
+    module = load_module()
+    usage = {
+        "input_tokens": 100_000,
+        "cached_input_tokens": 20_000,
+        "cache_write_input_tokens": 5_000,
+        "output_tokens": 10_000,
+    }
+
+    cost = module.calculate_event_cost(model, usage, tier, {"last_token_usage": usage})
+
+    assert cost is not None
+    assert cost["cache_write_tokens"] == 5_000
+    assert cost["total_cost"] == pytest.approx(expected)
+    assert cost["partial_unrecoverable_cache_write"] is False
+
+
+def test_calculate_event_cost_gpt_6_sol_fast_long_context():
+    module = load_module()
+    usage = {
+        "input_tokens": 300_000,
+        "cached_input_tokens": 50_000,
+        "cache_write_input_tokens": 20_000,
+        "output_tokens": 10_000,
+    }
+
+    cost = module.calculate_event_cost("gpt-6-sol", usage, "fast", {"last_token_usage": usage})
+
+    assert cost is not None
+    assert cost["miss_cost"] == pytest.approx(1.84)
+    assert cost["hit_cost"] == pytest.approx(0.04)
+    assert cost["write_cost"] == pytest.approx(0.2)
+    assert cost["output_cost"] == pytest.approx(0.3)
+    assert cost["total_cost"] == pytest.approx(2.38)
 
 
 def test_calculate_cost_supports_gpt_5_6_sol():
@@ -1736,7 +1800,7 @@ def test_main_rejects_mixed_time_modes(monkeypatch, codex_home, capsys):
 
     assert module.main() == 1
     err = capsys.readouterr().err
-    assert "只能选择一种时间范围输入方式：-t、-y、-d、-r 或 start_time/end_time" in err
+    assert "只能选择一种统计方式：-t、-y、-d、-r、start_time/end_time 或 --session-id" in err
 
 
 def test_main_rejects_invalid_recent_days(monkeypatch, codex_home, capsys):
@@ -1747,3 +1811,93 @@ def test_main_rejects_invalid_recent_days(monkeypatch, codex_home, capsys):
     assert module.main() == 1
     err = capsys.readouterr().err
     assert "-n 必须是大于 0 的整数" in err
+
+
+def test_session_mode_counts_one_complete_old_session_across_days(monkeypatch, tmp_path, capsys):
+    module = load_module()
+    codex_home = tmp_path / "codex_home"
+    session_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    session_file = write_session_file(
+        codex_home,
+        "2026-09-22",
+        "2026-09-22T23-50-00",
+        session_id,
+        [
+            {
+                "timestamp": "2026-09-22T15:50:00.000Z",
+                "type": "session_meta",
+                "payload": {"id": session_id, "cwd": "/workspace/session-test", "first_user_message": "跨天会话统计"},
+            },
+            turn_context_event("2026-09-22T15:50:01.000Z", "gpt-6-sol"),
+            thread_settings_applied_event("2026-09-22T15:50:02.000Z", "fast"),
+            token_event(
+                "2026-09-22T15:50:05.000Z",
+                100_000,
+                20_000,
+                10_000,
+                last_usage_extra={"cache_write_input_tokens": 5_000},
+            ),
+            turn_context_event("2026-09-22T16:10:00.000Z", "gpt-6-luna"),
+            thread_settings_applied_event("2026-09-22T16:10:01.000Z", "default"),
+            token_event(
+                "2026-09-22T16:10:05.000Z",
+                50_000,
+                10_000,
+                5_000,
+                last_usage_extra={"cache_write_input_tokens": 0},
+            ),
+        ],
+    )
+    os.utime(session_file, (1_600_000_000, 1_600_000_000))
+    write_session_file(
+        codex_home,
+        "2026-09-22",
+        "2026-09-22T23-51-00",
+        "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        [
+            turn_context_event("2026-09-22T15:51:00.000Z", "gpt-6-astra"),
+            token_event("2026-09-22T15:51:05.000Z", 1_000_000, 0, 100_000),
+        ],
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    detail_file = tmp_path / "session-report.txt"
+    monkeypatch.setattr(
+        module.sys,
+        "argv",
+        ["codex_token_usage.py", "--session-id", session_id, "-s", "-z", "Asia/Shanghai", "-f", str(detail_file)],
+    )
+
+    assert module.main() == 0
+    output = capsys.readouterr().out
+    detail = detail_file.read_text(encoding="utf-8")
+    session = module.collect_session_usage(session_id, module.ZoneInfo("Asia/Shanghai"))
+    cost, status = module.calculate_models_cost(session["models"])
+
+    assert session["input_tokens"] == 150_000
+    assert session["output_tokens"] == 15_000
+    assert session["cache_write_tokens"] == 5_000
+    assert set(session["models"]) == {"gpt-6-sol", "gpt-6-luna"}
+    assert cost == pytest.approx(0.5396)
+    assert status == {"unknown_model": False, "unrecoverable_cache_write": False}
+    assert "总Token：0.17百万（165,000）" in output
+    assert "时间：2026-09-22 23:50:01 至 2026-09-23 00:10:05" in output
+    assert "估算总成本：$0.54" in output
+    assert "二、模型汇总" not in output
+    assert "2.1 gpt-6-luna" in detail
+    assert "2.2 gpt-6-sol" in detail
+    assert "gpt-6-astra" not in detail
+
+
+def test_main_session_mode_reports_missing_or_invalid_id(monkeypatch, codex_home, capsys):
+    module = load_module()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(module.sys, "argv", ["codex_token_usage.py", "--session-id", "not-a-uuid"])
+
+    assert module.main() == 1
+    assert "--session-id 必须是完整的 UUID" in capsys.readouterr().err
+
+    missing_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    monkeypatch.setattr(module.sys, "argv", ["codex_token_usage.py", "--session-id", missing_id])
+
+    assert module.main() == 1
+    assert f"session ID {missing_id} not found" in capsys.readouterr().err

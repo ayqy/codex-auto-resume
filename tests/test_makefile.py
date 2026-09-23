@@ -40,3 +40,45 @@ def test_make_yesterday_passes_yesterday_range_and_detail_file(tmp_path):
         "-f",
         str(detail_file),
     ]
+
+
+def test_make_session_passes_id_and_detail_file(tmp_path):
+    captured_args = tmp_path / "captured-args.json"
+    detail_file = tmp_path / "session.txt"
+    python_spy = tmp_path / "python_spy.py"
+    python_spy.write_text(
+        "import json, sys\n"
+        f"open({str(captured_args)!r}, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))\n",
+        encoding="utf-8",
+    )
+    session_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+    result = subprocess.run(
+        [
+            "make",
+            "session",
+            f"ID={session_id}",
+            f"PYTHON={sys.executable} {python_spy}",
+            f"F={detail_file}",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(captured_args.read_text(encoding="utf-8")) == [
+        str(SCRIPT_PATH),
+        "--session-id",
+        session_id,
+        "-f",
+        str(detail_file),
+    ]
+
+
+def test_make_session_requires_id():
+    result = subprocess.run(["make", "session"], cwd=ROOT, check=False, capture_output=True, text=True)
+
+    assert result.returncode != 0
+    assert "usage: make session ID=<session-uuid>" in result.stderr

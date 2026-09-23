@@ -6,7 +6,7 @@
 
 [English](./README.md) | [**中文**](./README.zh-CN.md)
 
-[![项目状态: 活跃](https://img.shields.io/badge/status-active-success.svg)](https://github.com/your-repo/codex-auto-resume)
+[![项目状态: 活跃](https://img.shields.io/badge/status-active-success.svg)](https://github.com/ayqy/codex-auto-resume)
 [![Python 版本](https://img.shields.io/badge/python-3.x-blue.svg)](https://www.python.org/)
 [![许可证: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![欢迎 PR](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](./CONTRIBUTING.md)
@@ -43,7 +43,7 @@
 
 1.  **克隆仓库**:
     ```bash
-    git clone https://github.com/your-repo/codex-auto-resume.git
+    git clone https://github.com/ayqy/codex-auto-resume.git
     cd codex-auto-resume
     ```
 
@@ -80,6 +80,7 @@
 | `make yesterday` | 显示昨天相同维度的详细报告。 |
 | `make usage` | 显示指定某一天的同样内容的报告。(例如: `make usage D=2026-07-03`) |
 | `make recent`| 显示过去 30 天的用量统计。(例如: `make recent N=7` 显示过去 7 天) |
+| `make session ID=<会话UUID>` | 统计指定会话从开始至今的 token、模型、活跃时长和预估成本，不受日期限制。 |
 | `make status`| 显示监控程序的当前状态，包括等待中和已触发的恢复任务。 |
 | `make test` | 运行项目中的自动化测试。 |
 | `make reset` | 重置权益的唯一入口：准备环境、双路查询、选卡、选择立即或定时执行、零写入演练、最终确认并启动。再次运行可查看已有任务。 |
@@ -110,6 +111,9 @@
 -   `make recent N=7`
     > 查看您过去 7 天的用量统计。
 
+-   `make session ID=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa`
+    > 按完整会话 UUID 查看该会话的全部记录；只统计这个 ID，不合并其他子会话。也可加 `F=/tmp/codex-session.txt` 指定明细文件。
+
 -   `make check`
     > 手动执行一次同样的静默探针，测试额度是否已经恢复可用。
 
@@ -126,16 +130,25 @@
 `https://developers.openai.com/api/docs/models/gpt-5.6-sol`、
 `https://developers.openai.com/api/docs/models/gpt-5.6-terra`
 和 `https://developers.openai.com/api/docs/models/gpt-5.6-luna`。
-GPT-6 Astra 的价格于 2026 年 9 月 11 日根据
-`https://developers.openai.com/api/docs/models/gpt-6-astra` 核对：Standard 模式下每百万 token
-输入 $10、缓存输入 $1、缓存写入 $12.50、输出 $50。
-对于 GPT-6 Astra 和 `gpt-5.6` 系列，只要本地 rollout 日志里有对应字段，
+GPT-6 系列价格于 2026 年 9 月 24 日根据官方
+[`价格表`](https://developers.openai.com/api/docs/pricing) 及
+[`Astra`](https://developers.openai.com/api/docs/models/gpt-6-astra)、
+[`Sol`](https://developers.openai.com/api/docs/models/gpt-6-sol)、
+[`Luna`](https://developers.openai.com/api/docs/models/gpt-6-luna) 模型页核对。Standard 模式每百万 token 价格如下：
+
+| 模型 | 非缓存输入 | 缓存输入 | 缓存写入 | 输出 |
+| --- | ---: | ---: | ---: | ---: |
+| GPT-6 Astra | $10 | $1 | $12.50 | $50 |
+| GPT-6 Sol | $2 | $0.20 | $2.50 | $10 |
+| GPT-6 Luna | $0.10 | $0.01 | $0.125 | $0.50 |
+
+对于 GPT-6 系列和 `gpt-5.6` 系列，只要本地 rollout 日志里有对应字段，
 用量报告会按事件级计费规则估算价格，包括：
-`default` / `priority` service tier、官方 `>272K input tokens` 长上下文倍率，以及可恢复时的 `cache write` 计费。
-如果某个 GPT-6 Astra 或 `gpt-5.6` 事件在本地日志里没有暴露 cache write token 字段，
+`default` / `priority`（含 `fast`）/ `batch` / `flex` service tier、官方 `>272K input tokens` 长上下文倍率，以及可恢复时的 `cache write` 计费。Fast/Priority 价格为 Standard 的 2 倍，Batch/Flex 为其一半；长上下文请求的输入、缓存及缓存写入价格为 2 倍，输出为 1.5 倍。
+如果某个 GPT-6 或 `gpt-5.6` 事件在本地日志里没有暴露 cache write token 字段，
 报告仍会估算其余部分，
 但会明确标记该成本 `未含无法从日志恢复的 cache write`。其他模型仍按当前脚本已支持的
-`非缓存输入`、`缓存输入` 和 `输出` 三类聚合口径估算。
+`非缓存输入`、`缓存输入` 和 `输出` 三类聚合口径估算。这里使用 API token 价格估算，不代表 ChatGPT 订阅额度或积分扣减。
 
 自动恢复现在会先从目标会话的 rollout 日志中恢复原会话使用的模型和推理强度，再执行 `codex resume`，以避免切换模型导致缓存连续性丢失。
 

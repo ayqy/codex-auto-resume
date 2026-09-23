@@ -7,6 +7,7 @@ import re
 import shlex
 import sys
 import tempfile
+import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -19,10 +20,15 @@ from zoneinfo import ZoneInfo
 # https://developers.openai.com/api/docs/models/gpt-5.6-sol
 # https://developers.openai.com/api/docs/models/gpt-5.6-terra
 # https://developers.openai.com/api/docs/models/gpt-5.6-luna
-# GPT-6 Astra prices were checked on 2026-09-11 against:
+# GPT-6 prices were checked on 2026-09-24 against the official pricing table:
+# https://developers.openai.com/api/docs/pricing
 # https://developers.openai.com/api/docs/models/gpt-6-astra
+# https://developers.openai.com/api/docs/models/gpt-6-sol
+# https://developers.openai.com/api/docs/models/gpt-6-luna
 PRICES = {
     "gpt-6-astra": {"miss": 10.00, "hit": 1.00, "output": 50.00},
+    "gpt-6-sol": {"miss": 2.00, "hit": 0.20, "output": 10.00},
+    "gpt-6-luna": {"miss": 0.10, "hit": 0.01, "output": 0.50},
     "gpt-5.6": {"miss": 5.00, "hit": 0.50, "output": 30.00},
     "gpt-5.6-sol": {"miss": 5.00, "hit": 0.50, "output": 30.00},
     "gpt-5.6-terra": {"miss": 2.50, "hit": 0.25, "output": 15.00},
@@ -38,6 +44,14 @@ EVENT_PRICES = {
     "gpt-6-astra": {
         "default": {"miss": 10.00, "hit": 1.00, "write": 12.50, "output": 50.00},
         "priority": {"miss": 20.00, "hit": 2.00, "write": 25.00, "output": 100.00},
+    },
+    "gpt-6-sol": {
+        "default": {"miss": 2.00, "hit": 0.20, "write": 2.50, "output": 10.00},
+        "priority": {"miss": 4.00, "hit": 0.40, "write": 5.00, "output": 20.00},
+    },
+    "gpt-6-luna": {
+        "default": {"miss": 0.10, "hit": 0.01, "write": 0.125, "output": 0.50},
+        "priority": {"miss": 0.20, "hit": 0.02, "write": 0.25, "output": 1.00},
     },
     "gpt-5.6": {
         "default": {"miss": 5.00, "hit": 0.50, "write": 6.25, "output": 30.00},
@@ -251,10 +265,18 @@ def parse_range(args, target_tz: ZoneInfo):
     has_date = bool(args.d)
     has_recent = bool(args.r)
     has_range = bool(args.start_time or args.end_time)
+    has_session = args.session_id is not None
 
-    selected_modes = sum([has_today, has_yesterday, has_date, has_recent, has_range])
+    selected_modes = sum([has_today, has_yesterday, has_date, has_recent, has_range, has_session])
     if selected_modes != 1:
-        raise ValueError("只能选择一种时间范围输入方式：-t、-y、-d、-r 或 start_time/end_time")
+        raise ValueError("只能选择一种统计方式：-t、-y、-d、-r、start_time/end_time 或 --session-id")
+
+    if has_session:
+        try:
+            normalized_id = str(uuid.UUID(args.session_id))
+        except (ValueError, AttributeError):
+            raise ValueError("--session-id 必须是完整的 UUID") from None
+        return {"mode": "session", "session_id": normalized_id}
 
     if has_today:
         now_local = datetime.now(target_tz)
@@ -580,7 +602,11 @@ def calculate_event_cost(model: str, last_usage: dict, service_tier: str, info: 
     if model not in EVENT_PRICES:
         return None
 
-    price_info = EVENT_PRICES[model][normalize_service_tier(service_tier)]
+    tier = normalize_service_tier(service_tier)
+    if tier == "batch":
+        price_info = {key: value * 0.5 for key, value in EVENT_PRICES[model]["default"].items()}
+    else:
+        price_info = EVENT_PRICES[model][tier]
     input_tokens = int(last_usage.get("input_tokens", 0) or 0)
     cached_input_tokens = int(last_usage.get("cached_input_tokens", 0) or 0)
     output_tokens = int(last_usage.get("output_tokens", 0) or 0)
@@ -969,8 +995,10 @@ def update_model_tracking(obj: dict, state: dict):
 
 
 def normalize_service_tier(value: Optional[str]) -> str:
-    if value == "priority":
+    if value in {"priority", "fast"}:
         return "priority"
+    if value in {"batch", "flex"}:
+        return "batch"
     return "default"
 
 
@@ -1054,12 +1082,16 @@ def format_cost_text(total_cost: float, cost_status: Any) -> str:
     return f"${total_cost:,.2f}"
 
 
-def iter_session_files(root: Path, start_utc: datetime):
+def iter_session_files(root: Path, start_utc: Optional[datetime], session_id: Optional[str] = None):
     session_files = sorted(root.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
     for file_path in session_files:
-        file_mtime_utc = datetime.fromtimestamp(file_path.stat().st_mtime, tz=ZoneInfo("UTC"))
-        if file_mtime_utc < start_utc - timedelta(days=7):
-            continue
+        if session_id is not None:
+            if derive_session_id(file_path) != session_id:
+                continue
+        elif start_utc is not None:
+            file_mtime_utc = datetime.fromtimestamp(file_path.stat().st_mtime, tz=ZoneInfo("UTC"))
+            if file_mtime_utc < start_utc - timedelta(days=7):
+                continue
         yield file_path
 
 
@@ -1370,11 +1402,18 @@ def build_unresolved_child_clusters(sessions: dict, child_sessions: dict, assign
     return results
 
 
-def collect_usage_data(start_local: datetime, end_local: datetime, include_sessions: bool, include_days: bool):
+def collect_usage_data(
+    start_local: Optional[datetime],
+    end_local: Optional[datetime],
+    include_sessions: bool,
+    include_days: bool,
+    requested_session_id: Optional[str] = None,
+    target_tz: Optional[ZoneInfo] = None,
+):
     utc_tz = ZoneInfo("UTC")
-    start_utc = start_local.astimezone(utc_tz)
-    end_utc = end_local.astimezone(utc_tz)
-    target_tz = start_local.tzinfo or ZoneInfo("Asia/Shanghai")
+    start_utc = start_local.astimezone(utc_tz) if start_local is not None else None
+    end_utc = end_local.astimezone(utc_tz) if end_local is not None else None
+    target_tz = target_tz or (start_local.tzinfo if start_local is not None else resolve_timezone(None))
 
     root = session_root()
     if not root.is_dir():
@@ -1386,7 +1425,9 @@ def collect_usage_data(start_local: datetime, end_local: datetime, include_sessi
     days = {} if include_days else None
     session_catalog = {} if include_sessions else None
 
-    for file_path in iter_session_files(root, start_utc):
+    found_session_file = False
+    for file_path in iter_session_files(root, start_utc, requested_session_id):
+        found_session_file = True
         file_state = create_file_state(file_path)
 
         for obj in read_jsonl(file_path):
@@ -1413,14 +1454,14 @@ def collect_usage_data(start_local: datetime, end_local: datetime, include_sessi
                 session_id = file_state["session_id"]
                 activity_record = activity_sessions.setdefault(session_id, create_session_record(session_id))
                 register_activity_event(activity_record, file_state, obj, event_time_local)
-                if start_utc <= event_time_utc < end_utc:
+                if (start_utc is None or start_utc <= event_time_utc) and (end_utc is None or event_time_utc < end_utc):
                     activity_record["first_event_at"] = merge_time_window(
                         activity_record["first_event_at"], event_time_local, True
                     )
                     activity_record["last_event_at"] = merge_time_window(
                         activity_record["last_event_at"], event_time_local, False
                     )
-            if not (start_utc <= event_time_utc < end_utc):
+            if (start_utc is not None and event_time_utc < start_utc) or (end_utc is not None and event_time_utc >= end_utc):
                 continue
             if not is_usage_item(obj) or duplicate_usage_snapshot:
                 continue
@@ -1476,8 +1517,15 @@ def collect_usage_data(start_local: datetime, end_local: datetime, include_sessi
             if file_state["session_id"] in sessions:
                 apply_session_metadata(sessions[file_state["session_id"]], metadata_record)
 
+    if requested_session_id is not None and not found_session_file:
+        raise FileNotFoundError(f"session ID {requested_session_id} not found in {root}")
+    if requested_session_id is not None and requested_session_id not in sessions:
+        sessions[requested_session_id] = create_session_record(requested_session_id)
+        if requested_session_id in session_catalog:
+            apply_session_metadata(sessions[requested_session_id], session_catalog[requested_session_id])
+
     all_activity_spans = []
-    for session_id, session_record in list(activity_sessions.items()):
+    for current_session_id, session_record in list(activity_sessions.items()):
         raw_spans = build_activity_spans(session_record["_activity_turns"])
         clamped_spans = clamp_activity_spans(raw_spans, start_local, end_local)
         session_record["_activity_spans"] = clamped_spans
@@ -1490,8 +1538,8 @@ def collect_usage_data(start_local: datetime, end_local: datetime, include_sessi
 
         if not include_sessions:
             continue
-        if usage_total(session_record) == 0 and session_record["active_seconds"] == 0:
-            sessions.pop(session_id, None)
+        if requested_session_id is None and usage_total(session_record) == 0 and session_record["active_seconds"] == 0:
+            sessions.pop(current_session_id, None)
 
     merged_activity_spans = merge_activity_spans(all_activity_spans)
     result = {"models": model_totals, "active_seconds": sum_activity_seconds(merged_activity_spans)}
@@ -1511,6 +1559,13 @@ def collect_usage_data(start_local: datetime, end_local: datetime, include_sessi
 
 def collect_usage_report(start_local: datetime, end_local: datetime):
     return collect_usage_data(start_local, end_local, include_sessions=True, include_days=False)
+
+
+def collect_session_usage(session_id: str, target_tz: ZoneInfo):
+    report = collect_usage_data(
+        None, None, include_sessions=True, include_days=False, requested_session_id=session_id, target_tz=target_tz
+    )
+    return report["sessions"][session_id]
 
 
 def collect_usage(start_local: datetime, end_local: datetime):
@@ -1769,6 +1824,49 @@ def format_recent_reports(recent_report: dict):
     return "\n".join(summary_lines), "\n".join(detail_lines) + "\n", build_recent_markdown(recent_report)
 
 
+def format_session_reports(session: dict):
+    total_cost, cost_status = calculate_models_cost(session["models"])
+    summary_lines = [
+        "一、会话汇总",
+        f"session_id：{session['session_id']}",
+        f"标题：{session['title']}",
+        f"时间：{format_event_window(session['first_event_at'], session['last_event_at'])}",
+        f"cwd：{session['cwd'] or '未知'}",
+        f"总Token：{format_token_count(usage_total(session))}",
+        f"输入：{format_token_count(session['input_tokens'])}",
+        f"缓存命中：{format_token_count(session['cached_input_tokens'])}",
+        f"非缓存输入：{format_token_count(model_miss_tokens(session))}",
+        f"缓存写入：{format_token_count(session['cache_write_tokens'])}",
+        f"输出：{format_token_count(session['output_tokens'])}",
+        f"活跃时长：{format_duration(int(session.get('active_seconds', 0) or 0))}",
+        f"估算总成本：{format_cost_text(total_cost, cost_status)}",
+    ]
+    detail_lines = summary_lines + ["", "二、模型汇总"]
+    visible_index = 0
+    for model, usage in sorted_model_items(session["models"]):
+        if usage_total(usage) == 0:
+            continue
+        visible_index += 1
+        model_cost, model_cost_status = calculate_models_cost({model: usage})
+        detail_lines.extend(
+            [
+                f"2.{visible_index} {model}",
+                f"总Token：{format_token_count(usage_total(usage))}",
+                f"输入：{format_token_count(usage['input_tokens'])}",
+                f"缓存命中：{format_token_count(usage['cached_input_tokens'])}",
+                f"缓存写入：{format_token_count(usage['cache_write_tokens'])}",
+                f"输出：{format_token_count(usage['output_tokens'])}",
+                f"估算成本：{format_cost_text(model_cost, model_cost_status)}",
+                "",
+            ]
+        )
+    if visible_index == 0:
+        detail_lines.append("该会话未发现 token 使用记录。")
+    elif detail_lines[-1] == "":
+        detail_lines.pop()
+    return "\n".join(summary_lines), "\n".join(detail_lines) + "\n"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Calculate Codex token usage and cost by model.")
     parser.add_argument("start_time", nargs="?", help="Start time 'YYYY-MM-DD HH:MM:SS'")
@@ -1777,6 +1875,7 @@ def main():
     parser.add_argument("-y", "--yesterday", dest="y", action="store_true", help="Use the previous local day")
     parser.add_argument("-d", "--date", dest="d", help="Use one local day, e.g. 2026-07-03")
     parser.add_argument("-r", dest="r", action="store_true", help="Use the latest N local days")
+    parser.add_argument("--session-id", dest="session_id", help="Use all usage from one complete session UUID")
     parser.add_argument("-n", dest="n", type=int, default=30, help="Recent day count for -r")
     parser.add_argument("-z", "--tz", dest="z", help="Override local timezone, e.g. Asia/Shanghai")
     parser.add_argument("-s", "--summary-only", dest="s", action="store_true", help="Only print summary to stdout")
@@ -1786,7 +1885,12 @@ def main():
     try:
         target_tz = resolve_timezone(args.z)
         request = parse_range(args, target_tz)
-        if request["mode"] == "recent":
+        if request["mode"] == "session":
+            session = collect_session_usage(request["session_id"], target_tz)
+            summary_text, detail_text = format_session_reports(session)
+            file_text = detail_text
+            detail_suffix = ".txt"
+        elif request["mode"] == "recent":
             recent_report = collect_recent_usage(request["start_local"], request["end_local"], request["days"])
             summary_text, detail_text, file_text = format_recent_reports(recent_report)
             detail_suffix = ".md"
@@ -1801,7 +1905,10 @@ def main():
 
     detail_file = args.f
     if not detail_file:
-        prefix = "codex-recent-usage." if request["mode"] == "recent" else "codex-token-usage."
+        prefix = {
+            "recent": "codex-recent-usage.",
+            "session": "codex-session-usage.",
+        }.get(request["mode"], "codex-token-usage.")
         handle = tempfile.NamedTemporaryFile(
             prefix=prefix,
             suffix=detail_suffix,
